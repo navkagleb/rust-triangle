@@ -4,3 +4,15 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+rand = "0.10.0"
+
+[dependencies.windows]
+package = "windows"
+git = "https://github.com/microsoft/windows-rs"
+tag = "73"
+features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_WindowsAndMessaging",
+]
