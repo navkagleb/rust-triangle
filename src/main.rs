@@ -63,16 +63,6 @@ fn main() -> Result<()> {
         _ = ShowWindow(window_handle, SW_SHOW);
         _ = UpdateWindow(window_handle);
 
-        {
-            let mut d3d12_debug: Option<ID3D12Debug> = None;
-            D3D12GetDebugInterface(&mut d3d12_debug)?;
-
-            if let Some(d3d12_debug) = d3d12_debug {
-                d3d12_debug.EnableDebugLayer();
-                println!("Enable D3D12 debug layer");
-            }
-        }
-
         let dxgi_factory = {
             let dxgi_factory_2 = CreateDXGIFactory2::<IDXGIFactory2>(DXGI_CREATE_FACTORY_DEBUG)?;
             dxgi_factory_2.cast::<IDXGIFactory7>()?
@@ -105,6 +95,16 @@ fn main() -> Result<()> {
 
             selected_dxgi_adapter.unwrap()
         };
+
+        {
+            let mut d3d12_debug: Option<ID3D12Debug5> = None;
+            D3D12GetDebugInterface(&mut d3d12_debug)?;
+
+            if let Some(d3d12_debug) = d3d12_debug {
+                d3d12_debug.EnableDebugLayer();
+                println!("Enable D3D12 debug layer");
+            }
+        }
 
         let d3d12_device = {
             let mut d3d12_device: Option<ID3D12Device> = None;
@@ -335,6 +335,8 @@ fn print_d3d12_debug_messages(d3d12_info_queue: &ID3D12InfoQueue) -> Result<()> 
             let desc = std::ffi::CStr::from_ptr(message.pDescription as *const i8);
             println!("[D3D12]: {}", desc.to_string_lossy());
         }
+
+        d3d12_info_queue.ClearStoredMessages();
     }
 
     Ok(())
