@@ -5,6 +5,7 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::Graphics::Gdi::UpdateWindow;
 use windows::Win32::System::LibraryLoader::*;
+use windows::Win32::System::Threading::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::*;
 
@@ -16,8 +17,8 @@ fn main() -> Result<()> {
     println!("Hello D3D12 Rust Triangle!");
 
     unsafe {
-        let exe_handle: HMODULE = GetModuleHandleA(None)?;
-        let class_registry_name: PCSTR = s!("rust-window");
+        let exe_handle = GetModuleHandleA(None)?;
+        let class_registry_name = s!("rust-window");
 
         let wc = WNDCLASSA {
             style: CS_VREDRAW | CS_HREDRAW | CS_OWNDC,
@@ -80,10 +81,9 @@ fn main() -> Result<()> {
             let mut selected_dxgi_adapter: Option<IDXGIAdapter1> = None;
 
             loop {
-                match dxgi_factory.EnumAdapterByGpuPreference::<IDXGIAdapter1>(
-                    adapter_index,
-                    DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
-                ) {
+                match dxgi_factory
+                    .EnumAdapterByGpuPreference::<IDXGIAdapter1>(adapter_index, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE)
+                {
                     Ok(dxgi_adapter) => {
                         let desc = dxgi_adapter.GetDesc1()?;
                         let name = wide_to_string(&desc.Description);
@@ -111,6 +111,8 @@ fn main() -> Result<()> {
             d3d12_device.unwrap().cast::<ID3D12Device4>()?
         };
 
+        let d3d12_info_queue = d3d12_device.cast::<ID3D12InfoQueue>()?;
+
         let mut d3d12_shader_model = D3D12_FEATURE_DATA_SHADER_MODEL {
             HighestShaderModel: D3D_SHADER_MODEL_6_6,
         };
@@ -136,6 +138,9 @@ fn main() -> Result<()> {
             d3d12_device.CreateCommandQueue::<ID3D12CommandQueue>(&desc)?
         };
 
+        let d3d12_frame_fence = d3d12_device.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE)?;
+        let wait_event_handle = CreateEventA(None, false, false, s!("wait-event"))?;
+
         let dxgi_swap_chain = {
             let mut is_tearring_supported: u32 = 0;
             dxgi_factory.CheckFeatureSupport(
@@ -154,10 +159,7 @@ fn main() -> Result<()> {
                 Height: TOUCH_HIT_TESTING_PROXIMITY_FARTHEST,
                 Format: DXGI_FORMAT_R8G8B8A8_UNORM,
                 Stereo: BOOL(0),
-                SampleDesc: DXGI_SAMPLE_DESC {
-                    Count: 1,
-                    Quality: 0,
-                },
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
                 BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
                 BufferCount: FRAME_COUNT,
                 Scaling: DXGI_SCALING_STRETCH,
@@ -180,12 +182,11 @@ fn main() -> Result<()> {
         let d3d12_back_buffers: [ID3D12Resource; FRAME_COUNT as usize] =
             std::array::from_fn(|i| dxgi_swap_chain.GetBuffer(i as u32).unwrap());
 
-        let d3d12_cmd_allocators: [ID3D12CommandAllocator; FRAME_COUNT as usize] =
-            std::array::from_fn(|_| {
-                d3d12_device
-                    .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
-                    .unwrap()
-            });
+        let d3d12_cmd_allocators: [ID3D12CommandAllocator; FRAME_COUNT as usize] = std::array::from_fn(|_| {
+            d3d12_device
+                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+                .unwrap()
+        });
 
         let d3d12_cmd_list = d3d12_device.CreateCommandList1::<ID3D12GraphicsCommandList1>(
             0,
@@ -193,16 +194,16 @@ fn main() -> Result<()> {
             D3D12_COMMAND_LIST_FLAG_NONE,
         )?;
 
+        let mut cpu_frame_index = 0;
+
         loop {
+            cpu_frame_index += 1;
+
             let mut message = MSG::default();
 
             while PeekMessageA(&mut message, None, 0, 0, PM_REMOVE).into() {
                 _ = TranslateMessage(&message);
                 DispatchMessageA(&message);
-            }
-
-            if message.message == WM_QUIT {
-                break;
             }
 
             let active_frame_index = dxgi_swap_chain.GetCurrentBackBufferIndex();
@@ -214,25 +215,38 @@ fn main() -> Result<()> {
             let d3d12_cmd_lists: [Option<ID3D12CommandList>; 1] =
                 [Some(d3d12_cmd_list.cast::<ID3D12CommandList>().unwrap())];
             d3d12_cmd_queue.ExecuteCommandLists(&d3d12_cmd_lists);
+            d3d12_cmd_queue.Signal(&d3d12_frame_fence, cpu_frame_index)?;
 
             let code: HRESULT = dxgi_swap_chain.Present(0, DXGI_PRESENT_ALLOW_TEARING);
             if code.is_err() {
                 return Err(code.into());
             }
+
+            let gpu_frame_index = d3d12_frame_fence.GetCompletedValue();
+
+            println!("CPU: {}, GPU: {}", cpu_frame_index, gpu_frame_index);
+
+            if cpu_frame_index - gpu_frame_index >= FRAME_COUNT.into() {
+                let gpu_frame_index_to_wait = cpu_frame_index - FRAME_COUNT as u64 + 1;
+                wait_for_gpu(&d3d12_frame_fence, wait_event_handle, gpu_frame_index_to_wait)?;
+            }
+
+            print_d3d12_debug_messages(&d3d12_info_queue)?;
+
+            if message.message == WM_QUIT {
+                break;
+            }
         }
 
-        UnregisterClassA(class_registry_name, Some(exe_handle.into()))?;
+        wait_for_gpu(&d3d12_frame_fence, wait_event_handle, cpu_frame_index)?;
 
-        Ok(())
+        UnregisterClassA(class_registry_name, Some(exe_handle.into()))?;
     }
+
+    Ok(())
 }
 
-extern "system" fn handle_window_message(
-    window_handle: HWND,
-    message: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
+extern "system" fn handle_window_message(window_handle: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe {
         match message {
             WM_DESTROY => {
@@ -249,4 +263,37 @@ extern "system" fn handle_window_message(
 fn wide_to_string(wide: &[u16]) -> String {
     let end = wide.iter().position(|&c| c == 0).unwrap_or(wide.len());
     String::from_utf16_lossy(&wide[..end])
+}
+
+fn print_d3d12_debug_messages(d3d12_info_queue: &ID3D12InfoQueue) -> Result<()> {
+    unsafe {
+        let message_count = d3d12_info_queue.GetNumStoredMessages();
+        for i in 0..message_count {
+            let mut message_length = 0;
+            d3d12_info_queue.GetMessage(i, None, &mut message_length)?;
+
+            let mut message_buffer = vec![0u8; message_length];
+            let message = message_buffer.as_mut_ptr() as *mut D3D12_MESSAGE;
+
+            d3d12_info_queue.GetMessage(i, Some(message), &mut message_length)?;
+
+            let message = &*message;
+            let desc = std::ffi::CStr::from_ptr(message.pDescription as *const i8);
+            println!("[D3D12]: {}", desc.to_string_lossy());
+        }
+    }
+
+    Ok(())
+}
+
+fn wait_for_gpu(d3d12_fence: &ID3D12Fence, wait_event_handle: HANDLE, wait_value: u64) -> Result<()> {
+    unsafe {
+        d3d12_fence.SetEventOnCompletion(wait_value, wait_event_handle)?;
+
+        if WaitForSingleObject(wait_event_handle, INFINITE) == WAIT_FAILED {
+            return Err(Error::from_thread());
+        }
+    }
+
+    Ok(())
 }
