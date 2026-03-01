@@ -114,21 +114,38 @@ fn main() -> Result<()> {
         };
 
         let d3d12_info_queue = d3d12_device.cast::<ID3D12InfoQueue>()?;
+        let d3d12_debug_quard = D3D12DebugGuard::new(&d3d12_info_queue);
 
-        let mut d3d12_shader_model = D3D12_FEATURE_DATA_SHADER_MODEL {
-            HighestShaderModel: D3D_SHADER_MODEL_6_6,
-        };
-        d3d12_device.CheckFeatureSupport(
-            D3D12_FEATURE_SHADER_MODEL,
-            std::ptr::addr_of_mut!(d3d12_shader_model) as _,
-            size_of::<D3D12_FEATURE_DATA_SHADER_MODEL>() as u32,
-        )?;
+        {
+            let d3d12_shader_model = D3D12_FEATURE_DATA_SHADER_MODEL {
+                HighestShaderModel: D3D_SHADER_MODEL_6_6,
+            };
+            d3d12_device.CheckFeatureSupport(
+                D3D12_FEATURE_SHADER_MODEL,
+                std::ptr::addr_of!(d3d12_shader_model) as _,
+                size_of::<D3D12_FEATURE_DATA_SHADER_MODEL>() as u32,
+            )?;
 
-        println!(
-            "Supported shader model: {}.{}",
-            d3d12_shader_model.HighestShaderModel.0 / 16,
-            d3d12_shader_model.HighestShaderModel.0 % 16
-        );
+            println!(
+                "Supported shader model: {}.{}",
+                d3d12_shader_model.HighestShaderModel.0 / 16,
+                d3d12_shader_model.HighestShaderModel.0 % 16
+            );
+        }
+
+        {
+            let d3d12_options: D3D12_FEATURE_DATA_D3D12_OPTIONS16 = Default::default();
+            d3d12_device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS16,
+                std::ptr::addr_of!(d3d12_options) as _,
+                size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS16>() as u32,
+            )?;
+
+            println!(
+                "GPUUploadHeapSupported: {}",
+                d3d12_options.GPUUploadHeapSupported.as_bool()
+            );
+        }
 
         let d3d12_cmd_queue = {
             let desc = D3D12_COMMAND_QUEUE_DESC {
@@ -215,6 +232,12 @@ fn main() -> Result<()> {
             D3D12_COMMAND_LIST_FLAG_NONE,
         )?;
 
+        struct Vertex {
+            position_x: f32,
+            position_y: f32,
+            position_z: f32,
+        }
+
         let mut cpu_frame_index = 0;
 
         loop {
@@ -285,7 +308,7 @@ fn main() -> Result<()> {
                 wait_for_gpu(&d3d12_frame_fence, wait_event_handle, gpu_frame_index_to_wait)?;
             }
 
-            print_d3d12_debug_messages(&d3d12_info_queue)?;
+            dump_d3d12_debug_messages(&d3d12_info_queue)?;
 
             if message.message == WM_QUIT {
                 break;
@@ -295,6 +318,8 @@ fn main() -> Result<()> {
         wait_for_gpu(&d3d12_frame_fence, wait_event_handle, cpu_frame_index)?;
 
         UnregisterClassA(class_registry_name, Some(exe_handle.into()))?;
+
+        d3d12_debug_quard.success();
     }
 
     Ok(())
@@ -319,7 +344,7 @@ fn wide_to_string(wide: &[u16]) -> String {
     String::from_utf16_lossy(&wide[..end])
 }
 
-fn print_d3d12_debug_messages(d3d12_info_queue: &ID3D12InfoQueue) -> Result<()> {
+fn dump_d3d12_debug_messages(d3d12_info_queue: &ID3D12InfoQueue) -> Result<()> {
     unsafe {
         let message_count = d3d12_info_queue.GetNumStoredMessages();
         for i in 0..message_count {
@@ -370,5 +395,31 @@ fn create_transition_barrier(
                 StateAfter: state_after,
             }),
         },
+    }
+}
+
+struct D3D12DebugGuard<'a> {
+    d3d12_info_queue: &'a ID3D12InfoQueue,
+    is_ok: bool,
+}
+
+impl<'a> D3D12DebugGuard<'a> {
+    fn new(d3d12_info_queue: &'a ID3D12InfoQueue) -> Self {
+        Self {
+            d3d12_info_queue,
+            is_ok: false,
+        }
+    }
+
+    fn success(mut self) {
+        self.is_ok = true;
+    }
+}
+
+impl Drop for D3D12DebugGuard<'_> {
+    fn drop(&mut self) {
+        if !self.is_ok {
+            _ = dump_d3d12_debug_messages(self.d3d12_info_queue);
+        }
     }
 }
