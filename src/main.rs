@@ -1,3 +1,5 @@
+use std::mem::ManuallyDrop;
+
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Direct3D::*;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -182,6 +184,25 @@ fn main() -> Result<()> {
         let d3d12_back_buffers: [ID3D12Resource; FRAME_COUNT as usize] =
             std::array::from_fn(|i| dxgi_swap_chain.GetBuffer(i as u32).unwrap());
 
+        let d3d12_rtv_heap =
+            d3d12_device.CreateDescriptorHeap::<ID3D12DescriptorHeap>(&D3D12_DESCRIPTOR_HEAP_DESC {
+                NumDescriptors: FRAME_COUNT,
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+                ..Default::default()
+            })?;
+
+        let d3d12_rtvs: [D3D12_CPU_DESCRIPTOR_HANDLE; FRAME_COUNT as usize] = std::array::from_fn(|i| {
+            let rtv_begin_ptr = d3d12_rtv_heap.GetCPUDescriptorHandleForHeapStart().ptr;
+            let rtv_size = d3d12_device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV) as usize;
+            let rtv = D3D12_CPU_DESCRIPTOR_HANDLE {
+                ptr: rtv_begin_ptr + i * rtv_size,
+            };
+
+            d3d12_device.CreateRenderTargetView(&d3d12_back_buffers[i], None, rtv);
+
+            rtv
+        });
+
         let d3d12_cmd_allocators: [ID3D12CommandAllocator; FRAME_COUNT as usize] = std::array::from_fn(|_| {
             d3d12_device
                 .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
@@ -210,8 +231,41 @@ fn main() -> Result<()> {
             let d3d12_cmd_allocator = &d3d12_cmd_allocators[active_frame_index as usize];
 
             d3d12_cmd_list.Reset(d3d12_cmd_allocator, None)?;
-            d3d12_cmd_list.Close()?;
 
+            d3d12_cmd_list.RSSetViewports(&[D3D12_VIEWPORT {
+                TopLeftX: 0.0,
+                TopLeftY: 0.0,
+                Width: WIDTH as f32,
+                Height: HEIGHT as f32,
+                MinDepth: 0.0,
+                MaxDepth: 1.0,
+            }]);
+
+            d3d12_cmd_list.RSSetScissorRects(&[RECT {
+                left: 0,
+                top: 0,
+                right: WIDTH as i32,
+                bottom: HEIGHT as i32,
+            }]);
+
+            d3d12_cmd_list.ResourceBarrier(&[create_transition_barrier(
+                &d3d12_back_buffers[active_frame_index as usize],
+                D3D12_RESOURCE_STATE_PRESENT,
+                D3D12_RESOURCE_STATE_RENDER_TARGET,
+            )]);
+
+            let d3d12_rtv = d3d12_rtvs[active_frame_index as usize];
+
+            d3d12_cmd_list.OMSetRenderTargets(1, Some(&d3d12_rtv), false, None);
+            d3d12_cmd_list.ClearRenderTargetView(d3d12_rtv, &[0.3, 0.8, 0.5, 1.0], None);
+
+            d3d12_cmd_list.ResourceBarrier(&[create_transition_barrier(
+                &d3d12_back_buffers[active_frame_index as usize],
+                D3D12_RESOURCE_STATE_RENDER_TARGET,
+                D3D12_RESOURCE_STATE_PRESENT,
+            )]);
+
+            d3d12_cmd_list.Close()?;
             let d3d12_cmd_lists: [Option<ID3D12CommandList>; 1] =
                 [Some(d3d12_cmd_list.cast::<ID3D12CommandList>().unwrap())];
             d3d12_cmd_queue.ExecuteCommandLists(&d3d12_cmd_lists);
@@ -296,4 +350,23 @@ fn wait_for_gpu(d3d12_fence: &ID3D12Fence, wait_event_handle: HANDLE, wait_value
     }
 
     Ok(())
+}
+
+fn create_transition_barrier(
+    d3d12_resource: &ID3D12Resource,
+    state_before: D3D12_RESOURCE_STATES,
+    state_after: D3D12_RESOURCE_STATES,
+) -> D3D12_RESOURCE_BARRIER {
+    D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+            Transition: ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                pResource: unsafe { std::mem::transmute_copy(d3d12_resource) },
+                Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                StateBefore: state_before,
+                StateAfter: state_after,
+            }),
+        },
+    }
 }
