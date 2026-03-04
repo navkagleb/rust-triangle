@@ -1,4 +1,5 @@
 use std::mem::ManuallyDrop;
+use std::path::Path;
 
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Direct3D::*;
@@ -22,15 +23,13 @@ fn main() -> Result<()> {
         let exe_handle = GetModuleHandleA(None)?;
         let class_registry_name = s!("rust-window");
 
-        let wc = WNDCLASSA {
+        let class_atom = RegisterClassA(&WNDCLASSA {
             style: CS_VREDRAW | CS_HREDRAW | CS_OWNDC,
             hInstance: exe_handle.into(),
             lpszClassName: class_registry_name,
             lpfnWndProc: Some(handle_window_message),
             ..Default::default()
-        };
-
-        let class_atom = RegisterClassA(&wc);
+        });
         if class_atom == 0 {
             GetLastError().ok()?;
         }
@@ -63,10 +62,7 @@ fn main() -> Result<()> {
         _ = ShowWindow(window_handle, SW_SHOW);
         _ = UpdateWindow(window_handle);
 
-        let dxgi_factory = {
-            let dxgi_factory_2 = CreateDXGIFactory2::<IDXGIFactory2>(DXGI_CREATE_FACTORY_DEBUG)?;
-            dxgi_factory_2.cast::<IDXGIFactory7>()?
-        };
+        let dxgi_factory = CreateDXGIFactory2::<IDXGIFactory2>(DXGI_CREATE_FACTORY_DEBUG)?.cast::<IDXGIFactory7>()?;
 
         let dxgi_adapter = {
             let mut adapter_index = 0;
@@ -103,6 +99,8 @@ fn main() -> Result<()> {
             if let Some(d3d12_debug) = d3d12_debug {
                 d3d12_debug.EnableDebugLayer();
                 println!("Enable D3D12 debug layer");
+
+                d3d12_debug.SetEnableGPUBasedValidation(true);
             }
         }
 
@@ -147,15 +145,11 @@ fn main() -> Result<()> {
             );
         }
 
-        let d3d12_cmd_queue = {
-            let desc = D3D12_COMMAND_QUEUE_DESC {
-                Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
-                Priority: D3D12_COMMAND_QUEUE_PRIORITY_NORMAL.0,
-                ..Default::default()
-            };
-
-            d3d12_device.CreateCommandQueue::<ID3D12CommandQueue>(&desc)?
-        };
+        let d3d12_cmd_queue = d3d12_device.CreateCommandQueue::<ID3D12CommandQueue>(&D3D12_COMMAND_QUEUE_DESC {
+            Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+            Priority: D3D12_COMMAND_QUEUE_PRIORITY_NORMAL.0,
+            ..Default::default()
+        })?;
 
         let d3d12_frame_fence = d3d12_device.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE)?;
         let wait_event_handle = CreateEventA(None, false, false, s!("wait-event"))?;
@@ -173,29 +167,27 @@ fn main() -> Result<()> {
                 flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
             }
 
-            let desc = DXGI_SWAP_CHAIN_DESC1 {
-                Width: WIDTH,
-                Height: TOUCH_HIT_TESTING_PROXIMITY_FARTHEST,
-                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
-                Stereo: BOOL(0),
-                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-                BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
-                BufferCount: FRAME_COUNT,
-                Scaling: DXGI_SCALING_STRETCH,
-                SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
-                AlphaMode: DXGI_ALPHA_MODE_UNSPECIFIED,
-                Flags: flags.0 as u32,
-            };
-
-            let dxgi_swap_chain = dxgi_factory.CreateSwapChainForHwnd::<&ID3D12CommandQueue, _>(
-                &d3d12_cmd_queue,
-                window_handle,
-                &desc,
-                None,
-                None,
-            )?;
-
-            dxgi_swap_chain.cast::<IDXGISwapChain3>()?
+            dxgi_factory
+                .CreateSwapChainForHwnd(
+                    &d3d12_cmd_queue,
+                    window_handle,
+                    &DXGI_SWAP_CHAIN_DESC1 {
+                        Width: WIDTH,
+                        Height: HEIGHT,
+                        Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                        Stereo: BOOL(0),
+                        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                        BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
+                        BufferCount: FRAME_COUNT,
+                        Scaling: DXGI_SCALING_STRETCH,
+                        SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
+                        AlphaMode: DXGI_ALPHA_MODE_UNSPECIFIED,
+                        Flags: flags.0 as u32,
+                    },
+                    None,
+                    None,
+                )?
+                .cast::<IDXGISwapChain3>()?
         };
 
         let d3d12_back_buffers: [ID3D12Resource; FRAME_COUNT as usize] =
@@ -232,11 +224,165 @@ fn main() -> Result<()> {
             D3D12_COMMAND_LIST_FLAG_NONE,
         )?;
 
+        #[allow(dead_code)]
+        struct Position(f32, f32, f32);
+
+        #[allow(dead_code)]
+        struct Color(f32, f32, f32);
+
+        #[allow(dead_code)]
         struct Vertex {
-            position_x: f32,
-            position_y: f32,
-            position_z: f32,
+            position: Position,
+            color: Color,
         }
+
+        impl Vertex {
+            fn new(position: Position, color: Color) -> Self {
+                Self { position, color }
+            }
+        }
+
+        let vertices = [
+            Vertex::new(Position(0.0, 0.5, 0.0), Color(1.0, 0.0, 0.0)),
+            Vertex::new(Position(0.5, -0.5, 0.0), Color(0.0, 1.0, 0.0)),
+            Vertex::new(Position(-0.5, -0.5, 0.0), Color(0.0, 0.0, 1.0)),
+        ];
+
+        let d3d12_vertex_buffer = {
+            let mut d3d12_resource: Option<ID3D12Resource> = None;
+            d3d12_device.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES {
+                    Type: D3D12_HEAP_TYPE_UPLOAD,
+                    CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
+                    MemoryPoolPreference: D3D12_MEMORY_POOL_UNKNOWN,
+                    CreationNodeMask: 1,
+                    VisibleNodeMask: 1,
+                },
+                D3D12_HEAP_FLAG_NONE,
+                &D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                    Alignment: 0,
+                    Width: (vertices.len() * size_of::<Vertex>()) as u64,
+                    Height: 1,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    Format: DXGI_FORMAT_UNKNOWN,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                    Flags: D3D12_RESOURCE_FLAG_NONE,
+                },
+                D3D12_RESOURCE_STATE_GENERIC_READ,
+                None,
+                &mut d3d12_resource,
+            )?;
+
+            let d3d12_resource = d3d12_resource.unwrap();
+
+            let mut mapped_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+            d3d12_resource.Map(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }), Some(&mut mapped_ptr))?;
+
+            let vertex_ptr = mapped_ptr as *mut Vertex;
+            std::ptr::copy_nonoverlapping(vertices.as_ptr(), vertex_ptr, vertices.len());
+
+            d3d12_resource.Unmap(
+                0,
+                Some(&D3D12_RANGE {
+                    Begin: 0,
+                    End: std::mem::size_of_val(&vertices),
+                }),
+            );
+
+            d3d12_resource
+        };
+
+        let d3d12_root_signature = {
+            let mut blob: Option<ID3DBlob> = None;
+            let mut error: Option<ID3DBlob> = None;
+
+            D3D12SerializeRootSignature(
+                &D3D12_ROOT_SIGNATURE_DESC {
+                    NumParameters: 0,
+                    pParameters: std::ptr::null(),
+                    NumStaticSamplers: 0,
+                    pStaticSamplers: std::ptr::null(),
+                    Flags: D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT,
+                },
+                D3D_ROOT_SIGNATURE_VERSION_1,
+                &mut blob,
+                Some(&mut error),
+            )?;
+
+            let blob = blob.unwrap();
+            let bytecode = std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize());
+
+            d3d12_device.CreateRootSignature::<ID3D12RootSignature>(0, bytecode)?
+        };
+
+        let d3d12_pso = {
+            let vs_blob = std::fs::read(Path::new("target/dxil/triangle.vs.dxil"))?;
+            let ps_blob = std::fs::read(Path::new("target/dxil/triangle.ps.dxil"))?;
+
+            let to_bytecode = |blob: &[u8]| D3D12_SHADER_BYTECODE {
+                pShaderBytecode: blob.as_ptr() as _,
+                BytecodeLength: blob.len(),
+            };
+
+            let input_elements = [
+                D3D12_INPUT_ELEMENT_DESC {
+                    SemanticName: s!("sem_Position"),
+                    SemanticIndex: 0,
+                    Format: DXGI_FORMAT_R32G32B32_FLOAT,
+                    InputSlot: 0,
+                    AlignedByteOffset: 0,
+                    InputSlotClass: D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
+                    InstanceDataStepRate: 0,
+                },
+                D3D12_INPUT_ELEMENT_DESC {
+                    SemanticName: s!("sem_Color"),
+                    SemanticIndex: 0,
+                    Format: DXGI_FORMAT_R32G32B32_FLOAT,
+                    InputSlot: 0,
+                    AlignedByteOffset: size_of::<Position>() as u32,
+                    InputSlotClass: D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
+                    InstanceDataStepRate: 0,
+                },
+            ];
+
+            d3d12_device.CreateGraphicsPipelineState::<ID3D12PipelineState>(&D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+                pRootSignature: ManuallyDrop::new(std::mem::transmute_copy(&d3d12_root_signature)),
+                VS: to_bytecode(&vs_blob),
+                PS: to_bytecode(&ps_blob),
+                BlendState: D3D12_BLEND_DESC {
+                    RenderTarget: {
+                        let mut render_targets = [D3D12_RENDER_TARGET_BLEND_DESC::default(); 8];
+                        render_targets[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8;
+                        render_targets
+                    },
+                    ..Default::default()
+                },
+                SampleMask: u32::MAX,
+                RasterizerState: D3D12_RASTERIZER_DESC {
+                    FillMode: D3D12_FILL_MODE_SOLID,
+                    CullMode: D3D12_CULL_MODE_BACK,
+                    FrontCounterClockwise: BOOL(0),
+                    ..Default::default()
+                },
+                InputLayout: D3D12_INPUT_LAYOUT_DESC {
+                    pInputElementDescs: input_elements.as_ptr(),
+                    NumElements: input_elements.len() as u32,
+                },
+                PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+                NumRenderTargets: 1,
+                RTVFormats: {
+                    let mut formats = [DXGI_FORMAT_UNKNOWN; 8];
+                    formats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+                    formats
+                },
+                DSVFormat: DXGI_FORMAT_UNKNOWN,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                ..Default::default()
+            })?
+        };
 
         let mut cpu_frame_index = 0;
 
@@ -280,7 +426,20 @@ fn main() -> Result<()> {
             let d3d12_rtv = d3d12_rtvs[active_frame_index as usize];
 
             d3d12_cmd_list.OMSetRenderTargets(1, Some(&d3d12_rtv), false, None);
-            d3d12_cmd_list.ClearRenderTargetView(d3d12_rtv, &[0.3, 0.8, 0.5, 1.0], None);
+            d3d12_cmd_list.ClearRenderTargetView(d3d12_rtv, &[0.3, 0.3, 0.3, 1.0], None);
+
+            d3d12_cmd_list.SetGraphicsRootSignature(&d3d12_root_signature);
+            d3d12_cmd_list.SetPipelineState(&d3d12_pso);
+            d3d12_cmd_list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            d3d12_cmd_list.IASetVertexBuffers(
+                0,
+                Some(&[D3D12_VERTEX_BUFFER_VIEW {
+                    BufferLocation: d3d12_vertex_buffer.GetGPUVirtualAddress(),
+                    SizeInBytes: std::mem::size_of_val(&vertices) as u32,
+                    StrideInBytes: size_of::<Vertex>() as u32,
+                }]),
+            );
+            d3d12_cmd_list.DrawInstanced(vertices.len() as u32, 1, 0, 0);
 
             d3d12_cmd_list.ResourceBarrier(&[create_transition_barrier(
                 &d3d12_back_buffers[active_frame_index as usize],
@@ -300,8 +459,6 @@ fn main() -> Result<()> {
             }
 
             let gpu_frame_index = d3d12_frame_fence.GetCompletedValue();
-
-            println!("CPU: {}, GPU: {}", cpu_frame_index, gpu_frame_index);
 
             if cpu_frame_index - gpu_frame_index >= FRAME_COUNT.into() {
                 let gpu_frame_index_to_wait = cpu_frame_index - FRAME_COUNT as u64 + 1;
@@ -357,8 +514,16 @@ fn dump_d3d12_debug_messages(d3d12_info_queue: &ID3D12InfoQueue) -> Result<()> {
             d3d12_info_queue.GetMessage(i, Some(message), &mut message_length)?;
 
             let message = &*message;
-            let desc = std::ffi::CStr::from_ptr(message.pDescription as *const i8);
-            println!("[D3D12]: {}", desc.to_string_lossy());
+            let message_severity = match message.Severity {
+                D3D12_MESSAGE_SEVERITY_CORRUPTION => "CORRUPTION",
+                D3D12_MESSAGE_SEVERITY_ERROR => "ERROR",
+                D3D12_MESSAGE_SEVERITY_INFO => "INFO",
+                D3D12_MESSAGE_SEVERITY_MESSAGE => "MESSAGE",
+                D3D12_MESSAGE_SEVERITY_WARNING => "WARNING",
+                _ => "",
+            };
+            let desc = std::ffi::CStr::from_ptr(message.pDescription as *const std::ffi::c_char);
+            println!("[D3D12][{}]: {}", message_severity, desc.to_string_lossy());
         }
 
         d3d12_info_queue.ClearStoredMessages();
