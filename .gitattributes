@@ -1,0 +1,4 @@
+tools/dxc/** binary
+tools/dxc/** -diff
+tools/dxc/VERSION text
+tools/dxc/VERSION diff
