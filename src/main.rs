@@ -1,3 +1,6 @@
+mod imgui_ffi;
+use imgui_ffi::*;
+
 use std::mem::ManuallyDrop;
 use std::path::Path;
 
@@ -34,13 +37,17 @@ fn main() -> Result<()> {
             GetLastError().ok()?;
         }
 
-        let mut window_rect = RECT {
-            left: 0,
-            top: 0,
-            right: WIDTH as i32,
-            bottom: HEIGHT as i32,
+        let window_rect = {
+            let mut rect = RECT {
+                left: 0,
+                top: 0,
+                right: WIDTH as i32,
+                bottom: HEIGHT as i32,
+            };
+            AdjustWindowRect(&mut rect, WS_OVERLAPPEDWINDOW, false)?;
+
+            rect
         };
-        AdjustWindowRect(&mut window_rect, WS_OVERLAPPEDWINDOW, false)?;
 
         let window_handle: HWND = CreateWindowExA(
             WINDOW_EX_STYLE::default(),
@@ -197,7 +204,16 @@ fn main() -> Result<()> {
             d3d12_device.CreateDescriptorHeap::<ID3D12DescriptorHeap>(&D3D12_DESCRIPTOR_HEAP_DESC {
                 NumDescriptors: FRAME_COUNT,
                 Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
-                ..Default::default()
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+                NodeMask: 0,
+            })?;
+
+        let d3d12_resource_heap =
+            d3d12_device.CreateDescriptorHeap::<ID3D12DescriptorHeap>(&D3D12_DESCRIPTOR_HEAP_DESC {
+                NumDescriptors: 1,
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                NodeMask: 0,
             })?;
 
         let d3d12_rtvs: [D3D12_CPU_DESCRIPTOR_HANDLE; FRAME_COUNT as usize] = std::array::from_fn(|i| {
@@ -384,6 +400,31 @@ fn main() -> Result<()> {
             })?
         };
 
+        {
+            ImGui_CreateContext(std::ptr::null_mut());
+            ImGui_StyleColorsDark(std::ptr::null_mut());
+
+            let io = &mut *ImGui_GetIO();
+            io.ConfigFlags |= ImGuiConfigFlags__ImGuiConfigFlags_NavEnableKeyboard;
+            io.ConfigFlags |= ImGuiConfigFlags__ImGuiConfigFlags_DockingEnable;
+            io.ConfigFlags |= ImGuiConfigFlags__ImGuiConfigFlags_ViewportsEnable;
+
+            cimgui_implwin32_init(std::ptr::addr_of!(window_handle) as _);
+            cimgui_impldx12_init(&mut ImGui_ImplDX12_InitInfo {
+                device: d3d12_device.as_raw() as *mut _,
+                command_queue: d3d12_cmd_queue.as_raw() as *mut _,
+                num_frames_in_flight: FRAME_COUNT as i32,
+                rtv_format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                dsv_format: DXGI_FORMAT_UNKNOWN,
+                user_data: std::ptr::null_mut(),
+                srv_descriptor_heap: d3d12_resource_heap.as_raw() as *mut _,
+                srv_descriptor_alloc_fn: None,
+                srv_descriptor_free_fn: None,
+                legacy_srv_cpu: d3d12_resource_heap.GetCPUDescriptorHandleForHeapStart(),
+                legacy_srv_gpu: d3d12_resource_heap.GetGPUDescriptorHandleForHeapStart(),
+            });
+        }
+
         let mut cpu_frame_index = 0;
 
         loop {
@@ -441,6 +482,23 @@ fn main() -> Result<()> {
             );
             d3d12_cmd_list.DrawInstanced(vertices.len() as u32, 1, 0, 0);
 
+            {
+                cimgui_implwin32_new_frame();
+                cimgui_impldx12_new_frame();
+                ImGui_NewFrame();
+
+                ImGui_ShowDemoWindow(std::ptr::null_mut());
+                ImGui_Render();
+
+                cimgui_impldx12_render_draw_data(ImGui_GetDrawData(), d3d12_cmd_list.as_raw() as *mut _);
+
+                let io = *ImGui_GetIO();
+                if io.ConfigFlags & ImGuiConfigFlags__ImGuiConfigFlags_ViewportsEnable != 0 {
+                    ImGui_UpdatePlatformWindows();
+                    ImGui_RenderPlatformWindowsDefault();
+                }
+            }
+
             d3d12_cmd_list.ResourceBarrier(&[create_transition_barrier(
                 &d3d12_back_buffers[active_frame_index as usize],
                 D3D12_RESOURCE_STATE_RENDER_TARGET,
@@ -473,6 +531,12 @@ fn main() -> Result<()> {
         }
 
         wait_for_gpu(&d3d12_frame_fence, wait_event_handle, cpu_frame_index)?;
+
+        {
+            cimgui_impldx12_shutdown();
+            cimgui_implwin32_shutdown();
+            ImGui_DestroyContext(std::ptr::null_mut());
+        }
 
         UnregisterClassA(class_registry_name, Some(exe_handle.into()))?;
 
