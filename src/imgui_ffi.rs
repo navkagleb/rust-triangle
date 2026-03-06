@@ -11,6 +11,7 @@ include!(concat!(env!("OUT_DIR"), "/imgui_bindings.rs"));
 // when calling the original imgui backend functions that expect the plain ImDrawData* type.
 // the backend API is small and stable enough that manual declarations are simpler and more reliable.
 
+use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
 
@@ -18,6 +19,12 @@ unsafe extern "C" {
     pub unsafe fn cimgui_implwin32_init(hwnd: *mut std::ffi::c_void) -> bool;
     pub unsafe fn cimgui_implwin32_shutdown();
     pub unsafe fn cimgui_implwin32_new_frame();
+    pub unsafe fn cimgui_implwin32_wnd_proc_handler(
+        hwnd: HWND,
+        message: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT;
 }
 
 #[repr(C)]

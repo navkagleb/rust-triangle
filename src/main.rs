@@ -49,7 +49,7 @@ fn main() -> Result<()> {
             rect
         };
 
-        let window_handle: HWND = CreateWindowExA(
+        let window_handle = CreateWindowExA(
             WINDOW_EX_STYLE::default(),
             class_registry_name,
             s!("Hello Rust Triangle"),
@@ -81,15 +81,10 @@ fn main() -> Result<()> {
                 {
                     Ok(dxgi_adapter) => {
                         let desc = dxgi_adapter.GetDesc1()?;
-                        let name = wide_to_string(&desc.Description);
+                        println!("Adapter {}: {}", adapter_index, wide_to_string(&desc.Description));
 
-                        println!("Adapter {}: {}", adapter_index, name);
-
+                        selected_dxgi_adapter.get_or_insert(dxgi_adapter);
                         adapter_index += 1;
-
-                        if selected_dxgi_adapter.is_none() {
-                            selected_dxgi_adapter = Some(dxgi_adapter);
-                        }
                     }
                     Err(e) if e.code() == DXGI_ERROR_NOT_FOUND => break,
                     Err(e) => return Err(e),
@@ -409,7 +404,7 @@ fn main() -> Result<()> {
             io.ConfigFlags |= ImGuiConfigFlags__ImGuiConfigFlags_DockingEnable;
             io.ConfigFlags |= ImGuiConfigFlags__ImGuiConfigFlags_ViewportsEnable;
 
-            cimgui_implwin32_init(std::ptr::addr_of!(window_handle) as _);
+            cimgui_implwin32_init(window_handle.0);
             cimgui_impldx12_init(&mut ImGui_ImplDX12_InitInfo {
                 device: d3d12_device.as_raw() as *mut _,
                 command_queue: d3d12_cmd_queue.as_raw() as *mut _,
@@ -490,6 +485,7 @@ fn main() -> Result<()> {
                 ImGui_ShowDemoWindow(std::ptr::null_mut());
                 ImGui_Render();
 
+                d3d12_cmd_list.SetDescriptorHeaps(&[Some(d3d12_resource_heap.clone())]);
                 cimgui_impldx12_render_draw_data(ImGui_GetDrawData(), d3d12_cmd_list.as_raw() as *mut _);
 
                 let io = *ImGui_GetIO();
@@ -518,7 +514,7 @@ fn main() -> Result<()> {
 
             let gpu_frame_index = d3d12_frame_fence.GetCompletedValue();
 
-            if cpu_frame_index - gpu_frame_index >= FRAME_COUNT.into() {
+            if cpu_frame_index - gpu_frame_index >= FRAME_COUNT as u64 {
                 let gpu_frame_index_to_wait = cpu_frame_index - FRAME_COUNT as u64 + 1;
                 wait_for_gpu(&d3d12_frame_fence, wait_event_handle, gpu_frame_index_to_wait)?;
             }
@@ -548,6 +544,10 @@ fn main() -> Result<()> {
 
 extern "system" fn handle_window_message(window_handle: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe {
+        if cimgui_implwin32_wnd_proc_handler(window_handle, message, wparam, lparam).0 != 0 {
+            return LRESULT(1);
+        }
+
         match message {
             WM_DESTROY => {
                 println!("WM_DESTROY");

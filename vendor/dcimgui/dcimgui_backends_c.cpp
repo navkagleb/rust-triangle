@@ -5,6 +5,8 @@
 // Thin C wrappers — these are the only functions Rust needs to call directly.
 // The backend files are compiled as normal C++ separately.
 
+extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
+
 extern "C"
 {
     bool cimgui_implwin32_init(void *hwnd)
@@ -20,6 +22,11 @@ extern "C"
     void cimgui_implwin32_new_frame()
     {
         ImGui_ImplWin32_NewFrame();
+    }
+
+    LRESULT cimgui_implwin32_wnd_proc_handler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
+    {
+        return ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam);
     }
 
     bool cimgui_impldx12_init(ImGui_ImplDX12_InitInfo *info)
