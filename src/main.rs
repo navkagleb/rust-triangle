@@ -3,6 +3,8 @@ use imgui_ffi::*;
 
 use std::mem::ManuallyDrop;
 use std::path::Path;
+use std::time::Duration;
+use std::time::Instant;
 
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Direct3D::*;
@@ -15,6 +17,7 @@ use windows::Win32::System::Threading::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::*;
 
+const WINDOW_REGISTRY_NAME: PCSTR = s!("rust-window");
 const WIDTH: u32 = 1280;
 const HEIGHT: u32 = 720;
 const FRAME_COUNT: u32 = 3;
@@ -24,12 +27,11 @@ fn main() -> Result<()> {
 
     unsafe {
         let exe_handle = GetModuleHandleA(None)?;
-        let class_registry_name = s!("rust-window");
 
         let class_atom = RegisterClassA(&WNDCLASSA {
             style: CS_VREDRAW | CS_HREDRAW | CS_OWNDC,
             hInstance: exe_handle.into(),
-            lpszClassName: class_registry_name,
+            lpszClassName: WINDOW_REGISTRY_NAME,
             lpfnWndProc: Some(handle_window_message),
             ..Default::default()
         });
@@ -37,32 +39,34 @@ fn main() -> Result<()> {
             GetLastError().ok()?;
         }
 
-        let window_rect = {
-            let mut rect = RECT {
-                left: 0,
-                top: 0,
-                right: WIDTH as i32,
-                bottom: HEIGHT as i32,
+        let window_handle = {
+            let window_rect = {
+                let mut rect = RECT {
+                    left: 0,
+                    top: 0,
+                    right: WIDTH as i32,
+                    bottom: HEIGHT as i32,
+                };
+                AdjustWindowRect(&mut rect, WS_OVERLAPPEDWINDOW, false)?;
+
+                rect
             };
-            AdjustWindowRect(&mut rect, WS_OVERLAPPEDWINDOW, false)?;
 
-            rect
+            CreateWindowExA(
+                WINDOW_EX_STYLE::default(),
+                WINDOW_REGISTRY_NAME,
+                s!("Hello Rust Triangle"),
+                WS_OVERLAPPEDWINDOW,
+                (GetSystemMetrics(SM_CXSCREEN) - window_rect.right) / 2,
+                (GetSystemMetrics(SM_CYSCREEN) - window_rect.bottom) / 2,
+                window_rect.right - window_rect.left,
+                window_rect.bottom - window_rect.top,
+                None,
+                None,
+                None,
+                None,
+            )?
         };
-
-        let window_handle = CreateWindowExA(
-            WINDOW_EX_STYLE::default(),
-            class_registry_name,
-            s!("Hello Rust Triangle"),
-            WS_OVERLAPPEDWINDOW,
-            (GetSystemMetrics(SM_CXSCREEN) - window_rect.right) / 2,
-            (GetSystemMetrics(SM_CYSCREEN) - window_rect.bottom) / 2,
-            window_rect.right - window_rect.left,
-            window_rect.bottom - window_rect.top,
-            None,
-            None,
-            Some(exe_handle.into()),
-            None,
-        )?;
 
         println!("{:?}, width: {}, height: {}", window_handle, WIDTH, HEIGHT);
 
@@ -421,8 +425,11 @@ fn main() -> Result<()> {
         }
 
         let mut cpu_frame_index = 0;
+        let mut frame_timer = FrameTimer::new();
 
         loop {
+            let (dt, fps) = frame_timer.tick();
+
             cpu_frame_index += 1;
 
             let mut message = MSG::default();
@@ -482,6 +489,11 @@ fn main() -> Result<()> {
                 cimgui_impldx12_new_frame();
                 ImGui_NewFrame();
 
+                ImGui_Begin(c"Metrics".as_ptr(), std::ptr::null_mut(), 0);
+                let text = std::ffi::CString::new(format!("FPS: {} ({:.2} ms)", fps, dt)).unwrap();
+                ImGui_Text(text.as_ptr());
+                ImGui_End();
+
                 ImGui_ShowDemoWindow(std::ptr::null_mut());
                 ImGui_Render();
 
@@ -526,17 +538,17 @@ fn main() -> Result<()> {
             }
         }
 
-        wait_for_gpu(&d3d12_frame_fence, wait_event_handle, cpu_frame_index)?;
-
         {
             cimgui_impldx12_shutdown();
             cimgui_implwin32_shutdown();
             ImGui_DestroyContext(std::ptr::null_mut());
         }
 
-        UnregisterClassA(class_registry_name, Some(exe_handle.into()))?;
+        wait_for_gpu(&d3d12_frame_fence, wait_event_handle, cpu_frame_index)?;
 
         d3d12_debug_quard.success();
+
+        UnregisterClassA(WINDOW_REGISTRY_NAME, None)?;
     }
 
     Ok(())
@@ -650,5 +662,42 @@ impl Drop for D3D12DebugGuard<'_> {
         if !self.is_ok {
             _ = dump_d3d12_debug_messages(self.d3d12_info_queue);
         }
+    }
+}
+
+struct FrameTimer {
+    last_frame: Instant,
+    accumulated: Duration,
+    frame_count: u32,
+    fps: u32,
+}
+
+impl FrameTimer {
+    fn new() -> Self {
+        let now = Instant::now();
+
+        Self {
+            last_frame: now,
+            accumulated: Duration::ZERO,
+            frame_count: 0,
+            fps: 0,
+        }
+    }
+
+    fn tick(&mut self) -> (f32, u32) {
+        let now = Instant::now();
+        let delta = now.duration_since(self.last_frame);
+
+        self.last_frame = now;
+        self.accumulated += delta;
+        self.frame_count += 1;
+
+        if self.accumulated >= Duration::from_secs(1) {
+            self.fps = (self.frame_count as f32 / self.accumulated.as_secs_f32()) as u32;
+            self.accumulated = Duration::ZERO;
+            self.frame_count = 0;
+        }
+
+        (delta.as_secs_f32() * 1000.0, self.fps)
     }
 }
