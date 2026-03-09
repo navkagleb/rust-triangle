@@ -26,31 +26,27 @@ fn main() -> Result<()> {
     println!("Hello D3D12 Rust Triangle!");
 
     unsafe {
-        let exe_handle = GetModuleHandleA(None)?;
-
         let class_atom = RegisterClassA(&WNDCLASSA {
             style: CS_VREDRAW | CS_HREDRAW | CS_OWNDC,
-            hInstance: exe_handle.into(),
+            hInstance: GetModuleHandleA(None)?.into(),
             lpszClassName: WINDOW_REGISTRY_NAME,
             lpfnWndProc: Some(handle_window_message),
             ..Default::default()
         });
+
         if class_atom == 0 {
             GetLastError().ok()?;
         }
 
         let window_handle = {
-            let window_rect = {
-                let mut rect = RECT {
-                    left: 0,
-                    top: 0,
-                    right: WIDTH as i32,
-                    bottom: HEIGHT as i32,
-                };
-                AdjustWindowRect(&mut rect, WS_OVERLAPPEDWINDOW, false)?;
-
-                rect
+            let mut window_rect = RECT {
+                left: 0,
+                top: 0,
+                right: WIDTH as i32,
+                bottom: HEIGHT as i32,
             };
+
+            AdjustWindowRect(&mut window_rect, WS_OVERLAPPEDWINDOW, false)?;
 
             CreateWindowExA(
                 WINDOW_EX_STYLE::default(),
@@ -115,7 +111,9 @@ fn main() -> Result<()> {
             let mut d3d12_device: Option<ID3D12Device> = None;
             D3D12CreateDevice(&dxgi_adapter, D3D_FEATURE_LEVEL_12_0, &mut d3d12_device)?;
 
-            d3d12_device.unwrap().cast::<ID3D12Device4>()?
+            let d3d12_device = d3d12_device.unwrap();
+            set_d3d12_debug_name(&d3d12_device, w!("MainDevice"))?;
+            d3d12_device.cast::<ID3D12Device4>()?
         };
 
         {
@@ -162,7 +160,8 @@ fn main() -> Result<()> {
         let d3d12_cmd_queue = d3d12_device.CreateCommandQueue::<ID3D12CommandQueue>(&D3D12_COMMAND_QUEUE_DESC {
             Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
             Priority: D3D12_COMMAND_QUEUE_PRIORITY_NORMAL.0,
-            ..Default::default()
+            Flags: D3D12_COMMAND_QUEUE_FLAG_NONE,
+            NodeMask: 0,
         })?;
 
         let d3d12_frame_fence = d3d12_device.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE)?;
@@ -553,11 +552,29 @@ fn main() -> Result<()> {
             ImGui_DestroyContext(std::ptr::null_mut());
         }
 
-        CloseHandle(wait_event_handle)?;
-
         {
-            let debug_device = d3d12_device.cast::<ID3D12DebugDevice>()?;
-            debug_device.ReportLiveDeviceObjects(D3D12_RLDO_DETAIL | D3D12_RLDO_IGNORE_INTERNAL)?;
+            CloseHandle(wait_event_handle)?;
+
+            drop(d3d12_pso);
+            drop(d3d12_root_signature);
+            drop(d3d12_vertex_buffer);
+            drop(d3d12_cmd_list);
+            drop(d3d12_cmd_allocators);
+            drop(d3d12_resource_heap);
+            drop(d3d12_rtv_heap);
+            drop(d3d12_back_buffers);
+            drop(dxgi_swap_chain);
+            drop(d3d12_frame_fence);
+            drop(d3d12_cmd_queue);
+
+            {
+                let debug_device = d3d12_device.cast::<ID3D12DebugDevice>()?;
+                debug_device.ReportLiveDeviceObjects(D3D12_RLDO_DETAIL | D3D12_RLDO_IGNORE_INTERNAL)?;
+            }
+
+            drop(d3d12_device);
+            drop(dxgi_adapter);
+            drop(dxgi_factory);
         }
 
         UnregisterClassA(WINDOW_REGISTRY_NAME, None)?;
@@ -638,6 +655,20 @@ fn create_transition_barrier(
             }),
         },
     }
+}
+
+fn set_d3d12_debug_name<T: Interface>(object: &T, name: PCWSTR) -> Result<()> {
+    unsafe {
+        if let Ok(d3d12_object) = object.cast::<ID3D12Object>() {
+            d3d12_object.SetName(name)?;
+        }
+
+        if let Ok(dxgi_object) = object.cast::<IDXGIObject>() {
+            dxgi_object.SetPrivateData(&WKPDID_D3DDebugObjectName, name.len() as u32, name.as_ptr() as *const _)?;
+        }
+    }
+
+    Ok(())
 }
 
 struct FrameTimer {
