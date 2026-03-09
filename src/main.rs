@@ -107,6 +107,7 @@ fn main() -> Result<()> {
                 println!("Enable D3D12 debug layer");
 
                 d3d12_debug.SetEnableGPUBasedValidation(true);
+                d3d12_debug.SetEnableAutoName(true);
             }
         }
 
@@ -117,8 +118,15 @@ fn main() -> Result<()> {
             d3d12_device.unwrap().cast::<ID3D12Device4>()?
         };
 
-        let d3d12_info_queue = d3d12_device.cast::<ID3D12InfoQueue>()?;
-        let d3d12_debug_quard = D3D12DebugGuard::new(&d3d12_info_queue);
+        {
+            let d3d12_info_queue = d3d12_device.cast::<ID3D12InfoQueue1>()?;
+            d3d12_info_queue.RegisterMessageCallback(
+                Some(d3d12_message_callback),
+                D3D12_MESSAGE_CALLBACK_FLAG_NONE,
+                std::ptr::null_mut(),
+                &mut 0u32,
+            )?;
+        }
 
         {
             let d3d12_shader_model = D3D12_FEATURE_DATA_SHADER_MODEL {
@@ -240,27 +248,21 @@ fn main() -> Result<()> {
         )?;
 
         #[allow(dead_code)]
-        struct Position(f32, f32, f32);
-
-        #[allow(dead_code)]
-        struct Color(f32, f32, f32);
-
-        #[allow(dead_code)]
         struct Vertex {
-            position: Position,
-            color: Color,
+            position: [f32; 3],
+            color: [f32; 3],
         }
 
         impl Vertex {
-            fn new(position: Position, color: Color) -> Self {
+            fn new(position: [f32; 3], color: [f32; 3]) -> Self {
                 Self { position, color }
             }
         }
 
         let vertices = [
-            Vertex::new(Position(0.0, 0.5, 0.0), Color(1.0, 0.0, 0.0)),
-            Vertex::new(Position(0.5, -0.5, 0.0), Color(0.0, 1.0, 0.0)),
-            Vertex::new(Position(-0.5, -0.5, 0.0), Color(0.0, 0.0, 1.0)),
+            Vertex::new([0.0, 0.5, 0.0], [1.0, 0.0, 0.0]),
+            Vertex::new([0.5, -0.5, 0.0], [0.0, 1.0, 0.0]),
+            Vertex::new([-0.5, -0.5, 0.0], [0.0, 0.0, 1.0]),
         ];
 
         let d3d12_vertex_buffer = {
@@ -357,7 +359,7 @@ fn main() -> Result<()> {
                     SemanticIndex: 0,
                     Format: DXGI_FORMAT_R32G32B32_FLOAT,
                     InputSlot: 0,
-                    AlignedByteOffset: size_of::<Position>() as u32,
+                    AlignedByteOffset: size_of::<f32>() as u32 * 3,
                     InputSlotClass: D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
                     InstanceDataStepRate: 0,
                 },
@@ -428,16 +430,25 @@ fn main() -> Result<()> {
         let mut frame_timer = FrameTimer::new();
 
         loop {
-            let (dt, fps) = frame_timer.tick();
+            {
+                let mut message = MSG::default();
+                let mut is_done = false;
 
-            cpu_frame_index += 1;
+                while PeekMessageA(&mut message, None, 0, 0, PM_REMOVE).into() {
+                    _ = TranslateMessage(&message);
+                    DispatchMessageA(&message);
 
-            let mut message = MSG::default();
+                    if message.message == WM_QUIT {
+                        is_done = true;
+                    }
+                }
 
-            while PeekMessageA(&mut message, None, 0, 0, PM_REMOVE).into() {
-                _ = TranslateMessage(&message);
-                DispatchMessageA(&message);
+                if is_done {
+                    break;
+                }
             }
+
+            let (dt, fps) = frame_timer.tick();
 
             let active_frame_index = dxgi_swap_chain.GetCurrentBackBufferIndex();
             let d3d12_cmd_allocator = &d3d12_cmd_allocators[active_frame_index as usize];
@@ -517,12 +528,14 @@ fn main() -> Result<()> {
             let d3d12_cmd_lists: [Option<ID3D12CommandList>; 1] =
                 [Some(d3d12_cmd_list.cast::<ID3D12CommandList>().unwrap())];
             d3d12_cmd_queue.ExecuteCommandLists(&d3d12_cmd_lists);
-            d3d12_cmd_queue.Signal(&d3d12_frame_fence, cpu_frame_index)?;
 
             let code: HRESULT = dxgi_swap_chain.Present(0, DXGI_PRESENT_ALLOW_TEARING);
             if code.is_err() {
                 return Err(code.into());
             }
+
+            cpu_frame_index += 1;
+            d3d12_cmd_queue.Signal(&d3d12_frame_fence, cpu_frame_index)?;
 
             let gpu_frame_index = d3d12_frame_fence.GetCompletedValue();
 
@@ -530,13 +543,9 @@ fn main() -> Result<()> {
                 let gpu_frame_index_to_wait = cpu_frame_index - FRAME_COUNT as u64 + 1;
                 wait_for_gpu(&d3d12_frame_fence, wait_event_handle, gpu_frame_index_to_wait)?;
             }
-
-            dump_d3d12_debug_messages(&d3d12_info_queue)?;
-
-            if message.message == WM_QUIT {
-                break;
-            }
         }
+
+        wait_for_gpu(&d3d12_frame_fence, wait_event_handle, cpu_frame_index)?;
 
         {
             cimgui_impldx12_shutdown();
@@ -544,9 +553,12 @@ fn main() -> Result<()> {
             ImGui_DestroyContext(std::ptr::null_mut());
         }
 
-        wait_for_gpu(&d3d12_frame_fence, wait_event_handle, cpu_frame_index)?;
+        CloseHandle(wait_event_handle)?;
 
-        d3d12_debug_quard.success();
+        {
+            let debug_device = d3d12_device.cast::<ID3D12DebugDevice>()?;
+            debug_device.ReportLiveDeviceObjects(D3D12_RLDO_DETAIL | D3D12_RLDO_IGNORE_INTERNAL)?;
+        }
 
         UnregisterClassA(WINDOW_REGISTRY_NAME, None)?;
     }
@@ -572,40 +584,29 @@ extern "system" fn handle_window_message(window_handle: HWND, message: u32, wpar
     }
 }
 
+extern "system" fn d3d12_message_callback(
+    _category: D3D12_MESSAGE_CATEGORY,
+    severity: D3D12_MESSAGE_SEVERITY,
+    _id: D3D12_MESSAGE_ID,
+    description: PCSTR,
+    _context: *mut std::ffi::c_void,
+) {
+    let severity_str = match severity {
+        D3D12_MESSAGE_SEVERITY_CORRUPTION => "CORRUPTION",
+        D3D12_MESSAGE_SEVERITY_ERROR => "ERROR",
+        D3D12_MESSAGE_SEVERITY_WARNING => "WARNING",
+        D3D12_MESSAGE_SEVERITY_INFO => "INFO",
+        D3D12_MESSAGE_SEVERITY_MESSAGE => "MESSAGE",
+        _ => "",
+    };
+
+    let message = unsafe { std::ffi::CStr::from_ptr(description.0 as _).to_string_lossy() };
+    println!("[D3D12][{}]: {}", severity_str, message);
+}
+
 fn wide_to_string(wide: &[u16]) -> String {
     let end = wide.iter().position(|&c| c == 0).unwrap_or(wide.len());
     String::from_utf16_lossy(&wide[..end])
-}
-
-fn dump_d3d12_debug_messages(d3d12_info_queue: &ID3D12InfoQueue) -> Result<()> {
-    unsafe {
-        let message_count = d3d12_info_queue.GetNumStoredMessages();
-        for i in 0..message_count {
-            let mut message_length = 0;
-            d3d12_info_queue.GetMessage(i, None, &mut message_length)?;
-
-            let mut message_buffer = vec![0u8; message_length];
-            let message = message_buffer.as_mut_ptr() as *mut D3D12_MESSAGE;
-
-            d3d12_info_queue.GetMessage(i, Some(message), &mut message_length)?;
-
-            let message = &*message;
-            let message_severity = match message.Severity {
-                D3D12_MESSAGE_SEVERITY_CORRUPTION => "CORRUPTION",
-                D3D12_MESSAGE_SEVERITY_ERROR => "ERROR",
-                D3D12_MESSAGE_SEVERITY_INFO => "INFO",
-                D3D12_MESSAGE_SEVERITY_MESSAGE => "MESSAGE",
-                D3D12_MESSAGE_SEVERITY_WARNING => "WARNING",
-                _ => "",
-            };
-            let desc = std::ffi::CStr::from_ptr(message.pDescription as *const std::ffi::c_char);
-            println!("[D3D12][{}]: {}", message_severity, desc.to_string_lossy());
-        }
-
-        d3d12_info_queue.ClearStoredMessages();
-    }
-
-    Ok(())
 }
 
 fn wait_for_gpu(d3d12_fence: &ID3D12Fence, wait_event_handle: HANDLE, wait_value: u64) -> Result<()> {
@@ -636,32 +637,6 @@ fn create_transition_barrier(
                 StateAfter: state_after,
             }),
         },
-    }
-}
-
-struct D3D12DebugGuard<'a> {
-    d3d12_info_queue: &'a ID3D12InfoQueue,
-    is_ok: bool,
-}
-
-impl<'a> D3D12DebugGuard<'a> {
-    fn new(d3d12_info_queue: &'a ID3D12InfoQueue) -> Self {
-        Self {
-            d3d12_info_queue,
-            is_ok: false,
-        }
-    }
-
-    fn success(mut self) {
-        self.is_ok = true;
-    }
-}
-
-impl Drop for D3D12DebugGuard<'_> {
-    fn drop(&mut self) {
-        if !self.is_ok {
-            _ = dump_d3d12_debug_messages(self.d3d12_info_queue);
-        }
     }
 }
 
