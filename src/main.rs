@@ -17,6 +17,9 @@ use windows::Win32::System::Threading::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::*;
 
+use glam::Mat4;
+use glam::Vec3;
+
 const WINDOW_REGISTRY_NAME: PCSTR = s!("rust-window");
 const WIDTH: u32 = 1280;
 const HEIGHT: u32 = 720;
@@ -24,8 +27,103 @@ const FRAME_COUNT: u32 = 3;
 const BACK_BUFFER_FORMAT: DXGI_FORMAT = DXGI_FORMAT_R8G8B8A8_UNORM;
 const DEPTH_BUFFER_FORMAT: DXGI_FORMAT = DXGI_FORMAT_D32_FLOAT;
 
+#[allow(dead_code)]
+#[derive(Debug)]
+struct MeshVertex {
+    position: (f32, f32, f32),
+    normal: (f32, f32, f32),
+}
+
+struct Mesh {
+    vertex_offset: u32,
+    vertex_count: u32,
+    index_offset: u32,
+    index_count: u32,
+}
+
+struct MeshGeometry {
+    vertices: Vec<MeshVertex>,
+    indices: Vec<u32>,
+    meshes: Vec<Mesh>,
+}
+
+impl MeshGeometry {
+    fn load(path: &str) -> Option<Self> {
+        let (gltf, buffers, _) = gltf::import(path).map_err(|e| println!("GLTF error: {}", e)).ok()?;
+
+        assert_eq!(gltf.scenes().len(), 1);
+        assert_eq!(gltf.nodes().len(), 1);
+
+        let mut vertex_count = 0;
+        let mut index_count = 0;
+        let mut meshes = Vec::new();
+
+        for mesh in gltf.meshes() {
+            for primitive in mesh.primitives() {
+                let position_accessor = primitive.get(&gltf::Semantic::Positions)?;
+                let normal_accessor = primitive.get(&gltf::Semantic::Normals)?;
+
+                assert_eq!(position_accessor.count(), normal_accessor.count());
+                assert_eq!(primitive.mode(), gltf::mesh::Mode::Triangles);
+
+                let mesh = Mesh {
+                    vertex_offset: vertex_count,
+                    vertex_count: position_accessor.count() as u32,
+                    index_offset: index_count,
+                    index_count: primitive.indices()?.count() as u32,
+                };
+
+                vertex_count += mesh.vertex_count;
+                index_count += mesh.index_count;
+                meshes.push(mesh);
+            }
+        }
+
+        let mut result = Self {
+            vertices: Vec::with_capacity(vertex_count as usize),
+            indices: Vec::with_capacity(index_count as usize),
+            meshes,
+        };
+
+        for mesh in gltf.meshes() {
+            for primitive in mesh.primitives() {
+                let reader = primitive.reader(|buffer| Some(&buffers[buffer.index()]));
+
+                result
+                    .vertices
+                    .extend(std::iter::zip(reader.read_positions()?, reader.read_normals()?).map(
+                        |(position, normal)| MeshVertex {
+                            position: position.into(),
+                            normal: normal.into(),
+                        },
+                    ));
+
+                result.indices.extend(reader.read_indices()?.into_u32());
+            }
+        }
+
+        Some(result)
+    }
+}
+
 fn main() -> Result<()> {
     println!("Hello D3D12 Rust Triangle!");
+
+    let mesh_geometry = MeshGeometry::load("assets/Dinosaur.glb").unwrap();
+    println!(
+        "vertex count: {}, index count: {}",
+        mesh_geometry.vertices.len(),
+        mesh_geometry.indices.len()
+    );
+
+    let cam_pos = Vec3::new(0.0, 50.0, 200.0);
+    let cam_front_dir = Vec3::new(0.0, 0.0, -1.0).normalize();
+    let fov_y = 90_f32.to_radians();
+    let near_plane = 0.1;
+
+    let world_to_view = Mat4::look_to_lh(cam_pos, cam_front_dir, Vec3::Y);
+    let view_to_clip = Mat4::perspective_infinite_reverse_lh(fov_y, WIDTH as f32 / HEIGHT as f32, near_plane);
+    let world_to_clip = view_to_clip * world_to_view;
 
     unsafe {
         let class_atom = RegisterClassA(&WNDCLASSA {
@@ -114,7 +212,7 @@ fn main() -> Result<()> {
             D3D12CreateDevice(&dxgi_adapter, D3D_FEATURE_LEVEL_12_0, &mut d3d12_device)?;
 
             let d3d12_device = d3d12_device.unwrap();
-            set_d3d12_debug_name(&d3d12_device, w!("MainDevice"))?;
+            d3d12_device.set_debug_name("MainDevice")?;
             d3d12_device.cast::<ID3D12Device4>()?
         };
 
@@ -294,79 +392,29 @@ fn main() -> Result<()> {
             D3D12_COMMAND_LIST_FLAG_NONE,
         )?;
 
-        #[allow(dead_code)]
-        struct Vertex {
-            position: [f32; 3],
-            color: [f32; 3],
-        }
-
-        impl Vertex {
-            fn new(position: [f32; 3], color: [f32; 3]) -> Self {
-                Self { position, color }
-            }
-        }
-
-        let vertices = [
-            Vertex::new([0.0, 0.5, 0.0], [1.0, 0.0, 0.0]),
-            Vertex::new([0.5, -0.5, 0.0], [0.0, 1.0, 0.0]),
-            Vertex::new([-0.5, -0.5, 0.0], [0.0, 0.0, 1.0]),
-        ];
-
-        let d3d12_vertex_buffer = {
-            let mut d3d12_resource: Option<ID3D12Resource> = None;
-            d3d12_device.CreateCommittedResource(
-                &D3D12_HEAP_PROPERTIES {
-                    Type: D3D12_HEAP_TYPE_UPLOAD,
-                    CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
-                    MemoryPoolPreference: D3D12_MEMORY_POOL_UNKNOWN,
-                    CreationNodeMask: 1,
-                    VisibleNodeMask: 1,
-                },
-                D3D12_HEAP_FLAG_NONE,
-                &D3D12_RESOURCE_DESC {
-                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-                    Alignment: 0,
-                    Width: (vertices.len() * size_of::<Vertex>()) as u64,
-                    Height: 1,
-                    DepthOrArraySize: 1,
-                    MipLevels: 1,
-                    Format: DXGI_FORMAT_UNKNOWN,
-                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-                    Flags: D3D12_RESOURCE_FLAG_NONE,
-                },
-                D3D12_RESOURCE_STATE_GENERIC_READ,
-                None,
-                &mut d3d12_resource,
-            )?;
-
-            let d3d12_resource = d3d12_resource.unwrap();
-
-            let mut mapped_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-            d3d12_resource.Map(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }), Some(&mut mapped_ptr))?;
-
-            let vertex_ptr = mapped_ptr as *mut Vertex;
-            std::ptr::copy_nonoverlapping(vertices.as_ptr(), vertex_ptr, vertices.len());
-
-            d3d12_resource.Unmap(
-                0,
-                Some(&D3D12_RANGE {
-                    Begin: 0,
-                    End: std::mem::size_of_val(&vertices),
-                }),
-            );
-
-            d3d12_resource
-        };
+        let d3d12_vertex_buffer = ID3D12Resource::new_upload_buffer(&d3d12_device, mesh_geometry.vertices.as_slice())?;
+        let d3d12_index_buffer = ID3D12Resource::new_upload_buffer(&d3d12_device, mesh_geometry.indices.as_slice())?;
 
         let d3d12_root_signature = {
             let mut blob: Option<ID3DBlob> = None;
             let mut error: Option<ID3DBlob> = None;
 
+            let root_params = [D3D12_ROOT_PARAMETER {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+                Anonymous: D3D12_ROOT_PARAMETER_0 {
+                    Constants: D3D12_ROOT_CONSTANTS {
+                        ShaderRegister: 0,
+                        RegisterSpace: 0,
+                        Num32BitValues: 16,
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            }];
+
             D3D12SerializeRootSignature(
                 &D3D12_ROOT_SIGNATURE_DESC {
-                    NumParameters: 0,
-                    pParameters: std::ptr::null(),
+                    NumParameters: root_params.len() as u32,
+                    pParameters: root_params.as_ptr(),
                     NumStaticSamplers: 0,
                     pStaticSamplers: std::ptr::null(),
                     Flags: D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT,
@@ -402,7 +450,7 @@ fn main() -> Result<()> {
                     InstanceDataStepRate: 0,
                 },
                 D3D12_INPUT_ELEMENT_DESC {
-                    SemanticName: s!("sem_Color"),
+                    SemanticName: s!("sem_Normal"),
                     SemanticIndex: 0,
                     Format: DXGI_FORMAT_R32G32B32_FLOAT,
                     InputSlot: 0,
@@ -525,7 +573,7 @@ fn main() -> Result<()> {
                 bottom: HEIGHT as i32,
             }]);
 
-            d3d12_cmd_list.ResourceBarrier(&[create_transition_barrier(
+            d3d12_cmd_list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER::new_transition(
                 &d3d12_back_buffers[active_frame_index as usize],
                 D3D12_RESOURCE_STATE_PRESENT,
                 D3D12_RESOURCE_STATE_RENDER_TARGET,
@@ -539,16 +587,33 @@ fn main() -> Result<()> {
 
             d3d12_cmd_list.SetGraphicsRootSignature(&d3d12_root_signature);
             d3d12_cmd_list.SetPipelineState(&d3d12_pso);
+
+            d3d12_cmd_list.SetGraphicsRoot32BitConstants(0, 16, std::ptr::from_ref(&world_to_clip).cast(), 0);
+
             d3d12_cmd_list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             d3d12_cmd_list.IASetVertexBuffers(
                 0,
                 Some(&[D3D12_VERTEX_BUFFER_VIEW {
                     BufferLocation: d3d12_vertex_buffer.GetGPUVirtualAddress(),
-                    SizeInBytes: std::mem::size_of_val(&vertices) as u32,
-                    StrideInBytes: size_of::<Vertex>() as u32,
+                    SizeInBytes: std::mem::size_of_val(mesh_geometry.vertices.as_slice()) as u32,
+                    StrideInBytes: size_of::<MeshVertex>() as u32,
                 }]),
             );
-            d3d12_cmd_list.DrawInstanced(vertices.len() as u32, 1, 0, 0);
+            d3d12_cmd_list.IASetIndexBuffer(Some(&D3D12_INDEX_BUFFER_VIEW {
+                BufferLocation: d3d12_index_buffer.GetGPUVirtualAddress(),
+                SizeInBytes: std::mem::size_of_val(mesh_geometry.indices.as_slice()) as u32,
+                Format: DXGI_FORMAT_R32_UINT,
+            }));
+
+            for mesh in &mesh_geometry.meshes {
+                d3d12_cmd_list.DrawIndexedInstanced(
+                    mesh.index_count,
+                    1,
+                    mesh.index_offset,
+                    mesh.vertex_offset as i32,
+                    0,
+                );
+            }
 
             {
                 cimgui_implwin32_new_frame();
@@ -573,7 +638,7 @@ fn main() -> Result<()> {
                 }
             }
 
-            d3d12_cmd_list.ResourceBarrier(&[create_transition_barrier(
+            d3d12_cmd_list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER::new_transition(
                 &d3d12_back_buffers[active_frame_index as usize],
                 D3D12_RESOURCE_STATE_RENDER_TARGET,
                 D3D12_RESOURCE_STATE_PRESENT,
@@ -613,6 +678,7 @@ fn main() -> Result<()> {
 
             drop(d3d12_pso);
             drop(d3d12_root_signature);
+            drop(d3d12_index_buffer);
             drop(d3d12_vertex_buffer);
             drop(d3d12_cmd_list);
             drop(d3d12_cmd_allocators);
@@ -695,6 +761,37 @@ fn wait_for_gpu(d3d12_fence: &ID3D12Fence, wait_event_handle: HANDLE, wait_value
 
     Ok(())
 }
+
+trait InterfaceExt {
+    fn set_debug_name(&self, name: &str) -> Result<()>;
+}
+
+impl<T> InterfaceExt for T
+where
+    T: Interface,
+{
+    fn set_debug_name(&self, name: &str) -> Result<()> {
+        let wide = name.encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
+        let native_wide = PCWSTR::from_raw(wide.as_ptr());
+
+        unsafe {
+            if let Ok(d3d12_object) = self.cast::<ID3D12Object>() {
+                d3d12_object.SetName(native_wide)?;
+            }
+
+            if let Ok(dxgi_object) = self.cast::<IDXGIObject>() {
+                dxgi_object.SetPrivateData(
+                    &WKPDID_D3DDebugObjectName,
+                    native_wide.len() as u32,
+                    native_wide.as_ptr() as *const _,
+                )?;
+            }
+        }
+
+        Ok(())
+    }
+}
+
 trait D3D12HeapPropertiesExt {
     fn from_heap_type(d3d12_heap_type: D3D12_HEAP_TYPE) -> Self;
 }
@@ -711,37 +808,84 @@ impl D3D12HeapPropertiesExt for D3D12_HEAP_PROPERTIES {
     }
 }
 
-fn create_transition_barrier(
-    d3d12_resource: &ID3D12Resource,
-    state_before: D3D12_RESOURCE_STATES,
-    state_after: D3D12_RESOURCE_STATES,
-) -> D3D12_RESOURCE_BARRIER {
-    D3D12_RESOURCE_BARRIER {
-        Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
-        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-        Anonymous: D3D12_RESOURCE_BARRIER_0 {
-            Transition: ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
-                pResource: unsafe { std::mem::transmute_copy(d3d12_resource) },
-                Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
-                StateBefore: state_before,
-                StateAfter: state_after,
-            }),
-        },
+trait D3D12ResourceBarrierExt {
+    fn new_transition(
+        resource: &ID3D12Resource,
+        state_before: D3D12_RESOURCE_STATES,
+        state_after: D3D12_RESOURCE_STATES,
+    ) -> Self;
+}
+
+impl D3D12ResourceBarrierExt for D3D12_RESOURCE_BARRIER {
+    fn new_transition(
+        resource: &ID3D12Resource,
+        state_before: D3D12_RESOURCE_STATES,
+        state_after: D3D12_RESOURCE_STATES,
+    ) -> Self {
+        Self {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                Transition: ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                    pResource: unsafe { std::mem::transmute_copy(resource) },
+                    Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                    StateBefore: state_before,
+                    StateAfter: state_after,
+                }),
+            },
+        }
     }
 }
 
-fn set_d3d12_debug_name<T: Interface>(object: &T, name: PCWSTR) -> Result<()> {
-    unsafe {
-        if let Ok(d3d12_object) = object.cast::<ID3D12Object>() {
-            d3d12_object.SetName(name)?;
+trait D3D12ResourceExt {
+    fn new_upload_buffer<T>(d3d12_device: &ID3D12Device, items: &[T]) -> Result<ID3D12Resource>;
+}
+
+impl D3D12ResourceExt for ID3D12Resource {
+    fn new_upload_buffer<T>(d3d12_device: &ID3D12Device, items: &[T]) -> Result<ID3D12Resource> {
+        let mut d3d12_resource: Option<ID3D12Resource> = None;
+        unsafe {
+            d3d12_device.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES::from_heap_type(D3D12_HEAP_TYPE_UPLOAD),
+                D3D12_HEAP_FLAG_NONE,
+                &D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                    Alignment: 0,
+                    Width: std::mem::size_of_val(items) as u64,
+                    Height: 1,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    Format: DXGI_FORMAT_UNKNOWN,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                    Flags: D3D12_RESOURCE_FLAG_NONE,
+                },
+                D3D12_RESOURCE_STATE_GENERIC_READ,
+                None,
+                &mut d3d12_resource,
+            )?;
         }
 
-        if let Ok(dxgi_object) = object.cast::<IDXGIObject>() {
-            dxgi_object.SetPrivateData(&WKPDID_D3DDebugObjectName, name.len() as u32, name.as_ptr() as *const _)?;
+        let d3d12_resource = d3d12_resource.unwrap();
+
+        let mut mapped_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+        unsafe { d3d12_resource.Map(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }), Some(&mut mapped_ptr))? };
+
+        let items_ptr = mapped_ptr as *mut T;
+        unsafe { std::ptr::copy_nonoverlapping(items.as_ptr(), items_ptr, items.len()) };
+
+        unsafe {
+            d3d12_resource.Unmap(
+                0,
+                Some(&D3D12_RANGE {
+                    Begin: 0,
+                    End: std::mem::size_of_val(items),
+                }),
+            );
         }
+
+        Ok(d3d12_resource)
     }
-
-    Ok(())
 }
 
 struct FrameTimer {

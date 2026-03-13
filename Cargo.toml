@@ -8,7 +8,12 @@ bindgen = "=0.72.1"
 cc = "1.2.56"
 
 [dependencies]
-rand = "0.10.0"
+gltf = "1.4.1"
+
+[dependencies.glam]
+package = "glam"
+git = "https://github.com/bitshifter/glam-rs"
+tag = "0.32.0"
 
 [dependencies.windows]
 package = "windows"
