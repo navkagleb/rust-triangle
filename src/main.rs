@@ -21,6 +21,8 @@ const WINDOW_REGISTRY_NAME: PCSTR = s!("rust-window");
 const WIDTH: u32 = 1280;
 const HEIGHT: u32 = 720;
 const FRAME_COUNT: u32 = 3;
+const BACK_BUFFER_FORMAT: DXGI_FORMAT = DXGI_FORMAT_R8G8B8A8_UNORM;
+const DEPTH_BUFFER_FORMAT: DXGI_FORMAT = DXGI_FORMAT_D32_FLOAT;
 
 fn main() -> Result<()> {
     println!("Hello D3D12 Rust Triangle!");
@@ -187,7 +189,7 @@ fn main() -> Result<()> {
                     &DXGI_SWAP_CHAIN_DESC1 {
                         Width: WIDTH,
                         Height: HEIGHT,
-                        Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                        Format: BACK_BUFFER_FORMAT,
                         Stereo: BOOL(0),
                         SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
                         BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
@@ -203,13 +205,50 @@ fn main() -> Result<()> {
                 .cast::<IDXGISwapChain3>()?
         };
 
-        let d3d12_back_buffers: [ID3D12Resource; FRAME_COUNT as usize] =
+        let d3d12_back_buffers: [_; FRAME_COUNT as usize] =
             std::array::from_fn(|i| dxgi_swap_chain.GetBuffer(i as u32).unwrap());
+
+        let d3d12_depth_buffer = {
+            let mut resource: Option<ID3D12Resource> = None;
+            d3d12_device.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES::from_heap_type(D3D12_HEAP_TYPE_DEFAULT),
+                D3D12_HEAP_FLAG_NONE,
+                &D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                    Width: WIDTH as u64,
+                    Height: HEIGHT,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    Format: DXGI_FORMAT_D32_FLOAT,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Flags: D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+                    ..Default::default()
+                },
+                D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                Some(&D3D12_CLEAR_VALUE {
+                    Format: DXGI_FORMAT_D32_FLOAT,
+                    Anonymous: D3D12_CLEAR_VALUE_0 {
+                        DepthStencil: D3D12_DEPTH_STENCIL_VALUE { Depth: 0.0, Stencil: 0 },
+                    },
+                }),
+                &mut resource,
+            )?;
+
+            resource.unwrap()
+        };
 
         let d3d12_rtv_heap =
             d3d12_device.CreateDescriptorHeap::<ID3D12DescriptorHeap>(&D3D12_DESCRIPTOR_HEAP_DESC {
                 NumDescriptors: FRAME_COUNT,
                 Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+                NodeMask: 0,
+            })?;
+
+        let d3d12_dsv_heap =
+            d3d12_device.CreateDescriptorHeap::<ID3D12DescriptorHeap>(&D3D12_DESCRIPTOR_HEAP_DESC {
+                NumDescriptors: 1,
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
                 Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
                 NodeMask: 0,
             })?;
@@ -222,7 +261,7 @@ fn main() -> Result<()> {
                 NodeMask: 0,
             })?;
 
-        let d3d12_rtvs: [D3D12_CPU_DESCRIPTOR_HANDLE; FRAME_COUNT as usize] = std::array::from_fn(|i| {
+        let d3d12_rtvs: [_; FRAME_COUNT as usize] = std::array::from_fn(|i| {
             let rtv_begin_ptr = d3d12_rtv_heap.GetCPUDescriptorHandleForHeapStart().ptr;
             let rtv_size = d3d12_device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV) as usize;
             let rtv = D3D12_CPU_DESCRIPTOR_HANDLE {
@@ -234,9 +273,18 @@ fn main() -> Result<()> {
             rtv
         });
 
-        let d3d12_cmd_allocators: [ID3D12CommandAllocator; FRAME_COUNT as usize] = std::array::from_fn(|_| {
+        let d3d12_dsv = {
+            let dsv_begin_ptr = d3d12_dsv_heap.GetCPUDescriptorHandleForHeapStart().ptr;
+            let dsv = D3D12_CPU_DESCRIPTOR_HANDLE { ptr: dsv_begin_ptr };
+
+            d3d12_device.CreateDepthStencilView(&d3d12_depth_buffer, None, dsv);
+
+            dsv
+        };
+
+        let d3d12_cmd_allocators: [_; FRAME_COUNT as usize] = std::array::from_fn(|_| {
             d3d12_device
-                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+                .CreateCommandAllocator::<ID3D12CommandAllocator>(D3D12_COMMAND_LIST_TYPE_DIRECT)
                 .unwrap()
         });
 
@@ -383,6 +431,12 @@ fn main() -> Result<()> {
                     FrontCounterClockwise: BOOL(0),
                     ..Default::default()
                 },
+                DepthStencilState: D3D12_DEPTH_STENCIL_DESC {
+                    DepthEnable: BOOL(1),
+                    DepthWriteMask: D3D12_DEPTH_WRITE_MASK_ALL,
+                    DepthFunc: D3D12_COMPARISON_FUNC_GREATER,
+                    ..Default::default()
+                },
                 InputLayout: D3D12_INPUT_LAYOUT_DESC {
                     pInputElementDescs: input_elements.as_ptr(),
                     NumElements: input_elements.len() as u32,
@@ -391,10 +445,10 @@ fn main() -> Result<()> {
                 NumRenderTargets: 1,
                 RTVFormats: {
                     let mut formats = [DXGI_FORMAT_UNKNOWN; 8];
-                    formats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+                    formats[0] = BACK_BUFFER_FORMAT;
                     formats
                 },
-                DSVFormat: DXGI_FORMAT_UNKNOWN,
+                DSVFormat: DEPTH_BUFFER_FORMAT,
                 SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
                 ..Default::default()
             })?
@@ -414,8 +468,8 @@ fn main() -> Result<()> {
                 device: d3d12_device.as_raw() as *mut _,
                 command_queue: d3d12_cmd_queue.as_raw() as *mut _,
                 num_frames_in_flight: FRAME_COUNT as i32,
-                rtv_format: DXGI_FORMAT_R8G8B8A8_UNORM,
-                dsv_format: DXGI_FORMAT_UNKNOWN,
+                rtv_format: BACK_BUFFER_FORMAT,
+                dsv_format: DEPTH_BUFFER_FORMAT,
                 user_data: std::ptr::null_mut(),
                 srv_descriptor_heap: d3d12_resource_heap.as_raw() as *mut _,
                 srv_descriptor_alloc_fn: None,
@@ -478,8 +532,9 @@ fn main() -> Result<()> {
 
             let d3d12_rtv = d3d12_rtvs[active_frame_index as usize];
 
-            d3d12_cmd_list.OMSetRenderTargets(1, Some(&d3d12_rtv), false, None);
+            d3d12_cmd_list.OMSetRenderTargets(1, Some(&d3d12_rtv), false, Some(&d3d12_dsv));
             d3d12_cmd_list.ClearRenderTargetView(d3d12_rtv, &[0.3, 0.3, 0.3, 1.0], None);
+            d3d12_cmd_list.ClearDepthStencilView(d3d12_dsv, D3D12_CLEAR_FLAG_DEPTH, 0.0, 0, None);
 
             d3d12_cmd_list.SetGraphicsRootSignature(&d3d12_root_signature);
             d3d12_cmd_list.SetPipelineState(&d3d12_pso);
@@ -561,7 +616,9 @@ fn main() -> Result<()> {
             drop(d3d12_cmd_list);
             drop(d3d12_cmd_allocators);
             drop(d3d12_resource_heap);
+            drop(d3d12_dsv_heap);
             drop(d3d12_rtv_heap);
+            drop(d3d12_depth_buffer);
             drop(d3d12_back_buffers);
             drop(dxgi_swap_chain);
             drop(d3d12_frame_fence);
@@ -636,6 +693,21 @@ fn wait_for_gpu(d3d12_fence: &ID3D12Fence, wait_event_handle: HANDLE, wait_value
     }
 
     Ok(())
+}
+trait D3D12HeapPropertiesExt {
+    fn from_heap_type(d3d12_heap_type: D3D12_HEAP_TYPE) -> Self;
+}
+
+impl D3D12HeapPropertiesExt for D3D12_HEAP_PROPERTIES {
+    fn from_heap_type(d3d12_heap_type: D3D12_HEAP_TYPE) -> Self {
+        Self {
+            Type: d3d12_heap_type,
+            CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
+            MemoryPoolPreference: D3D12_MEMORY_POOL_UNKNOWN,
+            CreationNodeMask: 1,
+            VisibleNodeMask: 1,
+        }
+    }
 }
 
 fn create_transition_barrier(
