@@ -1,4 +1,6 @@
-use std::fs::{File, create_dir_all, read_dir, remove_file};
+use core::fmt;
+use std::collections::HashMap;
+use std::fs::{File, create_dir_all, read_dir, read_to_string, remove_file};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -54,12 +56,48 @@ fn gen_imgui_bindings() {
         .expect("Failed to write ImGui bindings");
 }
 
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ShaderType {
+    Vs,
+    Ps,
+}
+
+impl ShaderType {
+    fn entry_point(&self) -> &str {
+        match self {
+            ShaderType::Vs => "VsMain",
+            ShaderType::Ps => "PsMain",
+        }
+    }
+
+    fn target(&self) -> &str {
+        match self {
+            ShaderType::Vs => "vs_6_6",
+            ShaderType::Ps => "ps_6_6",
+        }
+    }
+}
+
+impl fmt::Display for ShaderType {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            ShaderType::Vs => write!(f, "vs"),
+            ShaderType::Ps => write!(f, "ps"),
+        }
+    }
+}
+
 fn compile_shaders() {
     let dxc_exe = Path::new("tools").join("dxc").join("dxc.exe");
     let shaders_dir = Path::new("src").join("shaders");
 
     let dxil_dir = Path::new("target").join("dxil");
     create_dir_all(&dxil_dir).expect("Failed to create DXIL directory");
+
+    let shaders_file = read_to_string("src/shaders/shaders.json").expect("No shaders.json file");
+    let shaders = serde_json::from_str::<HashMap<String, Vec<ShaderType>>>(&shaders_file)
+        .expect("Failed to deserialize shaders.json");
 
     let dir_iter = read_dir(shaders_dir).expect("Failed to read shaders directory");
 
@@ -69,24 +107,29 @@ fn compile_shaders() {
         }
 
         let shader_filename = source_path.file_name().unwrap().to_str().unwrap();
-        let shader_type = shader_filename.split('.').rev().nth(1).unwrap();
+        let shader_types = &shaders[shader_filename];
 
-        let target = match shader_type {
-            "vs" => "vs_6_6",
-            "ps" => "ps_6_6",
-            _ => panic!("Unknown shader type in filename: {:?}", shader_filename),
-        };
+        for shader_type in shader_types {
+            let dest_path = dxil_dir
+                .join(shader_filename)
+                .with_extension(format!("{}.dxil", shader_type));
+            File::create(&dest_path).expect("Failed to create DXIL file");
 
-        let dest_path = dxil_dir.join(shader_filename).with_extension("dxil");
-        File::create(&dest_path).expect("Failed to create DXIL file");
-
-        compile_shader(&dxc_exe, &source_path, &dest_path, target);
+            compile_shader(&dxc_exe, &source_path, &dest_path, shader_type);
+        }
     }
 }
 
-fn compile_shader(dxc_exe: &Path, source: &Path, dest: &Path, target: &str) {
+fn compile_shader(dxc_exe: &Path, source: &Path, dest: &Path, shader_type: &ShaderType) {
     let result = Command::new(dxc_exe)
-        .args(["-T", target, "-E", "Main", "-Fo", dest.to_str().unwrap()])
+        .args([
+            "-T",
+            shader_type.target(),
+            "-E",
+            shader_type.entry_point(),
+            "-Fo",
+            dest.to_str().unwrap(),
+        ])
         .arg(source)
         .output()
         .expect("Failed to run dxc.exe");
@@ -94,11 +137,17 @@ fn compile_shader(dxc_exe: &Path, source: &Path, dest: &Path, target: &str) {
     if !result.status.success() {
         _ = remove_file(dest);
         panic!(
-            "Failed to compile shader {}.\n{}",
+            "Failed to compile shader {} + {}.\n{}",
             source.display(),
+            shader_type,
             String::from_utf8_lossy(&result.stderr)
         );
     }
 
-    println!("cargo:warning=[OK] {}", source.display());
+    println!(
+        "cargo:warning=[OK] {} + {} -> {}",
+        source.display(),
+        shader_type,
+        dest.display()
+    );
 }

@@ -1,0 +1,6 @@
+{
+    "triangle.hlsl": [
+        "vs",
+        "ps"
+    ]
+}
