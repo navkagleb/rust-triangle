@@ -506,6 +506,7 @@ fn main() -> Result<()> {
             let active_frame_index = dxgi_swap_chain.GetCurrentBackBufferIndex();
             let d3d12_cmd_allocator = &d3d12_cmd_allocators[active_frame_index as usize];
 
+            d3d12_cmd_allocator.Reset()?;
             d3d12_cmd_list.Reset(d3d12_cmd_allocator, None)?;
 
             d3d12_cmd_list.RSSetViewports(&[D3D12_VIEWPORT {
