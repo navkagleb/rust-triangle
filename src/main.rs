@@ -1,10 +1,10 @@
 mod imgui_ffi;
 use imgui_ffi::*;
 
+use std::ffi::CString;
 use std::mem::ManuallyDrop;
-use std::path::Path;
-use std::time::Duration;
-use std::time::Instant;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Direct3D::*;
@@ -18,7 +18,10 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::*;
 
 use glam::Mat4;
+use glam::Quat;
 use glam::Vec3;
+
+use rand::prelude::*;
 
 const WINDOW_REGISTRY_NAME: PCSTR = s!("rust-window");
 const WIDTH: u32 = 1280;
@@ -26,6 +29,36 @@ const HEIGHT: u32 = 720;
 const FRAME_COUNT: u32 = 3;
 const BACK_BUFFER_FORMAT: DXGI_FORMAT = DXGI_FORMAT_R8G8B8A8_UNORM;
 const DEPTH_BUFFER_FORMAT: DXGI_FORMAT = DXGI_FORMAT_D32_FLOAT;
+
+struct ScopedTimer {
+    label: &'static str,
+    begin: Instant,
+}
+
+impl ScopedTimer {
+    fn new(label: &'static str) -> Self {
+        Self {
+            label,
+            begin: Instant::now(),
+        }
+    }
+}
+
+impl Drop for ScopedTimer {
+    fn drop(&mut self) {
+        println!(
+            "[TIMED] {}: {:.2}ms",
+            self.label,
+            self.begin.elapsed().as_secs_f32() * 1000.0
+        );
+    }
+}
+
+macro_rules! scope_time {
+    ($label:expr) => {
+        let _timer = ScopedTimer::new($label);
+    };
+}
 
 #[allow(dead_code)]
 #[derive(Debug)]
@@ -48,7 +81,7 @@ struct MeshGeometry {
 }
 
 impl MeshGeometry {
-    fn load(path: &str) -> Option<Self> {
+    fn load(path: &Path) -> Option<Self> {
         let (gltf, buffers, _) = gltf::import(path).map_err(|e| println!("GLTF error: {}", e)).ok()?;
 
         assert_eq!(gltf.scenes().len(), 1);
@@ -106,24 +139,66 @@ impl MeshGeometry {
     }
 }
 
+struct GpuMeshGeometry {
+    local_to_world: Mat4,
+    meshes: Vec<Mesh>,
+    d3d12_vertex_buffer: ID3D12Resource,
+    d3d12_index_buffer: ID3D12Resource,
+    vertex_count: usize,
+    index_count: usize,
+}
+
+impl GpuMeshGeometry {
+    fn upload(d3d12_device: &ID3D12Device, mesh_geometry: MeshGeometry) -> Option<Self> {
+        let d3d12_vertex_buffer = ID3D12Resource::new_upload_buffer(d3d12_device, &mesh_geometry.vertices).ok()?;
+        let d3d12_index_buffer = ID3D12Resource::new_upload_buffer(d3d12_device, &mesh_geometry.indices).ok()?;
+
+        Some(Self {
+            local_to_world: Mat4::IDENTITY,
+            d3d12_vertex_buffer,
+            d3d12_index_buffer,
+            meshes: mesh_geometry.meshes,
+            vertex_count: mesh_geometry.vertices.len(),
+            index_count: mesh_geometry.indices.len(),
+        })
+    }
+}
+
 fn main() -> Result<()> {
     println!("Hello D3D12 Rust Triangle!");
 
-    let mesh_geometry = MeshGeometry::load("assets/Dinosaur.glb").unwrap();
-    println!(
-        "vertex count: {}, index count: {}",
-        mesh_geometry.vertices.len(),
-        mesh_geometry.indices.len()
-    );
-
-    let cam_pos = Vec3::new(0.0, 50.0, 200.0);
-    let cam_front_dir = Vec3::new(0.0, 0.0, -1.0).normalize();
+    let cam_pos = Vec3::ZERO;
+    let cam_front_dir = Vec3::new(0.0, 0.0, 1.0).normalize();
     let fov_y = 90_f32.to_radians();
     let near_plane = 0.1;
 
     let world_to_view = Mat4::look_to_lh(cam_pos, cam_front_dir, Vec3::Y);
     let view_to_clip = Mat4::perspective_infinite_reverse_lh(fov_y, WIDTH as f32 / HEIGHT as f32, near_plane);
     let world_to_clip = view_to_clip * world_to_view;
+
+    let (load_mesh_tx, load_mesh_rx) = std::sync::mpsc::channel::<PathBuf>();
+    let (upload_mesh_tx, upload_mesh_rx) = std::sync::mpsc::channel::<MeshGeometry>();
+
+    let load_mesh_thread = std::thread::Builder::new()
+        .name("MeshLoader".to_string())
+        .spawn(move || {
+            while let Ok(path) = load_mesh_rx.recv() {
+                let mesh_geometry = {
+                    scope_time!("Mesh load");
+                    MeshGeometry::load(path.as_path())
+                };
+
+                match mesh_geometry {
+                    Some(mesh_geometry) => upload_mesh_tx.send(mesh_geometry).unwrap(),
+                    None => println!("Failed to load mesh by provided path: {:?}", path),
+                }
+            }
+        })
+        .unwrap();
+
+    let mut rng = rand::rng();
+
+    let mut gpu_meshes = Vec::<GpuMeshGeometry>::new();
 
     unsafe {
         let class_atom = RegisterClassA(&WNDCLASSA {
@@ -392,9 +467,6 @@ fn main() -> Result<()> {
             D3D12_COMMAND_LIST_FLAG_NONE,
         )?;
 
-        let d3d12_vertex_buffer = ID3D12Resource::new_upload_buffer(&d3d12_device, mesh_geometry.vertices.as_slice())?;
-        let d3d12_index_buffer = ID3D12Resource::new_upload_buffer(&d3d12_device, mesh_geometry.indices.as_slice())?;
-
         let d3d12_root_signature = {
             let mut blob: Option<ID3DBlob> = None;
             let mut error: Option<ID3DBlob> = None;
@@ -405,7 +477,7 @@ fn main() -> Result<()> {
                     Constants: D3D12_ROOT_CONSTANTS {
                         ShaderRegister: 0,
                         RegisterSpace: 0,
-                        Num32BitValues: 16,
+                        Num32BitValues: 32,
                     },
                 },
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
@@ -554,6 +626,37 @@ fn main() -> Result<()> {
             let active_frame_index = dxgi_swap_chain.GetCurrentBackBufferIndex();
             let d3d12_cmd_allocator = &d3d12_cmd_allocators[active_frame_index as usize];
 
+            while let Ok(mesh_geometry) = upload_mesh_rx.try_recv() {
+                let gpu_mesh_geometry = {
+                    scope_time!("Mesh upload");
+                    GpuMeshGeometry::upload(&d3d12_device, mesh_geometry)
+                };
+
+                match gpu_mesh_geometry {
+                    Some(mut gpu_mesh_geometry) => {
+                        scope_time!("Mesh add");
+
+                        let scale = Vec3::splat(rng.random_range(0.01..0.1));
+                        let rotation = Quat::from_euler(
+                            glam::EulerRot::XYX,
+                            rng.random_range(0.0..std::f32::consts::TAU),
+                            rng.random_range(0.0..std::f32::consts::TAU),
+                            rng.random_range(0.0..std::f32::consts::TAU),
+                        );
+                        let translation = Vec3::new(
+                            rng.random_range(-50.0..50.0),
+                            rng.random_range(-40.0..40.0),
+                            rng.random_range(35.0..60.0),
+                        );
+
+                        gpu_mesh_geometry.local_to_world =
+                            Mat4::from_scale_rotation_translation(scale, rotation, translation);
+                        gpu_meshes.push(gpu_mesh_geometry);
+                    }
+                    None => println!("Failed to upload mesh geometry"),
+                }
+            }
+
             d3d12_cmd_allocator.Reset()?;
             d3d12_cmd_list.Reset(d3d12_cmd_allocator, None)?;
 
@@ -591,28 +694,37 @@ fn main() -> Result<()> {
             d3d12_cmd_list.SetGraphicsRoot32BitConstants(0, 16, std::ptr::from_ref(&world_to_clip).cast(), 0);
 
             d3d12_cmd_list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-            d3d12_cmd_list.IASetVertexBuffers(
-                0,
-                Some(&[D3D12_VERTEX_BUFFER_VIEW {
-                    BufferLocation: d3d12_vertex_buffer.GetGPUVirtualAddress(),
-                    SizeInBytes: std::mem::size_of_val(mesh_geometry.vertices.as_slice()) as u32,
-                    StrideInBytes: size_of::<MeshVertex>() as u32,
-                }]),
-            );
-            d3d12_cmd_list.IASetIndexBuffer(Some(&D3D12_INDEX_BUFFER_VIEW {
-                BufferLocation: d3d12_index_buffer.GetGPUVirtualAddress(),
-                SizeInBytes: std::mem::size_of_val(mesh_geometry.indices.as_slice()) as u32,
-                Format: DXGI_FORMAT_R32_UINT,
-            }));
 
-            for mesh in &mesh_geometry.meshes {
-                d3d12_cmd_list.DrawIndexedInstanced(
-                    mesh.index_count,
-                    1,
-                    mesh.index_offset,
-                    mesh.vertex_offset as i32,
+            for gpu_mesh in &gpu_meshes {
+                d3d12_cmd_list.SetGraphicsRoot32BitConstants(
                     0,
+                    16,
+                    std::ptr::from_ref(&gpu_mesh.local_to_world).cast(),
+                    16,
                 );
+                d3d12_cmd_list.IASetVertexBuffers(
+                    0,
+                    Some(&[D3D12_VERTEX_BUFFER_VIEW {
+                        BufferLocation: gpu_mesh.d3d12_vertex_buffer.GetGPUVirtualAddress(),
+                        SizeInBytes: (gpu_mesh.vertex_count * size_of::<MeshVertex>()) as u32,
+                        StrideInBytes: size_of::<MeshVertex>() as u32,
+                    }]),
+                );
+                d3d12_cmd_list.IASetIndexBuffer(Some(&D3D12_INDEX_BUFFER_VIEW {
+                    BufferLocation: gpu_mesh.d3d12_index_buffer.GetGPUVirtualAddress(),
+                    SizeInBytes: (gpu_mesh.index_count * size_of::<u32>()) as u32,
+                    Format: DXGI_FORMAT_R32_UINT,
+                }));
+
+                for mesh in &gpu_mesh.meshes {
+                    d3d12_cmd_list.DrawIndexedInstanced(
+                        mesh.index_count,
+                        1,
+                        mesh.index_offset,
+                        mesh.vertex_offset as i32,
+                        0,
+                    );
+                }
             }
 
             {
@@ -620,9 +732,18 @@ fn main() -> Result<()> {
                 cimgui_impldx12_new_frame();
                 ImGui_NewFrame();
 
-                ImGui_Begin(c"Metrics".as_ptr(), std::ptr::null_mut(), 0);
-                let text = std::ffi::CString::new(format!("FPS: {} ({:.2} ms)", fps, dt)).unwrap();
-                ImGui_Text(text.as_ptr());
+                ImGui_Begin(c"Hello Rust".as_ptr(), std::ptr::null_mut(), 0);
+                {
+                    let text = CString::new(format!("FPS: {} ({:.2} ms)", fps, dt)).unwrap();
+                    ImGui_Text(text.as_ptr());
+
+                    let text = CString::new(format!("Mesh count: {}", gpu_meshes.len())).unwrap();
+                    ImGui_Text(text.as_ptr());
+
+                    if ImGui_Button(c"Load 'Dinosaur.glb'".as_ptr()) {
+                        load_mesh_tx.send(PathBuf::from("assets/Dinosaur.glb")).unwrap();
+                    }
+                }
                 ImGui_End();
 
                 ImGui_ShowDemoWindow(std::ptr::null_mut());
@@ -676,10 +797,13 @@ fn main() -> Result<()> {
         {
             CloseHandle(wait_event_handle)?;
 
+            for gpu_mesh in gpu_meshes {
+                drop(gpu_mesh.d3d12_vertex_buffer);
+                drop(gpu_mesh.d3d12_index_buffer);
+            }
+
             drop(d3d12_pso);
             drop(d3d12_root_signature);
-            drop(d3d12_index_buffer);
-            drop(d3d12_vertex_buffer);
             drop(d3d12_cmd_list);
             drop(d3d12_cmd_allocators);
             drop(d3d12_resource_heap);
@@ -703,6 +827,9 @@ fn main() -> Result<()> {
 
         UnregisterClassA(WINDOW_REGISTRY_NAME, None)?;
     }
+
+    drop(load_mesh_tx);
+    load_mesh_thread.join().unwrap();
 
     Ok(())
 }
@@ -897,10 +1024,8 @@ struct FrameTimer {
 
 impl FrameTimer {
     fn new() -> Self {
-        let now = Instant::now();
-
         Self {
-            last_frame: now,
+            last_frame: Instant::now(),
             accumulated: Duration::ZERO,
             frame_count: 0,
             fps: 0,
