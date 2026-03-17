@@ -4,6 +4,7 @@ use imgui_ffi::*;
 use std::ffi::{CString, c_void};
 use std::mem::ManuallyDrop;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::*;
@@ -47,7 +48,8 @@ impl ScopedTimer {
 impl Drop for ScopedTimer {
     fn drop(&mut self) {
         println!(
-            "[TIMED] {}: {:.2}ms",
+            "[TIMED][{:?}] {}: {:.2}ms",
+            unsafe { GetCurrentThreadId() },
             self.label,
             self.begin.elapsed().as_secs_f32() * 1000.0
         );
@@ -183,6 +185,13 @@ impl GpuMeshGeometry {
     }
 }
 
+struct UploadedGpuMeshGeometry {
+    gpu_mesh: GpuMeshGeometry,
+    d3d12_cmd_allocator: ID3D12CommandAllocator,
+    d3d12_cmd_list: ID3D12GraphicsCommandList1,
+    d3d12_upload_buf: ID3D12Resource,
+}
+
 fn main() -> Result<()> {
     println!("Hello D3D12 Rust Triangle!");
 
@@ -197,13 +206,14 @@ fn main() -> Result<()> {
 
     let (load_mesh_tx, load_mesh_rx) = std::sync::mpsc::channel::<PathBuf>();
     let (upload_mesh_tx, upload_mesh_rx) = std::sync::mpsc::channel::<MeshGeometry>();
+    let (ready_mesh_tx, ready_mesh_rx) = std::sync::mpsc::channel::<UploadedGpuMeshGeometry>();
 
     let load_mesh_thread = std::thread::Builder::new()
         .name("MeshLoader".to_string())
         .spawn(move || {
             while let Ok(path) = load_mesh_rx.recv() {
                 let mesh_geometry = {
-                    scope_time!("Mesh load");
+                    scope_time!("Mesh: load from disk");
                     MeshGeometry::load(path.as_path())
                 };
 
@@ -214,8 +224,6 @@ fn main() -> Result<()> {
             }
         })
         .unwrap();
-
-    let mut rng = rand::rng();
 
     let mut gpu_meshes = Vec::<GpuMeshGeometry>::new();
 
@@ -307,8 +315,166 @@ fn main() -> Result<()> {
 
             let d3d12_device = d3d12_device.unwrap();
             d3d12_device.set_debug_name("MainDevice")?;
-            d3d12_device.cast::<ID3D12Device4>()?
+
+            Arc::new(d3d12_device.cast::<ID3D12Device4>()?)
         };
+
+        let upload_mesh_thread = std::thread::Builder::new()
+            .name("MeshUploader".to_string())
+            .spawn({
+                let d3d12_device = Arc::clone(&d3d12_device);
+
+                move || -> Result<()> {
+                    let mut rng = rand::rng();
+
+                    while let Ok(mesh) = upload_mesh_rx.recv() {
+                        scope_time!("GpuMesh: total");
+
+                        let gpu_mesh = {
+                            scope_time!("GpuMesh: new");
+
+                            let scale = Vec3::splat(rng.random_range(0.01..0.1));
+                            let rotation = Quat::from_euler(
+                                glam::EulerRot::XYX,
+                                rng.random_range(0.0..std::f32::consts::TAU),
+                                rng.random_range(0.0..std::f32::consts::TAU),
+                                rng.random_range(0.0..std::f32::consts::TAU),
+                            );
+                            let translation = Vec3::new(
+                                rng.random_range(-50.0..50.0),
+                                rng.random_range(-40.0..40.0),
+                                rng.random_range(35.0..60.0),
+                            );
+
+                            GpuMeshGeometry::new(
+                                &d3d12_device,
+                                &mesh,
+                                Mat4::from_scale_rotation_translation(scale, rotation, translation),
+                            )
+                        };
+
+                        let Some(gpu_mesh) = gpu_mesh else {
+                            println!("Failed to create GpuMesh");
+                            continue;
+                        };
+
+                        let vertices_size = size_of_val(mesh.vertices.as_slice());
+                        let indices_size = size_of_val(mesh.indices.as_slice());
+
+                        let d3d12_upload_buf = {
+                            scope_time!("GpuMesh: upload buffer creation + map");
+
+                            let d3d12_upload_buf = ID3D12Resource::new_buf(
+                                &d3d12_device,
+                                D3D12_HEAP_TYPE_UPLOAD,
+                                vertices_size + indices_size,
+                            )?;
+
+                            let mut mapped_ptr = std::ptr::null_mut::<c_void>();
+                            d3d12_upload_buf.Map(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }), Some(&mut mapped_ptr))?;
+
+                            let mapped_ptr = mapped_ptr as *mut u8;
+
+                            std::ptr::copy_nonoverlapping(
+                                mesh.vertices.as_ptr(),
+                                mapped_ptr as *mut MeshVertex,
+                                mesh.vertices.len(),
+                            );
+
+                            std::ptr::copy_nonoverlapping(
+                                mesh.indices.as_ptr(),
+                                mapped_ptr.add(vertices_size) as *mut u32,
+                                mesh.indices.len(),
+                            );
+
+                            d3d12_upload_buf.Unmap(
+                                0,
+                                Some(&D3D12_RANGE {
+                                    Begin: 0,
+                                    End: vertices_size + indices_size,
+                                }),
+                            );
+
+                            d3d12_upload_buf
+                        };
+
+                        scope_time!("GpuMesh: create cmd alloc & buf + fill cmd buf");
+
+                        let d3d12_cmd_allocator = d3d12_device
+                            .CreateCommandAllocator::<ID3D12CommandAllocator>(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+
+                        let d3d12_cmd_list = d3d12_device.CreateCommandList1::<ID3D12GraphicsCommandList1>(
+                            0,
+                            D3D12_COMMAND_LIST_TYPE_DIRECT,
+                            D3D12_COMMAND_LIST_FLAG_NONE,
+                        )?;
+
+                        d3d12_cmd_allocator.Reset()?;
+                        d3d12_cmd_list.Reset(&d3d12_cmd_allocator, None)?;
+
+                        d3d12_cmd_list.ResourceBarrier(&[
+                            D3D12_RESOURCE_BARRIER::new_transition(
+                                &d3d12_upload_buf,
+                                D3D12_RESOURCE_STATE_GENERIC_READ,
+                                D3D12_RESOURCE_STATE_COPY_SOURCE,
+                            ),
+                            D3D12_RESOURCE_BARRIER::new_transition(
+                                &gpu_mesh.d3d12_vertex_buffer,
+                                D3D12_RESOURCE_STATE_COMMON,
+                                D3D12_RESOURCE_STATE_COPY_DEST,
+                            ),
+                            D3D12_RESOURCE_BARRIER::new_transition(
+                                &gpu_mesh.d3d12_index_buffer,
+                                D3D12_RESOURCE_STATE_COMMON,
+                                D3D12_RESOURCE_STATE_COPY_DEST,
+                            ),
+                        ]);
+
+                        d3d12_cmd_list.CopyBufferRegion(
+                            &gpu_mesh.d3d12_vertex_buffer,
+                            0,
+                            &d3d12_upload_buf,
+                            0,
+                            vertices_size as u64,
+                        );
+
+                        d3d12_cmd_list.CopyBufferRegion(
+                            &gpu_mesh.d3d12_index_buffer,
+                            0,
+                            &d3d12_upload_buf,
+                            vertices_size as u64,
+                            indices_size as u64,
+                        );
+
+                        d3d12_cmd_list.ResourceBarrier(&[
+                            D3D12_RESOURCE_BARRIER::new_transition(
+                                &gpu_mesh.d3d12_vertex_buffer,
+                                D3D12_RESOURCE_STATE_COPY_DEST,
+                                D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER,
+                            ),
+                            D3D12_RESOURCE_BARRIER::new_transition(
+                                &gpu_mesh.d3d12_index_buffer,
+                                D3D12_RESOURCE_STATE_COPY_DEST,
+                                D3D12_RESOURCE_STATE_INDEX_BUFFER,
+                            ),
+                        ]);
+
+                        d3d12_cmd_list.Close()?;
+
+                        ready_mesh_tx
+                            .send(UploadedGpuMeshGeometry {
+                                gpu_mesh,
+                                d3d12_cmd_allocator,
+                                d3d12_cmd_list,
+                                d3d12_upload_buf,
+                            })
+                            .unwrap();
+                    }
+
+                    Ok(())
+                }
+            })
+            .unwrap();
 
         {
             let d3d12_info_queue = d3d12_device.cast::<ID3D12InfoQueue1>()?;
@@ -621,7 +787,8 @@ fn main() -> Result<()> {
         let mut cpu_frame_index = 0;
         let mut frame_timer = FrameTimer::new();
 
-        let mut d3d12_upload_bufs = Vec::new();
+        let mut upload_d3d12_cmd_lists = Vec::new();
+        let mut pending_delete = Vec::new();
 
         loop {
             {
@@ -647,123 +814,18 @@ fn main() -> Result<()> {
             let active_frame_index = dxgi_swap_chain.GetCurrentBackBufferIndex();
             let d3d12_cmd_allocator = &d3d12_cmd_allocators[active_frame_index as usize];
 
+            while let Ok(uploaded_mesh) = ready_mesh_rx.try_recv() {
+                gpu_meshes.push(uploaded_mesh.gpu_mesh);
+                upload_d3d12_cmd_lists.push(uploaded_mesh.d3d12_cmd_list);
+                pending_delete.push((
+                    cpu_frame_index,
+                    uploaded_mesh.d3d12_cmd_allocator,
+                    uploaded_mesh.d3d12_upload_buf,
+                ));
+            }
+
             d3d12_cmd_allocator.Reset()?;
             d3d12_cmd_list.Reset(d3d12_cmd_allocator, None)?;
-
-            while let Ok(mesh) = upload_mesh_rx.try_recv() {
-                let gpu_mesh = {
-                    scope_time!("GpuMesh new");
-
-                    let scale = Vec3::splat(rng.random_range(0.01..0.1));
-                    let rotation = Quat::from_euler(
-                        glam::EulerRot::XYX,
-                        rng.random_range(0.0..std::f32::consts::TAU),
-                        rng.random_range(0.0..std::f32::consts::TAU),
-                        rng.random_range(0.0..std::f32::consts::TAU),
-                    );
-                    let translation = Vec3::new(
-                        rng.random_range(-50.0..50.0),
-                        rng.random_range(-40.0..40.0),
-                        rng.random_range(35.0..60.0),
-                    );
-
-                    GpuMeshGeometry::new(
-                        &d3d12_device,
-                        &mesh,
-                        Mat4::from_scale_rotation_translation(scale, rotation, translation),
-                    )
-                };
-
-                let Some(gpu_mesh) = gpu_mesh else {
-                    println!("Failed to create GpuMesh");
-                    continue;
-                };
-
-                scope_time!("GpuMesh upload");
-
-                let vertices_size = size_of_val(mesh.vertices.as_slice());
-                let indices_size = size_of_val(mesh.indices.as_slice());
-
-                let d3d12_upload_buf =
-                    ID3D12Resource::new_buf(&d3d12_device, D3D12_HEAP_TYPE_UPLOAD, vertices_size + indices_size)?;
-
-                {
-                    let mut mapped_ptr = std::ptr::null_mut::<c_void>();
-                    d3d12_upload_buf.Map(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }), Some(&mut mapped_ptr))?;
-
-                    let mapped_ptr = mapped_ptr as *mut u8;
-
-                    std::ptr::copy_nonoverlapping(
-                        mesh.vertices.as_ptr(),
-                        mapped_ptr as *mut MeshVertex,
-                        mesh.vertices.len(),
-                    );
-
-                    std::ptr::copy_nonoverlapping(
-                        mesh.indices.as_ptr(),
-                        mapped_ptr.add(vertices_size) as *mut u32,
-                        mesh.indices.len(),
-                    );
-
-                    d3d12_upload_buf.Unmap(
-                        0,
-                        Some(&D3D12_RANGE {
-                            Begin: 0,
-                            End: vertices_size + indices_size,
-                        }),
-                    );
-                }
-
-                d3d12_cmd_list.ResourceBarrier(&[
-                    D3D12_RESOURCE_BARRIER::new_transition(
-                        &d3d12_upload_buf,
-                        D3D12_RESOURCE_STATE_GENERIC_READ,
-                        D3D12_RESOURCE_STATE_COPY_SOURCE,
-                    ),
-                    D3D12_RESOURCE_BARRIER::new_transition(
-                        &gpu_mesh.d3d12_vertex_buffer,
-                        D3D12_RESOURCE_STATE_COMMON,
-                        D3D12_RESOURCE_STATE_COPY_DEST,
-                    ),
-                    D3D12_RESOURCE_BARRIER::new_transition(
-                        &gpu_mesh.d3d12_index_buffer,
-                        D3D12_RESOURCE_STATE_COMMON,
-                        D3D12_RESOURCE_STATE_COPY_DEST,
-                    ),
-                ]);
-
-                d3d12_cmd_list.CopyBufferRegion(
-                    &gpu_mesh.d3d12_vertex_buffer,
-                    0,
-                    &d3d12_upload_buf,
-                    0,
-                    vertices_size as u64,
-                );
-
-                d3d12_cmd_list.CopyBufferRegion(
-                    &gpu_mesh.d3d12_index_buffer,
-                    0,
-                    &d3d12_upload_buf,
-                    vertices_size as u64,
-                    indices_size as u64,
-                );
-
-                d3d12_cmd_list.ResourceBarrier(&[
-                    D3D12_RESOURCE_BARRIER::new_transition(
-                        &gpu_mesh.d3d12_vertex_buffer,
-                        D3D12_RESOURCE_STATE_COPY_DEST,
-                        D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER,
-                    ),
-                    D3D12_RESOURCE_BARRIER::new_transition(
-                        &gpu_mesh.d3d12_index_buffer,
-                        D3D12_RESOURCE_STATE_COPY_DEST,
-                        D3D12_RESOURCE_STATE_INDEX_BUFFER,
-                    ),
-                ]);
-
-                d3d12_upload_bufs.push((cpu_frame_index, d3d12_upload_buf));
-                gpu_meshes.push(gpu_mesh);
-            }
 
             d3d12_cmd_list.RSSetViewports(&[D3D12_VIEWPORT {
                 TopLeftX: 0.0,
@@ -829,6 +891,11 @@ fn main() -> Result<()> {
 
                 ImGui_Begin(c"Hello Rust".as_ptr(), std::ptr::null_mut(), 0);
                 {
+                    ImGui_Text(
+                        CString::new(format!("Main TID: {:?}", GetCurrentThreadId()))
+                            .unwrap()
+                            .as_ptr(),
+                    );
                     ImGui_Text(CString::new(format!("FPS: {} ({:.2} ms)", fps, dt)).unwrap().as_ptr());
 
                     let mut local_mem = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
@@ -884,9 +951,14 @@ fn main() -> Result<()> {
             )]);
 
             d3d12_cmd_list.Close()?;
-            let d3d12_cmd_lists: [Option<ID3D12CommandList>; 1] =
-                [Some(d3d12_cmd_list.cast::<ID3D12CommandList>().unwrap())];
-            d3d12_cmd_queue.ExecuteCommandLists(&d3d12_cmd_lists);
+
+            d3d12_cmd_queue.ExecuteCommandLists(
+                &upload_d3d12_cmd_lists
+                    .drain(..)
+                    .chain(std::iter::once(d3d12_cmd_list.clone()))
+                    .map(|cmd_list| Some(cmd_list.cast::<ID3D12CommandList>().unwrap()))
+                    .collect::<Vec<_>>(),
+            );
 
             let code: HRESULT = dxgi_swap_chain.Present(0, DXGI_PRESENT_ALLOW_TEARING);
             if code.is_err() {
@@ -903,7 +975,7 @@ fn main() -> Result<()> {
                 wait_for_gpu(&d3d12_frame_fence, wait_event_handle, gpu_frame_index_to_wait)?;
             }
 
-            d3d12_upload_bufs.retain(|(frame_index, _)| *frame_index > gpu_frame_index);
+            pending_delete.retain(|(frame_index, _, _)| *frame_index > gpu_frame_index);
         }
 
         wait_for_gpu(&d3d12_frame_fence, wait_event_handle, cpu_frame_index)?;
@@ -917,7 +989,7 @@ fn main() -> Result<()> {
         {
             CloseHandle(wait_event_handle)?;
 
-            assert!(d3d12_upload_bufs.is_empty());
+            assert!(pending_delete.is_empty());
 
             for gpu_mesh in gpu_meshes {
                 drop(gpu_mesh.d3d12_vertex_buffer);
@@ -947,11 +1019,13 @@ fn main() -> Result<()> {
             drop(dxgi_factory);
         }
 
+        // TODO
+        drop(load_mesh_tx);
+        load_mesh_thread.join().unwrap();
+        upload_mesh_thread.join().unwrap()?;
+
         UnregisterClassA(WINDOW_REGISTRY_NAME, None)?;
     }
-
-    drop(load_mesh_tx);
-    load_mesh_thread.join().unwrap();
 
     Ok(())
 }
