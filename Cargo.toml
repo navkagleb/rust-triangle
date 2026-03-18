@@ -34,3 +34,6 @@ features = [
     "Win32_System_Threading",
     "Win32_UI_WindowsAndMessaging",
 ]
+
+[profile.dev.package."*"]
+opt-level = 3
