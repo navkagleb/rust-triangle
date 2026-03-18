@@ -62,6 +62,12 @@ macro_rules! scope_time {
     };
 }
 
+macro_rules! imgui_text {
+    ($($arg:tt)*) => {
+        ImGui_Text(CString::new(format!($($arg)*)).unwrap().as_ptr())
+    };
+}
+
 #[allow(dead_code)]
 struct MeshVertex {
     position: (f32, f32, f32),
@@ -83,9 +89,7 @@ struct Mesh {
 }
 
 impl Mesh {
-    fn load(path: &Path) -> Option<Self> {
-        let (gltf, buffers, _) = gltf::import(path).map_err(|e| println!("GLTF error: {}", e)).ok()?;
-
+    fn from(gltf: gltf::Document, buffers: Vec<gltf::buffer::Data>) -> Option<Self> {
         assert_eq!(gltf.scenes().len(), 1);
         assert_eq!(gltf.nodes().len(), 1);
 
@@ -301,11 +305,22 @@ fn main() -> Result<()> {
                     let mut rng = rand::rng();
 
                     while let Ok(path) = load_mesh_rx.recv() {
-                        scope_time!("Load mesh total");
+                        scope_time!("-- Load mesh total");
+
+                        let (gltf, buffers, _) = {
+                            scope_time!("gltf::import");
+
+                            let Ok(result) = gltf::import(path.as_path()) else {
+                                println!("Failed to load GLTF model: {:?}", path);
+                                continue;
+                            };
+
+                            result
+                        };
 
                         let mesh = {
-                            scope_time!("Load mesh from disk");
-                            Mesh::load(path.as_path())
+                            scope_time!("Mesh::from");
+                            Mesh::from(gltf, buffers)
                         };
 
                         let Some(mesh) = mesh else {
@@ -314,7 +329,7 @@ fn main() -> Result<()> {
                         };
 
                         let gpu_mesh = {
-                            scope_time!("Create GpuMesh");
+                            scope_time!("GpuMesh::new");
 
                             let scale = Vec3::splat(rng.random_range(0.01..0.1));
                             let rotation = Quat::from_euler(
@@ -329,16 +344,18 @@ fn main() -> Result<()> {
                                 rng.random_range(35.0..60.0),
                             );
 
-                            GpuMesh::new(
+                            let gpu_mesh = GpuMesh::new(
                                 &device,
                                 &mesh,
                                 Mat4::from_scale_rotation_translation(scale, rotation, translation),
-                            )
-                        };
+                            );
 
-                        let Some(gpu_mesh) = gpu_mesh else {
-                            println!("Failed to create GpuMesh");
-                            continue;
+                            let Some(gpu_mesh) = gpu_mesh else {
+                                println!("Failed to create GpuMesh");
+                                continue;
+                            };
+
+                            gpu_mesh
                         };
 
                         let vertices_size = size_of_val(mesh.vertices.as_slice());
@@ -747,6 +764,8 @@ fn main() -> Result<()> {
         let mut upload_cmd_lists = Vec::new();
         let mut pending_release = Vec::new();
 
+        let mut pending_mesh_count = 0;
+
         loop {
             {
                 let mut message = MSG::default();
@@ -779,6 +798,8 @@ fn main() -> Result<()> {
 
                 pending_release.push((cpu_frame_index, ready_gpu_mesh.cmd_allocator.cast::<ID3D12Object>()?));
                 pending_release.push((cpu_frame_index, ready_gpu_mesh.upload_buf.cast::<ID3D12Object>()?));
+
+                pending_mesh_count -= 1;
             }
 
             cmd_allocator.Reset()?;
@@ -848,12 +869,8 @@ fn main() -> Result<()> {
 
                 ImGui_Begin(c"Hello Rust".as_ptr(), std::ptr::null_mut(), 0);
                 {
-                    ImGui_Text(
-                        CString::new(format!("Main TID: {:?}", GetCurrentThreadId()))
-                            .unwrap()
-                            .as_ptr(),
-                    );
-                    ImGui_Text(CString::new(format!("FPS: {} ({:.2} ms)", fps, dt)).unwrap().as_ptr());
+                    imgui_text!("Main TID: {}", GetCurrentThreadId());
+                    imgui_text!("FPS: {} ({:.2} ms)", fps, dt);
 
                     let mut local_mem = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
                     let mut host_mem = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
@@ -861,29 +878,30 @@ fn main() -> Result<()> {
                     adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut local_mem)?;
                     adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &mut host_mem)?;
 
-                    ImGui_Text(
-                        CString::new(format!(
-                            "Local VRAM: {} / {} mb",
-                            local_mem.CurrentUsage / (1024 * 1024),
-                            local_mem.Budget / (1024 * 1024)
-                        ))
-                        .unwrap()
-                        .as_ptr(),
+                    imgui_text!(
+                        "Local VRAM: {} / {} mb",
+                        local_mem.CurrentUsage / (1024 * 1024),
+                        local_mem.Budget / (1024 * 1024)
                     );
 
-                    ImGui_Text(
-                        CString::new(format!("Host VRAM: {} mb", host_mem.CurrentUsage / (1024 * 1024)))
-                            .unwrap()
-                            .as_ptr(),
-                    );
+                    imgui_text!("Host VRAM: {} mb", host_mem.CurrentUsage / (1024 * 1024));
 
                     ImGui_NewLine();
 
-                    let text = CString::new(format!("Mesh count: {}", gpu_meshes.len())).unwrap();
-                    ImGui_Text(text.as_ptr());
+                    imgui_text!("Mesh count: {}", gpu_meshes.len());
 
-                    if ImGui_Button(c"Load 'Dinosaur.glb'".as_ptr()) {
-                        load_mesh_tx.send(PathBuf::from("assets/Dinosaur.glb")).unwrap();
+                    for entry in std::fs::read_dir("assets")?.flatten() {
+                        let file_name = entry.file_name();
+                        let button_text = CString::new(format!("Load '{}'", file_name.into_string().unwrap())).unwrap();
+
+                        if ImGui_Button(button_text.as_ptr()) {
+                            load_mesh_tx.send(entry.path()).unwrap();
+                            pending_mesh_count += 1;
+                        }
+                    }
+
+                    if pending_mesh_count > 0 {
+                        imgui_text!("Loading... ({} pending)", pending_mesh_count);
                     }
                 }
                 ImGui_End();
