@@ -269,7 +269,7 @@ fn main() -> Result<()> {
             selected_adapter.unwrap().cast::<IDXGIAdapter3>()?
         };
 
-        {
+        if cfg!(debug_assertions) {
             let mut debug: Option<ID3D12Debug5> = None;
             D3D12GetDebugInterface(&mut debug)?;
 
@@ -277,7 +277,7 @@ fn main() -> Result<()> {
                 debug.EnableDebugLayer();
                 println!("Enable D3D12 debug layer");
 
-                debug.SetEnableGPUBasedValidation(true);
+                // debug.SetEnableGPUBasedValidation(true);
                 debug.SetEnableAutoName(true);
             }
         }
@@ -449,16 +449,6 @@ fn main() -> Result<()> {
                 }
             })
             .unwrap();
-
-        {
-            let info_queue = device.cast::<ID3D12InfoQueue1>()?;
-            info_queue.RegisterMessageCallback(
-                Some(d3d12_message_callback),
-                D3D12_MESSAGE_CALLBACK_FLAG_NONE,
-                std::ptr::null_mut(),
-                &mut 0u32,
-            )?;
-        }
 
         {
             let shader_model = D3D12_FEATURE_DATA_SHADER_MODEL {
@@ -776,6 +766,8 @@ fn main() -> Result<()> {
                 }
             }
 
+            cpu_frame_index += 1;
+
             let (dt, fps) = frame_timer.tick();
 
             let active_frame_index = swap_chain.GetCurrentBackBufferIndex();
@@ -930,15 +922,20 @@ fn main() -> Result<()> {
                 return Err(code.into());
             }
 
-            cpu_frame_index += 1;
             cmd_queue.Signal(&frame_fence, cpu_frame_index)?;
 
-            let gpu_frame_index = frame_fence.GetCompletedValue();
+            let gpu_frame_index = {
+                let mut gpu_frame_index = frame_fence.GetCompletedValue();
 
-            if cpu_frame_index - gpu_frame_index >= FRAME_COUNT as u64 {
-                let gpu_frame_index_to_wait = cpu_frame_index - FRAME_COUNT as u64 + 1;
-                wait_for_gpu(&frame_fence, wait_event_handle, gpu_frame_index_to_wait)?;
-            }
+                if cpu_frame_index - gpu_frame_index >= FRAME_COUNT as u64 {
+                    let gpu_frame_index_to_wait = cpu_frame_index - FRAME_COUNT as u64 + 1;
+                    wait_for_gpu(&frame_fence, wait_event_handle, gpu_frame_index_to_wait)?;
+
+                    gpu_frame_index = frame_fence.GetCompletedValue();
+                }
+
+                gpu_frame_index
+            };
 
             pending_release.retain(|(frame_index, _)| *frame_index > gpu_frame_index);
         }
@@ -974,7 +971,7 @@ fn main() -> Result<()> {
             drop(frame_fence);
             drop(cmd_queue);
 
-            {
+            if cfg!(debug_assertions) {
                 let debug_device = device.cast::<ID3D12DebugDevice>()?;
                 debug_device.ReportLiveDeviceObjects(D3D12_RLDO_DETAIL | D3D12_RLDO_IGNORE_INTERNAL)?;
             }
@@ -1009,26 +1006,6 @@ extern "system" fn handle_window_message(window_handle: HWND, message: u32, wpar
             _ => DefWindowProcA(window_handle, message, wparam, lparam),
         }
     }
-}
-
-extern "system" fn d3d12_message_callback(
-    _category: D3D12_MESSAGE_CATEGORY,
-    severity: D3D12_MESSAGE_SEVERITY,
-    _id: D3D12_MESSAGE_ID,
-    description: PCSTR,
-    _context: *mut std::ffi::c_void,
-) {
-    let severity_str = match severity {
-        D3D12_MESSAGE_SEVERITY_CORRUPTION => "CORRUPTION",
-        D3D12_MESSAGE_SEVERITY_ERROR => "ERROR",
-        D3D12_MESSAGE_SEVERITY_WARNING => "WARNING",
-        D3D12_MESSAGE_SEVERITY_INFO => "INFO",
-        D3D12_MESSAGE_SEVERITY_MESSAGE => "MESSAGE",
-        _ => "",
-    };
-
-    let message = unsafe { std::ffi::CStr::from_ptr(description.0 as _).to_string_lossy() };
-    println!("[D3D12][{}]: {}", severity_str, message);
 }
 
 fn wide_to_string(wide: &[u16]) -> String {

@@ -2,19 +2,19 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "type": "lldb",
+            "type": "cppvsdbg",
             "request": "launch",
             "name": "Debug",
-            "cargo": {
-                "args": [
-                    "run"
-                ],
-                "filter": {
-                    "name": "rust-triangle",
-                    "kind": "bin"
-                }
-            },
-            "args": [],
+            "program": "${workspaceFolder}/target/debug/rust-triangle.exe",
+            "preLaunchTask": "cargo build debug",
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "type": "cppvsdbg",
+            "request": "launch",
+            "name": "Release",
+            "program": "${workspaceFolder}/target/release/rust-triangle.exe",
+            "preLaunchTask": "cargo build release",
             "cwd": "${workspaceFolder}"
         }
     ]
