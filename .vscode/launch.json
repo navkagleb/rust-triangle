@@ -7,6 +7,7 @@
             "name": "Debug",
             "program": "${workspaceFolder}/target/debug/rust-triangle.exe",
             "preLaunchTask": "cargo build debug",
+            "console": "internalConsole",
             "cwd": "${workspaceFolder}"
         },
         {
@@ -15,6 +16,7 @@
             "name": "Release",
             "program": "${workspaceFolder}/target/release/rust-triangle.exe",
             "preLaunchTask": "cargo build release",
+            "console": "internalConsole",
             "cwd": "${workspaceFolder}"
         }
     ]
