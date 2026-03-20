@@ -168,7 +168,7 @@ struct ReadyGpuMesh {
 }
 
 impl ReadyGpuMesh {
-    fn new(device: &ID3D12Device4, mesh: Mesh, gpu_mesh: GpuMesh) -> Result<ReadyGpuMesh> {
+    fn new(device: &ID3D12Device4, mesh: Mesh, gpu_mesh: GpuMesh) -> Result<Self> {
         let vertices_size = size_of_val(mesh.vertices.as_slice());
         let indices_size = size_of_val(mesh.indices.as_slice());
 
@@ -271,16 +271,17 @@ impl ReadyGpuMesh {
     }
 }
 
-type ThreadPoolJob = Box<dyn FnOnce() + Send + 'static>;
+type GpuMeshJob = Box<dyn FnOnce() + Send + 'static>;
 
-struct ThreadPool {
-    job_sender: Option<Sender<ThreadPoolJob>>,
+struct GpuMeshThreadPool {
     workers: Vec<JoinHandle<()>>,
+    job_sender: Option<Sender<GpuMeshJob>>,
+    ready_mesh_sender: Sender<Result<ReadyGpuMesh>>,
 }
 
-impl ThreadPool {
-    fn new(thread_count: usize) -> Self {
-        let (job_sender, job_receiver) = std::sync::mpsc::channel::<ThreadPoolJob>();
+impl GpuMeshThreadPool {
+    fn new(thread_count: usize, ready_mesh_sender: Sender<Result<ReadyGpuMesh>>) -> Self {
+        let (job_sender, job_receiver) = std::sync::mpsc::channel::<GpuMeshJob>();
         let job_receiver = Arc::new(Mutex::new(job_receiver));
 
         let workers = (0..thread_count)
@@ -304,38 +305,8 @@ impl ThreadPool {
             .collect();
 
         Self {
-            job_sender: Some(job_sender),
             workers,
-        }
-    }
-
-    fn submit<J>(&self, job: J)
-    where
-        J: FnOnce() + Send + 'static,
-    {
-        self.job_sender.as_ref().unwrap().send(Box::new(job)).unwrap();
-    }
-}
-
-impl Drop for ThreadPool {
-    fn drop(&mut self) {
-        drop(self.job_sender.take());
-
-        for worker in self.workers.drain(..) {
-            worker.join().unwrap();
-        }
-    }
-}
-
-struct GpuMeshThreadPool {
-    thread_pool: ThreadPool,
-    ready_mesh_sender: Sender<Result<ReadyGpuMesh>>,
-}
-
-impl GpuMeshThreadPool {
-    fn new(thread_count: usize, ready_mesh_sender: Sender<Result<ReadyGpuMesh>>) -> Self {
-        Self {
-            thread_pool: ThreadPool::new(thread_count),
+            job_sender: Some(job_sender),
             ready_mesh_sender,
         }
     }
@@ -344,7 +315,7 @@ impl GpuMeshThreadPool {
         let device = Arc::clone(device);
         let ready_mesh_sender = self.ready_mesh_sender.clone();
 
-        self.thread_pool.submit(move || {
+        let job = move || {
             let result = (|| {
                 let (gltf_import, gltf_import_ms) = measure(|| gltf::import(path.as_path()));
                 let (gltf, buffers, _) = gltf_import.with_context(|| format!("Failed to import gltf: {:?}", path))?;
@@ -392,7 +363,19 @@ impl GpuMeshThreadPool {
             })();
 
             ready_mesh_sender.send(result).unwrap();
-        });
+        };
+
+        self.job_sender.as_ref().unwrap().send(Box::new(job)).unwrap();
+    }
+}
+
+impl Drop for GpuMeshThreadPool {
+    fn drop(&mut self) {
+        drop(self.job_sender.take());
+
+        for worker in self.workers.drain(..) {
+            worker.join().unwrap();
+        }
     }
 }
 
