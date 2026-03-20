@@ -20,12 +20,8 @@ use windows::Win32::System::Threading::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::*;
 
-use anyhow::Result;
-
-use glam::Mat4;
-use glam::Quat;
-use glam::Vec3;
-
+use anyhow::{Context, Result};
+use glam::{Mat4, Quat, Vec3};
 use rand::prelude::*;
 
 const WINDOW_REGISTRY_NAME: PCSTR = s!("rust-window");
@@ -333,11 +329,11 @@ impl Drop for ThreadPool {
 
 struct GpuMeshThreadPool {
     thread_pool: ThreadPool,
-    ready_mesh_sender: Sender<ReadyGpuMesh>,
+    ready_mesh_sender: Sender<Result<ReadyGpuMesh>>,
 }
 
 impl GpuMeshThreadPool {
-    fn new(thread_count: usize, ready_mesh_sender: Sender<ReadyGpuMesh>) -> Self {
+    fn new(thread_count: usize, ready_mesh_sender: Sender<Result<ReadyGpuMesh>>) -> Self {
         Self {
             thread_pool: ThreadPool::new(thread_count),
             ready_mesh_sender,
@@ -349,17 +345,13 @@ impl GpuMeshThreadPool {
         let ready_mesh_sender = self.ready_mesh_sender.clone();
 
         self.thread_pool.submit(move || {
-            let (gltf_import, gltf_import_ms) = measure(|| gltf::import(path));
-            let Ok((gltf, buffers, _)) = gltf_import else {
-                return;
-            };
+            let result = (|| {
+                let (gltf_import, gltf_import_ms) = measure(|| gltf::import(path.as_path()));
+                let (gltf, buffers, _) = gltf_import.with_context(|| format!("Failed to import gltf: {:?}", path))?;
 
-            let (mesh, mesh_ms) = measure(|| Mesh::from(gltf, buffers));
-            let Some(mesh) = mesh else {
-                return;
-            };
+                let (mesh, mesh_ms) = measure(|| Mesh::from(gltf, buffers));
+                let mesh = mesh.context("Failed to parse mesh")?;
 
-            let (gpu_mesh, gpu_mesh_ms) = measure(|| {
                 let mut rng = rand::rng();
 
                 let scale = Vec3::splat(rng.random_range(0.01..0.1));
@@ -375,31 +367,31 @@ impl GpuMeshThreadPool {
                     rng.random_range(35.0..60.0),
                 );
 
-                GpuMesh::new(
-                    &device,
-                    &mesh,
-                    Mat4::from_scale_rotation_translation(scale, rotation, translation),
-                )
-            });
-            let Some(gpu_mesh) = gpu_mesh else {
-                return;
-            };
+                let (gpu_mesh, gpu_mesh_ms) = measure(|| {
+                    GpuMesh::new(
+                        &device,
+                        &mesh,
+                        Mat4::from_scale_rotation_translation(scale, rotation, translation),
+                    )
+                });
+                let gpu_mesh = gpu_mesh.context("Failed to create GpuMesh")?;
 
-            let (ready_gpu_mesh, ready_gpu_mesh_ms) = measure(|| ReadyGpuMesh::new(&device, mesh, gpu_mesh));
-            let Ok(ready_gpu_mesh) = ready_gpu_mesh else {
-                return;
-            };
+                let (ready_gpu_mesh, ready_gpu_mesh_ms) = measure(|| ReadyGpuMesh::new(&device, mesh, gpu_mesh));
+                let ready_gpu_mesh = ready_gpu_mesh.context("Failed to creatte ReadyGpuMesh")?;
 
-            println!(
-                "[{}] gltf: {:.2}ms | parse: {:.2}ms | gpu: {:.2}ms | upload: {:.2}ms",
-                unsafe { GetCurrentThreadId() },
-                gltf_import_ms,
-                mesh_ms,
-                gpu_mesh_ms,
-                ready_gpu_mesh_ms
-            );
+                println!(
+                    "[{}] gltf: {:.2}ms | parse: {:.2}ms | gpu: {:.2}ms | upload: {:.2}ms",
+                    unsafe { GetCurrentThreadId() },
+                    gltf_import_ms,
+                    mesh_ms,
+                    gpu_mesh_ms,
+                    ready_gpu_mesh_ms
+                );
 
-            ready_mesh_sender.send(ready_gpu_mesh).unwrap();
+                Ok(ready_gpu_mesh)
+            })();
+
+            ready_mesh_sender.send(result).unwrap();
         });
     }
 }
@@ -416,10 +408,12 @@ fn main() -> Result<()> {
     let view_to_clip = Mat4::perspective_infinite_reverse_lh(fov_y, WIDTH as f32 / HEIGHT as f32, near_plane);
     let world_to_clip = view_to_clip * world_to_view;
 
-    let (ready_mesh_sender, ready_mesh_receiver) = std::sync::mpsc::channel::<ReadyGpuMesh>();
+    let (ready_mesh_sender, ready_mesh_receiver) = std::sync::mpsc::channel::<Result<ReadyGpuMesh>>();
     let gpu_mesh_thread_pool = GpuMeshThreadPool::new(GPU_MESH_THREAD_POOL_SIZE, ready_mesh_sender);
 
     let mut gpu_meshes = Vec::<GpuMesh>::new();
+
+    let mesh_paths = collect_mesh_paths(Path::new("assets"))?;
 
     unsafe {
         let class_atom = RegisterClassA(&WNDCLASSA {
@@ -813,11 +807,6 @@ fn main() -> Result<()> {
         let mut mesh_spawn_count = 1;
         let mut pending_mesh_count = 0;
 
-        let mesh_paths = std::fs::read_dir("assets")?
-            .flatten()
-            .map(|e| e.path())
-            .collect::<Vec<_>>();
-
         loop {
             {
                 let mut message = MSG::default();
@@ -844,14 +833,19 @@ fn main() -> Result<()> {
             let active_frame_index = swap_chain.GetCurrentBackBufferIndex();
             let cmd_allocator = &cmd_allocators[active_frame_index as usize];
 
-            while let Ok(ready_gpu_mesh) = ready_mesh_receiver.try_recv() {
-                gpu_meshes.push(ready_gpu_mesh.gpu_mesh);
-                upload_cmd_lists.push(ready_gpu_mesh.cmd_list);
-
-                pending_release.push((cpu_frame_index, ready_gpu_mesh.cmd_allocator.cast::<ID3D12Object>()?));
-                pending_release.push((cpu_frame_index, ready_gpu_mesh.upload_buf.cast::<ID3D12Object>()?));
-
+            while let Ok(result) = ready_mesh_receiver.try_recv() {
                 pending_mesh_count -= 1;
+
+                match result {
+                    Ok(ready_gpu_mesh) => {
+                        gpu_meshes.push(ready_gpu_mesh.gpu_mesh);
+                        upload_cmd_lists.push(ready_gpu_mesh.cmd_list);
+
+                        pending_release.push((cpu_frame_index, ready_gpu_mesh.cmd_allocator.cast::<ID3D12Object>()?));
+                        pending_release.push((cpu_frame_index, ready_gpu_mesh.upload_buf.cast::<ID3D12Object>()?));
+                    }
+                    Err(e) => println!("Mesh load failed: {:#}", e),
+                }
             }
 
             cmd_allocator.Reset()?;
@@ -1237,4 +1231,22 @@ impl FrameTimer {
 
         (delta.as_secs_f32() * 1000.0, self.fps)
     }
+}
+
+fn collect_mesh_paths(dir: &Path) -> Result<Vec<PathBuf>> {
+    // Could be more efficient if Vec is passed as &mut,
+    // but for app startup this is fine
+    let mut result = Vec::new();
+
+    for entry in std::fs::read_dir(dir)?.flatten() {
+        let path = entry.path();
+
+        if path.is_dir() {
+            result.extend(collect_mesh_paths(&path)?);
+        } else if matches!(path.extension().and_then(|e| e.to_str()), Some("glb") | Some("gltf")) {
+            result.push(path);
+        }
+    }
+
+    Ok(result)
 }
