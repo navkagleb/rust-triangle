@@ -20,6 +20,8 @@ use windows::Win32::System::Threading::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::*;
 
+use anyhow::Result;
+
 use glam::Mat4;
 use glam::Quat;
 use glam::Vec3;
@@ -342,10 +344,11 @@ impl GpuMeshThreadPool {
         }
     }
 
-    fn submit(&self, device: Arc<ID3D12Device4>, path: PathBuf) {
+    fn submit(&self, device: &Arc<ID3D12Device4>, path: PathBuf) {
+        let device = Arc::clone(device);
         let ready_mesh_sender = self.ready_mesh_sender.clone();
 
-        let job = Box::new(move || {
+        self.thread_pool.submit(move || {
             let (gltf_import, gltf_import_ms) = measure(|| gltf::import(path));
             let Ok((gltf, buffers, _)) = gltf_import else {
                 return;
@@ -398,8 +401,6 @@ impl GpuMeshThreadPool {
 
             ready_mesh_sender.send(ready_gpu_mesh).unwrap();
         });
-
-        self.thread_pool.submit(job);
     }
 }
 
@@ -482,7 +483,7 @@ fn main() -> Result<()> {
                         adapter_index += 1;
                     }
                     Err(e) if e.code() == DXGI_ERROR_NOT_FOUND => break,
-                    Err(e) => return Err(e),
+                    Err(e) => return Err(e.into()),
                 }
             }
 
@@ -812,6 +813,11 @@ fn main() -> Result<()> {
         let mut mesh_spawn_count = 1;
         let mut pending_mesh_count = 0;
 
+        let mesh_paths = std::fs::read_dir("assets")?
+            .flatten()
+            .map(|e| e.path())
+            .collect::<Vec<_>>();
+
         loop {
             {
                 let mut message = MSG::default();
@@ -938,14 +944,13 @@ fn main() -> Result<()> {
 
                     ImGui_InputInt(c"Spawn count".as_ptr(), &mut mesh_spawn_count);
 
-                    for entry in std::fs::read_dir("assets")?.flatten() {
-                        let path = entry.path();
+                    for path in &mesh_paths {
                         let button_text =
                             CString::new(format!("Load '{}'", path.file_name().unwrap().to_str().unwrap())).unwrap();
 
                         if ImGui_Button(button_text.as_ptr()) {
                             for _ in 0..mesh_spawn_count {
-                                gpu_mesh_thread_pool.submit(Arc::clone(&device), path.clone());
+                                gpu_mesh_thread_pool.submit(&device, path.clone());
                                 pending_mesh_count += 1;
                             }
                         }
@@ -986,11 +991,7 @@ fn main() -> Result<()> {
                     .collect::<Vec<_>>(),
             );
 
-            let code: HRESULT = swap_chain.Present(0, DXGI_PRESENT_ALLOW_TEARING);
-            if code.is_err() {
-                return Err(code.into());
-            }
-
+            swap_chain.Present(0, DXGI_PRESENT_ALLOW_TEARING).ok()?;
             cmd_queue.Signal(&frame_fence, cpu_frame_index)?;
 
             let gpu_frame_index = {
@@ -1084,7 +1085,7 @@ fn wait_for_gpu(fence: &ID3D12Fence, wait_event_handle: HANDLE, wait_value: u64)
         fence.SetEventOnCompletion(wait_value, wait_event_handle)?;
 
         if WaitForSingleObject(wait_event_handle, INFINITE) == WAIT_FAILED {
-            return Err(Error::from_thread());
+            return Err(Error::from_thread().into());
         }
     }
 

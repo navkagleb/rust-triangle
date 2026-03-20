@@ -12,6 +12,7 @@ serde_json = "1.0.149"
 [dependencies]
 gltf = "1.4.1"
 rand = "0.10.0"
+anyhow = "1.0.102"
 
 [dependencies.glam]
 package = "glam"
