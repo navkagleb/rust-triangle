@@ -490,6 +490,16 @@ fn main() -> Result<()> {
             Arc::new(device.cast::<ID3D12Device4>()?)
         };
 
+        if cfg!(debug_assertions) {
+            let info_queue = device.cast::<ID3D12InfoQueue1>()?;
+            info_queue.RegisterMessageCallback(
+                Some(d3d12_message_callback),
+                D3D12_MESSAGE_CALLBACK_FLAG_NONE,
+                std::ptr::null_mut(),
+                &mut 0u32,
+            )?;
+        }
+
         {
             let shader_model = D3D12_FEATURE_DATA_SHADER_MODEL {
                 HighestShaderModel: D3D_SHADER_MODEL_6_6,
@@ -1067,6 +1077,26 @@ fn wait_for_gpu(fence: &ID3D12Fence, wait_event_handle: HANDLE, wait_value: u64)
     }
 
     Ok(())
+}
+
+extern "system" fn d3d12_message_callback(
+    _category: D3D12_MESSAGE_CATEGORY,
+    severity: D3D12_MESSAGE_SEVERITY,
+    _id: D3D12_MESSAGE_ID,
+    description: PCSTR,
+    _context: *mut std::ffi::c_void,
+) {
+    let severity_str = match severity {
+        D3D12_MESSAGE_SEVERITY_CORRUPTION => "CORRUPTION",
+        D3D12_MESSAGE_SEVERITY_ERROR => "ERROR",
+        D3D12_MESSAGE_SEVERITY_WARNING => "WARNING",
+        D3D12_MESSAGE_SEVERITY_INFO => "INFO",
+        D3D12_MESSAGE_SEVERITY_MESSAGE => "MESSAGE",
+        _ => "",
+    };
+
+    let message = unsafe { std::ffi::CStr::from_ptr(description.0 as _).to_string_lossy() };
+    println!("[D3D12 {}]: {}", severity_str, message);
 }
 
 trait InterfaceExt {
