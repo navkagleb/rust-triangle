@@ -1,0 +1,12 @@
+[
+  {
+    "label": "cargo build debug",
+    "command": "cargo",
+    "args": ["build"],
+  },
+  {
+    "label": "cargo build release",
+    "command": "cargo",
+    "args": ["build", "--release"],
+  },
+]
