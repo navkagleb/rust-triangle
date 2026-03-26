@@ -65,8 +65,8 @@ enum ShaderType {
 impl ShaderType {
     fn entry_point(&self) -> &str {
         match self {
-            ShaderType::Vs => "VsMain",
-            ShaderType::Ps => "PsMain",
+            ShaderType::Vs => "vs_main",
+            ShaderType::Ps => "ps_main",
         }
     }
 

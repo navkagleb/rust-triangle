@@ -1,35 +1,30 @@
-struct VsInput
-{
-    float3 m_Position : sem_Position;
-    float3 m_Normal : sem_Normal;
+struct VsInput {
+    float3 pos : sem_Position;
+    float3 normal : sem_Normal;
 };
 
-struct VsOutput
-{
-    float4 m_ClipPosition : SV_Position;
-    float3 m_Normal : Normal;
+struct VsOutput {
+    float4 clip_pos : SV_Position;
+    float3 normal : Normal;
 };
 
-struct FrameConsts
-{
-    float4x4 m_WorldToClip;
-    float4x4 m_LocalToWorld;
+struct FrameConsts {
+    float4x4 world_to_clip;
+    float4x4 local_to_world;
 };
 
-ConstantBuffer<FrameConsts> g_FrameConsts;
+ConstantBuffer<FrameConsts> FRAME_CONSTS;
 
-VsOutput VsMain(VsInput input)
-{
+VsOutput vs_main(VsInput input) {
     VsOutput output = (VsOutput)0;
-    output.m_ClipPosition = mul(g_FrameConsts.m_LocalToWorld, float4(input.m_Position, 1.0));
-    output.m_ClipPosition = mul(g_FrameConsts.m_WorldToClip, output.m_ClipPosition);
-    output.m_Normal = normalize(mul((float3x3)g_FrameConsts.m_LocalToWorld, input.m_Normal));
+    output.clip_pos = mul(FRAME_CONSTS.local_to_world, float4(input.pos, 1.0));
+    output.clip_pos = mul(FRAME_CONSTS.world_to_clip, output.clip_pos);
+    output.normal = normalize(mul((float3x3)FRAME_CONSTS.local_to_world, input.normal));
 
     return output;
 }
 
-float4 PsMain(VsOutput input) : SV_Target
-{
-    const float3 color = input.m_Normal * 0.5 + 0.5;
+float4 ps_main(VsOutput input) : SV_Target {
+    const float3 color = input.normal * 0.5 + 0.5;
     return float4(color, 1.0);
 }
