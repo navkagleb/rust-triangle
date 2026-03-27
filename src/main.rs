@@ -206,12 +206,11 @@ impl ReadyGpuMesh {
         };
 
         unsafe {
-            let cmd_allocator =
-                device.CreateCommandAllocator::<ID3D12CommandAllocator>(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
-
+            let cmd_list_type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
+            let cmd_allocator = device.CreateCommandAllocator::<ID3D12CommandAllocator>(cmd_list_type)?;
             let cmd_list = device.CreateCommandList1::<ID3D12GraphicsCommandList1>(
                 0,
-                D3D12_COMMAND_LIST_TYPE_DIRECT,
+                cmd_list_type,
                 D3D12_COMMAND_LIST_FLAG_NONE,
             )?;
 
@@ -219,11 +218,6 @@ impl ReadyGpuMesh {
             cmd_list.Reset(&cmd_allocator, None)?;
 
             cmd_list.ResourceBarrier(&[
-                D3D12_RESOURCE_BARRIER::new_transition(
-                    &upload_buf,
-                    D3D12_RESOURCE_STATE_GENERIC_READ,
-                    D3D12_RESOURCE_STATE_COPY_SOURCE,
-                ),
                 D3D12_RESOURCE_BARRIER::new_transition(
                     &gpu_mesh.vertex_buffer,
                     D3D12_RESOURCE_STATE_COMMON,
@@ -245,19 +239,6 @@ impl ReadyGpuMesh {
                 vertices_size as u64,
                 indices_size as u64,
             );
-
-            cmd_list.ResourceBarrier(&[
-                D3D12_RESOURCE_BARRIER::new_transition(
-                    &gpu_mesh.vertex_buffer,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                    D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER,
-                ),
-                D3D12_RESOURCE_BARRIER::new_transition(
-                    &gpu_mesh.index_buffer,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                    D3D12_RESOURCE_STATE_INDEX_BUFFER,
-                ),
-            ]);
 
             cmd_list.Close()?;
 
@@ -535,8 +516,17 @@ fn main() -> Result<()> {
             NodeMask: 0,
         })?;
 
-        let frame_fence = device.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE)?;
-        let wait_event_handle = CreateEventA(None, false, false, s!("wait-event"))?;
+        let compute_cmd_queue = device.CreateCommandQueue::<ID3D12CommandQueue>(&D3D12_COMMAND_QUEUE_DESC {
+            Type: D3D12_COMMAND_LIST_TYPE_COMPUTE,
+            Priority: D3D12_COMMAND_QUEUE_PRIORITY_NORMAL.0,
+            Flags: D3D12_COMMAND_QUEUE_FLAG_NONE,
+            NodeMask: 0,
+        })?;
+
+        let render_fence = device.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE)?;
+        let render_fence_event = CreateEventA(None, false, false, s!("frame_fence_event"))?;
+
+        let compute_fence = device.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE)?;
 
         let swap_chain = {
             let mut is_tearring_supported: u32 = 0;
@@ -768,7 +758,7 @@ fn main() -> Result<()> {
 
         {
             ImGui_CreateContext(std::ptr::null_mut());
-            ImGui_StyleColorsDark(std::ptr::null_mut());
+            ImGui_StyleColorsClassic(std::ptr::null_mut());
 
             let io = &mut *ImGui_GetIO();
             io.ConfigFlags |= ImGuiConfigFlags__ImGuiConfigFlags_NavEnableKeyboard;
@@ -792,10 +782,11 @@ fn main() -> Result<()> {
         }
 
         let mut cpu_frame_index = 0;
+        let mut compute_queue_index = 0;
         let mut frame_timer = FrameTimer::new();
 
-        let mut upload_cmd_lists = Vec::new();
-        let mut pending_release = Vec::new();
+        let mut compute_cmd_lists = Vec::new();
+        let mut compute_pending_release = Vec::new();
 
         let mut mesh_spawn_count = 1;
         let mut pending_mesh_count = 0;
@@ -832,13 +823,30 @@ fn main() -> Result<()> {
                 match result {
                     Ok(ready_gpu_mesh) => {
                         gpu_meshes.push(ready_gpu_mesh.gpu_mesh);
-                        upload_cmd_lists.push(ready_gpu_mesh.cmd_list);
 
-                        pending_release.push((cpu_frame_index, ready_gpu_mesh.cmd_allocator.cast::<ID3D12Object>()?));
-                        pending_release.push((cpu_frame_index, ready_gpu_mesh.upload_buf.cast::<ID3D12Object>()?));
+                        compute_cmd_lists.push(ready_gpu_mesh.cmd_list);
+                        compute_pending_release.push((
+                            compute_queue_index,
+                            ready_gpu_mesh.cmd_allocator.cast::<ID3D12Object>()?,
+                        ));
+                        compute_pending_release
+                            .push((compute_queue_index, ready_gpu_mesh.upload_buf.cast::<ID3D12Object>()?));
                     }
                     Err(e) => println!("Mesh load failed: {:#}", e),
                 }
+            }
+
+            if !compute_cmd_lists.is_empty() {
+                // Drop compute cmd lists immediatly
+                compute_cmd_queue.ExecuteCommandLists(
+                    &compute_cmd_lists
+                        .drain(..)
+                        .map(|cmd_list| Some(cmd_list.cast::<ID3D12CommandList>().ok()?))
+                        .collect::<Vec<_>>(),
+                );
+
+                compute_queue_index += 1;
+                compute_cmd_queue.Signal(&compute_fence, compute_queue_index)?;
             }
 
             cmd_allocator.Reset()?;
@@ -886,6 +894,19 @@ fn main() -> Result<()> {
                     std::ptr::from_ref(&gpu_mesh.local_to_world).cast(),
                     16,
                 );
+
+                render_cmd_list.ResourceBarrier(&[
+                    D3D12_RESOURCE_BARRIER::new_transition(
+                        &gpu_mesh.vertex_buffer,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER,
+                    ),
+                    D3D12_RESOURCE_BARRIER::new_transition(
+                        &gpu_mesh.index_buffer,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        D3D12_RESOURCE_STATE_INDEX_BUFFER,
+                    ),
+                ]);
 
                 render_cmd_list.IASetVertexBuffers(0, Some(&[gpu_mesh.vbv]));
                 render_cmd_list.IASetIndexBuffer(Some(&gpu_mesh.ibv));
@@ -970,34 +991,27 @@ fn main() -> Result<()> {
 
             render_cmd_list.Close()?;
 
-            cmd_queue.ExecuteCommandLists(
-                &upload_cmd_lists
-                    .drain(..)
-                    .chain(std::iter::once(render_cmd_list.clone()))
-                    .map(|cmd_list| Some(cmd_list.cast::<ID3D12CommandList>().unwrap()))
-                    .collect::<Vec<_>>(),
-            );
+            if compute_queue_index != 0 {
+                cmd_queue.Wait(&compute_fence, compute_queue_index)?;
+            }
+            cmd_queue.ExecuteCommandLists(&[Some(render_cmd_list.cast::<ID3D12CommandList>()?)]);
 
             swap_chain.Present(0, DXGI_PRESENT_ALLOW_TEARING).ok()?;
-            cmd_queue.Signal(&frame_fence, cpu_frame_index)?;
 
-            let gpu_frame_index = {
-                let mut gpu_frame_index = frame_fence.GetCompletedValue();
+            cpu_frame_index += 1;
+            cmd_queue.Signal(&render_fence, cpu_frame_index)?;
 
-                if cpu_frame_index - gpu_frame_index >= FRAME_COUNT as u64 {
-                    let gpu_frame_index_to_wait = cpu_frame_index - FRAME_COUNT as u64 + 1;
-                    wait_for_gpu(&frame_fence, wait_event_handle, gpu_frame_index_to_wait)?;
+            let gpu_frame_index = render_fence.GetCompletedValue();
+            if cpu_frame_index - gpu_frame_index >= FRAME_COUNT as u64 {
+                let gpu_frame_index_to_wait = cpu_frame_index - FRAME_COUNT as u64 + 1;
+                wait_for_gpu(&render_fence, render_fence_event, gpu_frame_index_to_wait)?;
+            }
 
-                    gpu_frame_index = frame_fence.GetCompletedValue();
-                }
-
-                gpu_frame_index
-            };
-
-            pending_release.retain(|(frame_index, _)| *frame_index > gpu_frame_index);
+            let completed_compute_index = compute_fence.GetCompletedValue();
+            compute_pending_release.retain(|(compute_index, _)| *compute_index > completed_compute_index);
         }
 
-        wait_for_gpu(&frame_fence, wait_event_handle, cpu_frame_index)?;
+        wait_for_gpu(&render_fence, render_fence_event, cpu_frame_index)?;
 
         {
             cimgui_impldx12_shutdown();
@@ -1006,9 +1020,9 @@ fn main() -> Result<()> {
         }
 
         {
-            CloseHandle(wait_event_handle)?;
+            CloseHandle(render_fence_event)?;
 
-            assert!(pending_release.is_empty());
+            assert!(compute_pending_release.is_empty());
 
             for gpu_mesh in gpu_meshes {
                 drop(gpu_mesh.vertex_buffer);
@@ -1025,7 +1039,9 @@ fn main() -> Result<()> {
             drop(depth_buffer);
             drop(back_buffers);
             drop(swap_chain);
-            drop(frame_fence);
+            drop(compute_fence);
+            drop(render_fence);
+            drop(compute_cmd_queue);
             drop(cmd_queue);
 
             if cfg!(debug_assertions) {
