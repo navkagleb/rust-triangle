@@ -1,14 +1,10 @@
-use std::sync::mpsc::Receiver;
-
-use anyhow::Result;
-
 use crate::*;
 
 const ASYNC_COMPUTE_FRAME_COUNT: u64 = 3;
 
 pub fn start_thread(
     device: Arc<ID3D12Device4>,
-    loaded_mesh_receiver: Receiver<Result<LoadedMesh>>,
+    loaded_mesh_receiver: Receiver<Result<mesh::LoadedMesh>>,
     ready_mesh_sender: Sender<GpuMesh>,
 ) -> std::thread::JoinHandle<Result<()>> {
     std::thread::Builder::new()
