@@ -1,7 +1,7 @@
+mod async_compute;
 mod imgui_ffi;
-use imgui_ffi::*;
 
-use std::ffi::{CString, c_void};
+use std::ffi::CString;
 use std::mem::ManuallyDrop;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
@@ -9,6 +9,9 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use anyhow::{Context, Result};
+use glam::{Mat4, Quat, Vec3};
+use rand::prelude::*;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Direct3D::*;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -20,9 +23,7 @@ use windows::Win32::System::Threading::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::*;
 
-use anyhow::{Context, Result};
-use glam::{Mat4, Quat, Vec3};
-use rand::prelude::*;
+use crate::imgui_ffi::*;
 
 const WINDOW_REGISTRY_NAME: PCSTR = s!("rust-window");
 const WIDTH: u32 = 1280;
@@ -160,108 +161,18 @@ impl GpuMesh {
     }
 }
 
-struct ReadyGpuMesh {
-    gpu_mesh: GpuMesh,
-    cmd_allocator: ID3D12CommandAllocator,
-    cmd_list: ID3D12GraphicsCommandList1,
-    upload_buf: ID3D12Resource,
-}
-
-impl ReadyGpuMesh {
-    fn new(device: &ID3D12Device4, mesh: Mesh, gpu_mesh: GpuMesh) -> Result<Self> {
-        let vertices_size = size_of_val(mesh.vertices.as_slice());
-        let indices_size = size_of_val(mesh.indices.as_slice());
-
-        let upload_buf = {
-            let upload_buf = ID3D12Resource::new_buf(device, D3D12_HEAP_TYPE_UPLOAD, vertices_size + indices_size)?;
-
-            unsafe {
-                let mut mapped_ptr = std::ptr::null_mut::<c_void>();
-                upload_buf.Map(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }), Some(&mut mapped_ptr))?;
-
-                let mapped_ptr = mapped_ptr as *mut u8;
-
-                std::ptr::copy_nonoverlapping(
-                    mesh.vertices.as_ptr(),
-                    mapped_ptr as *mut MeshVertex,
-                    mesh.vertices.len(),
-                );
-
-                std::ptr::copy_nonoverlapping(
-                    mesh.indices.as_ptr(),
-                    mapped_ptr.add(vertices_size) as *mut u32,
-                    mesh.indices.len(),
-                );
-
-                upload_buf.Unmap(
-                    0,
-                    Some(&D3D12_RANGE {
-                        Begin: 0,
-                        End: vertices_size + indices_size,
-                    }),
-                );
-            }
-
-            upload_buf
-        };
-
-        unsafe {
-            let cmd_list_type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
-            let cmd_allocator = device.CreateCommandAllocator::<ID3D12CommandAllocator>(cmd_list_type)?;
-            let cmd_list = device.CreateCommandList1::<ID3D12GraphicsCommandList1>(
-                0,
-                cmd_list_type,
-                D3D12_COMMAND_LIST_FLAG_NONE,
-            )?;
-
-            cmd_allocator.Reset()?;
-            cmd_list.Reset(&cmd_allocator, None)?;
-
-            cmd_list.ResourceBarrier(&[
-                D3D12_RESOURCE_BARRIER::new_transition(
-                    &gpu_mesh.vertex_buffer,
-                    D3D12_RESOURCE_STATE_COMMON,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                ),
-                D3D12_RESOURCE_BARRIER::new_transition(
-                    &gpu_mesh.index_buffer,
-                    D3D12_RESOURCE_STATE_COMMON,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                ),
-            ]);
-
-            cmd_list.CopyBufferRegion(&gpu_mesh.vertex_buffer, 0, &upload_buf, 0, vertices_size as u64);
-
-            cmd_list.CopyBufferRegion(
-                &gpu_mesh.index_buffer,
-                0,
-                &upload_buf,
-                vertices_size as u64,
-                indices_size as u64,
-            );
-
-            cmd_list.Close()?;
-
-            Ok(ReadyGpuMesh {
-                gpu_mesh,
-                cmd_allocator,
-                cmd_list,
-                upload_buf,
-            })
-        }
-    }
-}
-
 type GpuMeshJob = Box<dyn FnOnce() + Send + 'static>;
+
+struct LoadedMesh(Mesh, GpuMesh);
 
 struct GpuMeshThreadPool {
     workers: Vec<JoinHandle<()>>,
     job_sender: Option<Sender<GpuMeshJob>>,
-    ready_mesh_sender: Sender<Result<ReadyGpuMesh>>,
+    loaded_mesh_sender: Sender<Result<LoadedMesh>>,
 }
 
 impl GpuMeshThreadPool {
-    fn new(thread_count: usize, ready_mesh_sender: Sender<Result<ReadyGpuMesh>>) -> Self {
+    fn new(thread_count: usize, loaded_mesh_sender: Sender<Result<LoadedMesh>>) -> Self {
         let (job_sender, job_receiver) = std::sync::mpsc::channel::<GpuMeshJob>();
         let job_receiver = Arc::new(Mutex::new(job_receiver));
 
@@ -288,13 +199,13 @@ impl GpuMeshThreadPool {
         Self {
             workers,
             job_sender: Some(job_sender),
-            ready_mesh_sender,
+            loaded_mesh_sender,
         }
     }
 
     fn submit(&self, device: &Arc<ID3D12Device4>, path: PathBuf) {
         let device = Arc::clone(device);
-        let ready_mesh_sender = self.ready_mesh_sender.clone();
+        let loaded_mesh_sender = self.loaded_mesh_sender.clone();
 
         let job = move || {
             let result = (|| {
@@ -328,22 +239,18 @@ impl GpuMeshThreadPool {
                 });
                 let gpu_mesh = gpu_mesh.context("Failed to create GpuMesh")?;
 
-                let (ready_gpu_mesh, ready_gpu_mesh_ms) = measure(|| ReadyGpuMesh::new(&device, mesh, gpu_mesh));
-                let ready_gpu_mesh = ready_gpu_mesh.context("Failed to creatte ReadyGpuMesh")?;
-
                 println!(
-                    "[{}] gltf: {:.2}ms | parse: {:.2}ms | gpu: {:.2}ms | upload: {:.2}ms",
+                    "[{:6}][LT] gltf: {:.2}ms | parse: {:.2}ms | gpu: {:.2}ms",
                     unsafe { GetCurrentThreadId() },
                     gltf_import_ms,
                     mesh_ms,
                     gpu_mesh_ms,
-                    ready_gpu_mesh_ms
                 );
 
-                Ok(ready_gpu_mesh)
+                Ok(LoadedMesh(mesh, gpu_mesh))
             })();
 
-            ready_mesh_sender.send(result).unwrap();
+            loaded_mesh_sender.send(result).unwrap();
         };
 
         self.job_sender.as_ref().unwrap().send(Box::new(job)).unwrap();
@@ -372,8 +279,9 @@ fn main() -> Result<()> {
     let view_to_clip = Mat4::perspective_infinite_reverse_lh(fov_y, WIDTH as f32 / HEIGHT as f32, near_plane);
     let world_to_clip = view_to_clip * world_to_view;
 
-    let (ready_mesh_sender, ready_mesh_receiver) = std::sync::mpsc::channel::<Result<ReadyGpuMesh>>();
-    let gpu_mesh_thread_pool = GpuMeshThreadPool::new(GPU_MESH_THREAD_POOL_SIZE, ready_mesh_sender);
+    let (loaded_mesh_sender, loaded_mesh_receiver) = std::sync::mpsc::channel::<Result<LoadedMesh>>();
+    let (ready_mesh_sender, ready_mesh_receiver) = std::sync::mpsc::channel::<GpuMesh>();
+    let load_mesh_thread_pool = GpuMeshThreadPool::new(GPU_MESH_THREAD_POOL_SIZE, loaded_mesh_sender);
 
     let mut gpu_meshes = Vec::<GpuMesh>::new();
 
@@ -516,17 +424,8 @@ fn main() -> Result<()> {
             NodeMask: 0,
         })?;
 
-        let compute_cmd_queue = device.CreateCommandQueue::<ID3D12CommandQueue>(&D3D12_COMMAND_QUEUE_DESC {
-            Type: D3D12_COMMAND_LIST_TYPE_COMPUTE,
-            Priority: D3D12_COMMAND_QUEUE_PRIORITY_NORMAL.0,
-            Flags: D3D12_COMMAND_QUEUE_FLAG_NONE,
-            NodeMask: 0,
-        })?;
-
         let render_fence = device.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE)?;
-        let render_fence_event = CreateEventA(None, false, false, s!("frame_fence_event"))?;
-
-        let compute_fence = device.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE)?;
+        let render_fence_event = CreateEventA(None, false, false, s!("render_fence_event"))?;
 
         let swap_chain = {
             let mut is_tearring_supported: u32 = 0;
@@ -781,12 +680,11 @@ fn main() -> Result<()> {
             });
         }
 
-        let mut cpu_frame_index = 0;
-        let mut compute_queue_index = 0;
-        let mut frame_timer = FrameTimer::new();
+        let async_compute_thread =
+            async_compute::start_thread(Arc::clone(&device), loaded_mesh_receiver, ready_mesh_sender);
 
-        let mut compute_cmd_lists = Vec::new();
-        let mut compute_pending_release = Vec::new();
+        let mut cpu_frame_index = 0;
+        let mut frame_timer = FrameTimer::new();
 
         let mut mesh_spawn_count = 1;
         let mut pending_mesh_count = 0;
@@ -810,43 +708,14 @@ fn main() -> Result<()> {
                 }
             }
 
-            cpu_frame_index += 1;
-
             let (dt, fps) = frame_timer.tick();
 
             let active_frame_index = swap_chain.GetCurrentBackBufferIndex();
             let cmd_allocator = &cmd_allocators[active_frame_index as usize];
 
-            while let Ok(result) = ready_mesh_receiver.try_recv() {
+            while let Ok(gpu_mesh) = ready_mesh_receiver.try_recv() {
                 pending_mesh_count -= 1;
-
-                match result {
-                    Ok(ready_gpu_mesh) => {
-                        gpu_meshes.push(ready_gpu_mesh.gpu_mesh);
-
-                        compute_cmd_lists.push(ready_gpu_mesh.cmd_list);
-                        compute_pending_release.push((
-                            compute_queue_index,
-                            ready_gpu_mesh.cmd_allocator.cast::<ID3D12Object>()?,
-                        ));
-                        compute_pending_release
-                            .push((compute_queue_index, ready_gpu_mesh.upload_buf.cast::<ID3D12Object>()?));
-                    }
-                    Err(e) => println!("Mesh load failed: {:#}", e),
-                }
-            }
-
-            if !compute_cmd_lists.is_empty() {
-                // Drop compute cmd lists immediatly
-                compute_cmd_queue.ExecuteCommandLists(
-                    &compute_cmd_lists
-                        .drain(..)
-                        .map(|cmd_list| Some(cmd_list.cast::<ID3D12CommandList>().ok()?))
-                        .collect::<Vec<_>>(),
-                );
-
-                compute_queue_index += 1;
-                compute_cmd_queue.Signal(&compute_fence, compute_queue_index)?;
+                gpu_meshes.push(gpu_mesh);
             }
 
             cmd_allocator.Reset()?;
@@ -958,7 +827,7 @@ fn main() -> Result<()> {
 
                         if ImGui_Button(button_text.as_ptr()) {
                             for _ in 0..mesh_spawn_count {
-                                gpu_mesh_thread_pool.submit(&device, path.clone());
+                                load_mesh_thread_pool.submit(&device, path.clone());
                                 pending_mesh_count += 1;
                             }
                         }
@@ -991,9 +860,6 @@ fn main() -> Result<()> {
 
             render_cmd_list.Close()?;
 
-            if compute_queue_index != 0 {
-                cmd_queue.Wait(&compute_fence, compute_queue_index)?;
-            }
             cmd_queue.ExecuteCommandLists(&[Some(render_cmd_list.cast::<ID3D12CommandList>()?)]);
 
             swap_chain.Present(0, DXGI_PRESENT_ALLOW_TEARING).ok()?;
@@ -1006,9 +872,6 @@ fn main() -> Result<()> {
                 let gpu_frame_index_to_wait = cpu_frame_index - FRAME_COUNT as u64 + 1;
                 wait_for_gpu(&render_fence, render_fence_event, gpu_frame_index_to_wait)?;
             }
-
-            let completed_compute_index = compute_fence.GetCompletedValue();
-            compute_pending_release.retain(|(compute_index, _)| *compute_index > completed_compute_index);
         }
 
         wait_for_gpu(&render_fence, render_fence_event, cpu_frame_index)?;
@@ -1019,40 +882,36 @@ fn main() -> Result<()> {
             ImGui_DestroyContext(std::ptr::null_mut());
         }
 
-        {
-            CloseHandle(render_fence_event)?;
-
-            assert!(compute_pending_release.is_empty());
-
-            for gpu_mesh in gpu_meshes {
-                drop(gpu_mesh.vertex_buffer);
-                drop(gpu_mesh.index_buffer);
-            }
-
-            drop(pso);
-            drop(root_signature);
-            drop(render_cmd_list);
-            drop(cmd_allocators);
-            drop(resource_heap);
-            drop(dsv_heap);
-            drop(rtv_heap);
-            drop(depth_buffer);
-            drop(back_buffers);
-            drop(swap_chain);
-            drop(compute_fence);
-            drop(render_fence);
-            drop(compute_cmd_queue);
-            drop(cmd_queue);
-
-            if cfg!(debug_assertions) {
-                let debug_device = device.cast::<ID3D12DebugDevice>()?;
-                debug_device.ReportLiveDeviceObjects(D3D12_RLDO_DETAIL | D3D12_RLDO_IGNORE_INTERNAL)?;
-            }
-
-            drop(device);
-            drop(adapter);
-            drop(dxgi_factory);
+        for gpu_mesh in gpu_meshes {
+            drop(gpu_mesh.vertex_buffer);
+            drop(gpu_mesh.index_buffer);
         }
+
+        drop(load_mesh_thread_pool);
+        _ = async_compute_thread.join().unwrap();
+
+        drop(pso);
+        drop(root_signature);
+        drop(render_cmd_list);
+        drop(cmd_allocators);
+        drop(resource_heap);
+        drop(dsv_heap);
+        drop(rtv_heap);
+        drop(depth_buffer);
+        drop(back_buffers);
+        drop(swap_chain);
+        CloseHandle(render_fence_event)?;
+        drop(render_fence);
+        drop(cmd_queue);
+
+        if cfg!(debug_assertions) {
+            let debug_device = device.cast::<ID3D12DebugDevice>()?;
+            debug_device.ReportLiveDeviceObjects(D3D12_RLDO_DETAIL | D3D12_RLDO_IGNORE_INTERNAL)?;
+        }
+
+        drop(device);
+        drop(adapter);
+        drop(dxgi_factory);
 
         UnregisterClassA(WINDOW_REGISTRY_NAME, None)?;
     }
