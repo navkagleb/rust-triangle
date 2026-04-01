@@ -1,5 +1,4 @@
 mod async_compute;
-mod imgui_ffi;
 mod mesh;
 
 use std::ffi::CString;
@@ -24,8 +23,8 @@ use windows::Win32::System::Threading::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::*;
 
-use crate::imgui_ffi::*;
-use crate::mesh::*;
+use imgui_sys::*;
+use mesh::*;
 
 const WINDOW_REGISTRY_NAME: PCSTR = s!("rust-window");
 const WIDTH: u32 = 1280;

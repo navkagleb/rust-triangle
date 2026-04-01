@@ -1,0 +1,40 @@
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2024"
+
+[build-dependencies]
+anyhow = "1.0.102"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+
+[dependencies]
+gltf = "1.4.1"
+rand = "0.10.0"
+anyhow = "1.0.102"
+imgui-sys = { path = "../imgui-sys" }
+
+[dependencies.glam]
+package = "glam"
+git = "https://github.com/bitshifter/glam-rs"
+tag = "0.32.0"
+
+[dependencies.windows]
+package = "windows"
+git = "https://github.com/microsoft/windows-rs"
+tag = "73"
+features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D12",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+]
+
+[profile.dev.package."*"]
+opt-level = 3

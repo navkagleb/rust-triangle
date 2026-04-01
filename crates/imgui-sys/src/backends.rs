@@ -1,10 +1,3 @@
-#![allow(non_upper_case_globals)]
-#![allow(non_camel_case_types)]
-#![allow(non_snake_case)]
-#![allow(dead_code)]
-
-include!(concat!(env!("OUT_DIR"), "/imgui_bindings.rs"));
-
 // imgui backend functions are declared manually instead of using dear_bindings generated wrappers
 // because dear_bindings backend generation is experimental and produces broken C++ code —
 // types like ImDrawData* end up in the `cimgui` namespace which causes type mismatch errors
@@ -14,6 +7,8 @@ include!(concat!(env!("OUT_DIR"), "/imgui_bindings.rs"));
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+
+use crate::*;
 
 unsafe extern "C" {
     pub unsafe fn cimgui_implwin32_init(hwnd: *mut std::ffi::c_void) -> bool;
@@ -28,6 +23,7 @@ unsafe extern "C" {
 }
 
 #[repr(C)]
+#[derive(Default)]
 pub struct ImGui_ImplDX12_InitInfo {
     pub device: *mut ID3D12Device,
     pub command_queue: *mut ID3D12CommandQueue,
