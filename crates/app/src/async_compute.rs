@@ -1,5 +1,3 @@
-use anyhow::Result;
-
 use crate::*;
 
 const ASYNC_COMPUTE_FRAME_COUNT: u64 = 3;
@@ -71,11 +69,8 @@ fn async_compute_routine(
                     total_indices_size += size_of_val(mesh.indices.as_slice());
                 }
 
-                let upload_buf = ID3D12Resource::new_buf(
-                    &device,
-                    D3D12_HEAP_TYPE_UPLOAD,
-                    total_vertices_size + total_indices_size,
-                )?;
+                let upload_buf =
+                    ID3D12Resource::new_buf(device, D3D12_HEAP_TYPE_UPLOAD, total_vertices_size + total_indices_size)?;
 
                 let mut mapped_ptr = std::ptr::null_mut::<std::ffi::c_void>();
                 upload_buf.Map(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }), Some(&mut mapped_ptr))?;
@@ -161,8 +156,8 @@ fn async_compute_routine(
                 );
             }
 
-            if fence_value - fence.GetCompletedValue() >= ASYNC_COMPUTE_FRAME_COUNT as u64 {
-                let fence_value_to_wait = fence_value - ASYNC_COMPUTE_FRAME_COUNT as u64 + 1;
+            if fence_value - fence.GetCompletedValue() >= ASYNC_COMPUTE_FRAME_COUNT {
+                let fence_value_to_wait = fence_value - ASYNC_COMPUTE_FRAME_COUNT + 1;
                 wait_for_gpu(&fence, fence_event, fence_value_to_wait)?;
             }
 

@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use glam::{Mat4, Quat, Vec3};
 use rand::prelude::*;
 use windows::Win32::Foundation::*;
@@ -21,7 +21,7 @@ use windows::Win32::Graphics::Gdi::UpdateWindow;
 use windows::Win32::System::LibraryLoader::*;
 use windows::Win32::System::Threading::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
-use windows::core::*;
+use windows::core::{BOOL, Interface, PCSTR, PCWSTR, s};
 
 use imgui_sys::*;
 use mesh::*;
@@ -730,7 +730,7 @@ fn wait_for_gpu(fence: &ID3D12Fence, wait_event_handle: HANDLE, wait_value: u64)
         fence.SetEventOnCompletion(wait_value, wait_event_handle)?;
 
         if WaitForSingleObject(wait_event_handle, INFINITE) == WAIT_FAILED {
-            return Err(Error::from_thread().into());
+            bail!(windows::core::Error::from_thread());
         }
     }
 
