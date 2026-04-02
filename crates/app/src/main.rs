@@ -443,9 +443,9 @@ fn main() -> Result<()> {
             ImGui_StyleColorsClassic(std::ptr::null_mut());
 
             let io = &mut *ImGui_GetIO();
-            io.ConfigFlags |= ImGuiConfigFlags__ImGuiConfigFlags_NavEnableKeyboard;
-            io.ConfigFlags |= ImGuiConfigFlags__ImGuiConfigFlags_DockingEnable;
-            io.ConfigFlags |= ImGuiConfigFlags__ImGuiConfigFlags_ViewportsEnable;
+            io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+            io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
+            io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;
 
             cimgui_implwin32_init(window_handle.0);
             cimgui_impldx12_init(&mut ImGui_ImplDX12_InitInfo {
@@ -629,7 +629,7 @@ fn main() -> Result<()> {
                 cimgui_impldx12_render_draw_data(ImGui_GetDrawData(), render_cmd_list.as_raw() as *mut _);
 
                 let io = *ImGui_GetIO();
-                if io.ConfigFlags & ImGuiConfigFlags__ImGuiConfigFlags_ViewportsEnable != 0 {
+                if io.ConfigFlags & ImGuiConfigFlags_ViewportsEnable != 0 {
                     ImGui_UpdatePlatformWindows();
                     ImGui_RenderPlatformWindowsDefault();
                 }

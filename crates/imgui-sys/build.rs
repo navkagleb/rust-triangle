@@ -36,6 +36,7 @@ fn main() -> anyhow::Result<()> {
         .allowlist_function("ImGui_.*")
         .allowlist_type("Im.*")
         .allowlist_var("ImGui.*")
+        .prepend_enum_name(false)
         .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
         .generate()?
         .write_to_file(PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("imgui_bindings.rs"))?;
