@@ -1,4 +1,14 @@
-use crate::*;
+use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex};
+
+use anyhow::{Context, Result};
+use glam::{Mat4, Quat, Vec3};
+use rand::prelude::*;
+use windows::Win32::Graphics::Direct3D12::*;
+use windows::Win32::Graphics::Dxgi::Common::*;
+use windows::Win32::System::Threading::GetCurrentThreadId;
+
+use crate::{D3D12ResourceExt, measure};
 
 #[allow(dead_code)]
 pub struct MeshVertex {
@@ -117,7 +127,7 @@ type GpuMeshJob = Box<dyn FnOnce() + Send + 'static>;
 pub struct LoadedMesh(pub Mesh, pub GpuMesh);
 
 pub struct LoadThreadPool {
-    workers: Vec<JoinHandle<()>>,
+    workers: Vec<std::thread::JoinHandle<()>>,
     job_sender: Option<Sender<GpuMeshJob>>,
     loaded_mesh_sender: Sender<Result<LoadedMesh>>,
 }
@@ -154,7 +164,7 @@ impl LoadThreadPool {
         }
     }
 
-    pub fn submit(&self, device: &Arc<ID3D12Device4>, path: PathBuf) {
+    pub fn submit(&self, device: &Arc<ID3D12Device4>, path: std::path::PathBuf) {
         let device = Arc::clone(device);
         let loaded_mesh_sender = self.loaded_mesh_sender.clone();
 

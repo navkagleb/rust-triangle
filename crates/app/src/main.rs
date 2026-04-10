@@ -4,22 +4,19 @@ mod mesh;
 use std::ffi::CString;
 use std::mem::ManuallyDrop;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{Receiver, Sender};
-use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
-use glam::{Mat4, Quat, Vec3};
-use rand::prelude::*;
+use anyhow::Result;
+use glam::{Mat4, Vec3};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Direct3D::*;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::Graphics::Gdi::UpdateWindow;
-use windows::Win32::System::LibraryLoader::*;
-use windows::Win32::System::Threading::*;
+use windows::Win32::System::LibraryLoader::GetModuleHandleA;
+use windows::Win32::System::Threading::{CreateEventA, GetCurrentThreadId, INFINITE, WaitForSingleObject};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{BOOL, Interface, PCSTR, PCWSTR, s};
 
@@ -50,7 +47,7 @@ macro_rules! imgui_text {
     };
 }
 
-fn main() -> Result<()> {
+fn main() -> anyhow::Result<()> {
     println!("Hello D3D12 Rust Triangle!");
 
     let cam_pos = Vec3::ZERO;
@@ -62,7 +59,7 @@ fn main() -> Result<()> {
     let view_to_clip = Mat4::perspective_infinite_reverse_lh(fov_y, WIDTH as f32 / HEIGHT as f32, near_plane);
     let world_to_clip = view_to_clip * world_to_view;
 
-    let (loaded_mesh_sender, loaded_mesh_receiver) = std::sync::mpsc::channel::<Result<LoadedMesh>>();
+    let (loaded_mesh_sender, loaded_mesh_receiver) = std::sync::mpsc::channel::<anyhow::Result<LoadedMesh>>();
     let (ready_mesh_sender, ready_mesh_receiver) = std::sync::mpsc::channel::<GpuMesh>();
     let load_mesh_thread_pool = LoadThreadPool::new(GPU_MESH_THREAD_POOL_SIZE, loaded_mesh_sender);
 
@@ -725,12 +722,12 @@ fn wide_to_string(wide: &[u16]) -> String {
     String::from_utf16_lossy(&wide[..end])
 }
 
-fn wait_for_gpu(fence: &ID3D12Fence, wait_event_handle: HANDLE, wait_value: u64) -> Result<()> {
+fn wait_for_gpu(fence: &ID3D12Fence, wait_event_handle: HANDLE, wait_value: u64) -> anyhow::Result<()> {
     unsafe {
         fence.SetEventOnCompletion(wait_value, wait_event_handle)?;
 
         if WaitForSingleObject(wait_event_handle, INFINITE) == WAIT_FAILED {
-            bail!(windows::core::Error::from_thread());
+            anyhow::bail!(windows::core::Error::from_thread());
         }
     }
 

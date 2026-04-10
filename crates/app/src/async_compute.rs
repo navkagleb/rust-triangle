@@ -1,10 +1,19 @@
-use crate::*;
+use std::sync::Arc;
+use std::sync::mpsc::{Receiver, Sender};
+
+use anyhow::Result;
+use windows::Win32::Graphics::Direct3D12::*;
+use windows::Win32::System::Threading::{CreateEventA, GetCurrentProcessId};
+use windows::core::{Interface, s};
+
+use crate::mesh::*;
+use crate::{D3D12ResourceBarrierExt, D3D12ResourceExt, wait_for_gpu};
 
 const ASYNC_COMPUTE_FRAME_COUNT: u64 = 3;
 
 pub fn start_thread(
     device: Arc<ID3D12Device4>,
-    loaded_mesh_receiver: Receiver<Result<mesh::LoadedMesh>>,
+    loaded_mesh_receiver: Receiver<Result<LoadedMesh>>,
     ready_mesh_sender: Sender<GpuMesh>,
 ) -> std::thread::JoinHandle<Result<()>> {
     std::thread::Builder::new()
