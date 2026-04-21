@@ -1,4 +1,5 @@
 mod async_compute;
+mod d3d12_utils;
 mod mesh;
 
 use std::ffi::CString;
@@ -16,12 +17,13 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::Graphics::Gdi::UpdateWindow;
 use windows::Win32::System::LibraryLoader::GetModuleHandleA;
-use windows::Win32::System::Threading::{CreateEventA, GetCurrentThreadId, INFINITE, WaitForSingleObject};
+use windows::Win32::System::Threading::{CreateEventA, GetCurrentThreadId};
 use windows::Win32::UI::WindowsAndMessaging::*;
-use windows::core::{BOOL, Interface, PCSTR, PCWSTR, s};
+use windows::core::{BOOL, Interface, PCSTR, s};
 
+use d3d12_utils::*;
 use imgui_sys::*;
-use mesh::*;
+use mesh::{GpuMesh, LoadThreadPool, LoadedMesh};
 
 const WINDOW_REGISTRY_NAME: PCSTR = s!("rust-window");
 const WIDTH: u32 = 1280;
@@ -30,16 +32,6 @@ const FRAME_COUNT: u32 = 3;
 const BACK_BUFFER_FORMAT: DXGI_FORMAT = DXGI_FORMAT_R8G8B8A8_UNORM;
 const DEPTH_BUFFER_FORMAT: DXGI_FORMAT = DXGI_FORMAT_D32_FLOAT;
 const GPU_MESH_THREAD_POOL_SIZE: usize = 4;
-
-fn measure<F, R>(f: F) -> (R, f32)
-where
-    F: FnOnce() -> R,
-{
-    let t = Instant::now();
-    let r = f();
-
-    (r, t.elapsed().as_secs_f32() * 1000.0)
-}
 
 macro_rules! imgui_text {
     ($($arg:tt)*) => {
@@ -59,7 +51,7 @@ fn main() -> anyhow::Result<()> {
     let view_to_clip = Mat4::perspective_infinite_reverse_lh(fov_y, WIDTH as f32 / HEIGHT as f32, near_plane);
     let world_to_clip = view_to_clip * world_to_view;
 
-    let (loaded_mesh_sender, loaded_mesh_receiver) = std::sync::mpsc::channel::<anyhow::Result<LoadedMesh>>();
+    let (loaded_mesh_sender, loaded_mesh_receiver) = std::sync::mpsc::channel::<Result<LoadedMesh>>();
     let (ready_mesh_sender, ready_mesh_receiver) = std::sync::mpsc::channel::<GpuMesh>();
     let load_mesh_thread_pool = LoadThreadPool::new(GPU_MESH_THREAD_POOL_SIZE, loaded_mesh_sender);
 
@@ -184,6 +176,17 @@ fn main() -> anyhow::Result<()> {
                 shader_model.HighestShaderModel.0 / 16,
                 shader_model.HighestShaderModel.0 % 16
             );
+        }
+
+        {
+            let options7 = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
+            device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS7,
+                std::ptr::addr_of!(options7) as _,
+                size_of_val(&options7) as u32,
+            )?;
+
+            assert_ne!(options7.MeshShaderTier, D3D12_MESH_SHADER_TIER_NOT_SUPPORTED);
         }
 
         {
@@ -316,11 +319,11 @@ fn main() -> anyhow::Result<()> {
             dsv
         };
 
-        let cmd_allocators: [_; FRAME_COUNT as usize] = std::array::from_fn(|_| {
-            device
-                .CreateCommandAllocator::<ID3D12CommandAllocator>(D3D12_COMMAND_LIST_TYPE_DIRECT)
-                .unwrap()
-        });
+        let cmd_allocators: [_; FRAME_COUNT as usize] = (0..FRAME_COUNT)
+            .map(|_| device.CreateCommandAllocator::<ID3D12CommandAllocator>(D3D12_COMMAND_LIST_TYPE_DIRECT))
+            .collect::<windows::core::Result<Vec<_>>>()?
+            .try_into()
+            .expect("0..FRAME_COUNT must produce exactly FRAME_COUNT elements");
 
         let render_cmd_list = device.CreateCommandList1::<ID3D12GraphicsCommandList1>(
             0,
@@ -720,150 +723,6 @@ extern "system" fn handle_window_message(window_handle: HWND, message: u32, wpar
 fn wide_to_string(wide: &[u16]) -> String {
     let end = wide.iter().position(|&c| c == 0).unwrap_or(wide.len());
     String::from_utf16_lossy(&wide[..end])
-}
-
-fn wait_for_gpu(fence: &ID3D12Fence, wait_event_handle: HANDLE, wait_value: u64) -> anyhow::Result<()> {
-    unsafe {
-        fence.SetEventOnCompletion(wait_value, wait_event_handle)?;
-
-        if WaitForSingleObject(wait_event_handle, INFINITE) == WAIT_FAILED {
-            anyhow::bail!(windows::core::Error::from_thread());
-        }
-    }
-
-    Ok(())
-}
-
-extern "system" fn d3d12_message_callback(
-    _category: D3D12_MESSAGE_CATEGORY,
-    severity: D3D12_MESSAGE_SEVERITY,
-    _id: D3D12_MESSAGE_ID,
-    description: PCSTR,
-    _context: *mut std::ffi::c_void,
-) {
-    let severity_str = match severity {
-        D3D12_MESSAGE_SEVERITY_CORRUPTION => "CORRUPTION",
-        D3D12_MESSAGE_SEVERITY_ERROR => "ERROR",
-        D3D12_MESSAGE_SEVERITY_WARNING => "WARNING",
-        D3D12_MESSAGE_SEVERITY_INFO => "INFO",
-        D3D12_MESSAGE_SEVERITY_MESSAGE => "MESSAGE",
-        _ => "",
-    };
-
-    let message = unsafe { std::ffi::CStr::from_ptr(description.0 as _).to_string_lossy() };
-    println!("[D3D12 {}]: {}", severity_str, message);
-}
-
-trait InterfaceExt {
-    fn set_debug_name(&self, name: &str) -> Result<()>;
-}
-
-impl<T> InterfaceExt for T
-where
-    T: Interface,
-{
-    fn set_debug_name(&self, name: &str) -> Result<()> {
-        let wide = name.encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
-        let native_wide = PCWSTR::from_raw(wide.as_ptr());
-
-        unsafe {
-            if let Ok(d3d12_object) = self.cast::<ID3D12Object>() {
-                d3d12_object.SetName(native_wide)?;
-            }
-
-            if let Ok(dxgi_object) = self.cast::<IDXGIObject>() {
-                dxgi_object.SetPrivateData(
-                    &WKPDID_D3DDebugObjectName,
-                    native_wide.len() as u32,
-                    native_wide.as_ptr() as *const _,
-                )?;
-            }
-        }
-
-        Ok(())
-    }
-}
-
-trait D3D12HeapPropertiesExt {
-    fn from_heap_type(heap_type: D3D12_HEAP_TYPE) -> Self;
-}
-
-impl D3D12HeapPropertiesExt for D3D12_HEAP_PROPERTIES {
-    fn from_heap_type(heap_type: D3D12_HEAP_TYPE) -> Self {
-        Self {
-            Type: heap_type,
-            CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
-            MemoryPoolPreference: D3D12_MEMORY_POOL_UNKNOWN,
-            CreationNodeMask: 1,
-            VisibleNodeMask: 1,
-        }
-    }
-}
-
-trait D3D12ResourceBarrierExt {
-    fn new_transition(
-        resource: &ID3D12Resource,
-        state_before: D3D12_RESOURCE_STATES,
-        state_after: D3D12_RESOURCE_STATES,
-    ) -> Self;
-}
-
-impl D3D12ResourceBarrierExt for D3D12_RESOURCE_BARRIER {
-    fn new_transition(
-        resource: &ID3D12Resource,
-        state_before: D3D12_RESOURCE_STATES,
-        state_after: D3D12_RESOURCE_STATES,
-    ) -> Self {
-        Self {
-            Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
-            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-            Anonymous: D3D12_RESOURCE_BARRIER_0 {
-                Transition: ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
-                    pResource: unsafe { std::mem::transmute_copy(resource) },
-                    Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
-                    StateBefore: state_before,
-                    StateAfter: state_after,
-                }),
-            },
-        }
-    }
-}
-
-trait D3D12ResourceExt {
-    fn new_buf(device: &ID3D12Device, heap_type: D3D12_HEAP_TYPE, size: usize) -> Result<ID3D12Resource>;
-}
-
-impl D3D12ResourceExt for ID3D12Resource {
-    fn new_buf(device: &ID3D12Device, heap_type: D3D12_HEAP_TYPE, size: usize) -> Result<ID3D12Resource> {
-        let mut buf: Option<ID3D12Resource> = None;
-        unsafe {
-            device.CreateCommittedResource(
-                &D3D12_HEAP_PROPERTIES::from_heap_type(heap_type),
-                D3D12_HEAP_FLAG_NONE,
-                &D3D12_RESOURCE_DESC {
-                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-                    Alignment: 0,
-                    Width: size as u64,
-                    Height: 1,
-                    DepthOrArraySize: 1,
-                    MipLevels: 1,
-                    Format: DXGI_FORMAT_UNKNOWN,
-                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-                    Flags: D3D12_RESOURCE_FLAG_NONE,
-                },
-                if heap_type == D3D12_HEAP_TYPE_UPLOAD {
-                    D3D12_RESOURCE_STATE_GENERIC_READ
-                } else {
-                    D3D12_RESOURCE_STATE_COMMON
-                },
-                None,
-                &mut buf,
-            )?;
-        }
-
-        Ok(buf.unwrap())
-    }
 }
 
 struct FrameTimer {

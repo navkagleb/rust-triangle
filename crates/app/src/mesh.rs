@@ -8,7 +8,17 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 
-use crate::{D3D12ResourceExt, measure};
+use crate::d3d12_utils::D3D12ResourceExt;
+
+fn measure<F, R>(f: F) -> (R, f32)
+where
+    F: FnOnce() -> R,
+{
+    let t = std::time::Instant::now();
+    let r = f();
+
+    (r, t.elapsed().as_secs_f32() * 1000.0)
+}
 
 #[allow(dead_code)]
 pub struct MeshVertex {
