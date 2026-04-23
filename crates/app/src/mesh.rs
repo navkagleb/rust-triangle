@@ -109,9 +109,9 @@ pub struct GpuMesh {
 impl GpuMesh {
     fn new(device: &ID3D12Device, mesh: &Mesh, local_to_world: Mat4) -> Option<Self> {
         let vertex_buffer =
-            ID3D12Resource::new_buf(device, D3D12_HEAP_TYPE_DEFAULT, size_of_val(mesh.vertices.as_slice())).ok()?;
+            ID3D12Resource::new_buffer(device, D3D12_HEAP_TYPE_DEFAULT, size_of_val(mesh.vertices.as_slice())).ok()?;
         let index_buffer =
-            ID3D12Resource::new_buf(device, D3D12_HEAP_TYPE_DEFAULT, size_of_val(mesh.indices.as_slice())).ok()?;
+            ID3D12Resource::new_buffer(device, D3D12_HEAP_TYPE_DEFAULT, size_of_val(mesh.indices.as_slice())).ok()?;
 
         Some(Self {
             local_to_world,

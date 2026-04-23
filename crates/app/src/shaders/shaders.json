@@ -2,5 +2,9 @@
     "triangle.hlsl": [
         "vs",
         "ps"
+    ],
+    "terrain.hlsl": [
+        "vs",
+        "ps"
     ]
 }

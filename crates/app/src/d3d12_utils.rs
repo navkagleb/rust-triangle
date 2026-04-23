@@ -5,7 +5,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::System::Threading::{INFINITE, WaitForSingleObject};
-use windows::core::{Interface, PCSTR, PCWSTR};
+use windows::core::{Error, Interface, PCSTR, PCWSTR};
 
 pub fn wait_for_gpu(fence: &ID3D12Fence, wait_event_handle: HANDLE, wait_value: u64) -> Result<()> {
     unsafe {
@@ -17,26 +17,6 @@ pub fn wait_for_gpu(fence: &ID3D12Fence, wait_event_handle: HANDLE, wait_value: 
     }
 
     Ok(())
-}
-
-pub extern "system" fn d3d12_message_callback(
-    _category: D3D12_MESSAGE_CATEGORY,
-    severity: D3D12_MESSAGE_SEVERITY,
-    _id: D3D12_MESSAGE_ID,
-    description: PCSTR,
-    _context: *mut std::ffi::c_void,
-) {
-    let severity_str = match severity {
-        D3D12_MESSAGE_SEVERITY_CORRUPTION => "CORRUPTION",
-        D3D12_MESSAGE_SEVERITY_ERROR => "ERROR",
-        D3D12_MESSAGE_SEVERITY_WARNING => "WARNING",
-        D3D12_MESSAGE_SEVERITY_INFO => "INFO",
-        D3D12_MESSAGE_SEVERITY_MESSAGE => "MESSAGE",
-        _ => "",
-    };
-
-    let message = unsafe { std::ffi::CStr::from_ptr(description.0 as _).to_string_lossy() };
-    println!("[D3D12 {}]: {}", severity_str, message);
 }
 
 pub trait InterfaceExt {
@@ -112,14 +92,15 @@ impl D3D12ResourceBarrierExt for D3D12_RESOURCE_BARRIER {
 }
 
 pub trait D3D12ResourceExt {
-    fn new_buf(device: &ID3D12Device, heap_type: D3D12_HEAP_TYPE, size: usize) -> Result<ID3D12Resource>;
+    fn new_buffer(device: &ID3D12Device, heap_type: D3D12_HEAP_TYPE, size: usize) -> Result<ID3D12Resource>;
+    fn new_texture(device: &ID3D12Device, format: DXGI_FORMAT, width: u32, height: u32) -> Result<ID3D12Resource>;
 }
 
 impl D3D12ResourceExt for ID3D12Resource {
-    fn new_buf(device: &ID3D12Device, heap_type: D3D12_HEAP_TYPE, size: usize) -> Result<ID3D12Resource> {
-        let mut buf: Option<ID3D12Resource> = None;
+    fn new_buffer(device: &ID3D12Device, heap_type: D3D12_HEAP_TYPE, size: usize) -> Result<ID3D12Resource> {
+        let mut buffer = None;
         unsafe {
-            device.CreateCommittedResource(
+            device.CreateCommittedResource::<ID3D12Resource>(
                 &D3D12_HEAP_PROPERTIES::from_heap_type(heap_type),
                 D3D12_HEAP_FLAG_NONE,
                 &D3D12_RESOURCE_DESC {
@@ -140,10 +121,112 @@ impl D3D12ResourceExt for ID3D12Resource {
                     D3D12_RESOURCE_STATE_COMMON
                 },
                 None,
-                &mut buf,
+                &mut buffer,
             )?;
         }
 
-        Ok(buf.unwrap())
+        buffer.ok_or(Error::from_thread().into())
     }
+
+    fn new_texture(device: &ID3D12Device, format: DXGI_FORMAT, width: u32, height: u32) -> Result<ID3D12Resource> {
+        assert_ne!(format, DXGI_FORMAT_UNKNOWN);
+
+        let mut texture = None;
+        unsafe {
+            device.CreateCommittedResource::<ID3D12Resource>(
+                &D3D12_HEAP_PROPERTIES::from_heap_type(D3D12_HEAP_TYPE_DEFAULT),
+                D3D12_HEAP_FLAG_NONE,
+                &D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                    Alignment: 0,
+                    Width: width as u64,
+                    Height: height,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    Format: format,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+                    Flags: D3D12_RESOURCE_FLAG_NONE,
+                },
+                D3D12_RESOURCE_STATE_COMMON,
+                None,
+                &mut texture,
+            )?
+        }
+
+        texture.ok_or(Error::from_thread().into())
+    }
+}
+
+pub fn upload_texture_data(
+    device: &ID3D12Device,
+    cmd_list: &ID3D12GraphicsCommandList,
+    data: &[u8],
+    texture: &ID3D12Resource,
+) -> Result<ID3D12Resource> {
+    let mut layout = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+    let mut row_count = 0;
+    let mut row_size = 0;
+    let mut texture_size = 0;
+    unsafe {
+        device.GetCopyableFootprints(
+            &texture.GetDesc(),
+            0,
+            1,
+            0,
+            Some(&mut layout),
+            Some(&mut row_count),
+            Some(&mut row_size),
+            Some(&mut texture_size),
+        )
+    };
+
+    let upload_buffer = ID3D12Resource::new_buffer(device, D3D12_HEAP_TYPE_UPLOAD, texture_size as usize)?;
+    let upload_cpu_ptr = {
+        let mut cpu_ptr = std::ptr::null_mut::<std::ffi::c_void>();
+        unsafe { upload_buffer.Map(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }), Some(&mut cpu_ptr))? };
+
+        cpu_ptr as *mut u8
+    };
+
+    for row_index in 0..row_count {
+        let data_row_offset = row_size as usize * row_index as usize;
+        let upload_row_offset = (layout.Footprint.RowPitch * row_index) as usize;
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr().add(data_row_offset),
+                upload_cpu_ptr.add(upload_row_offset),
+                row_size as usize,
+            );
+        }
+    }
+
+    unsafe {
+        upload_buffer.Unmap(
+            0,
+            Some(&D3D12_RANGE {
+                Begin: 0,
+                End: texture_size as usize,
+            }),
+        );
+    }
+
+    let dst_location = D3D12_TEXTURE_COPY_LOCATION {
+        pResource: unsafe { std::mem::transmute_copy(texture) },
+        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+    };
+
+    let src_location = D3D12_TEXTURE_COPY_LOCATION {
+        pResource: unsafe { std::mem::transmute_copy(&upload_buffer) },
+        Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+            PlacedFootprint: layout,
+        },
+    };
+
+    unsafe { cmd_list.CopyTextureRegion(&dst_location, 0, 0, 0, &src_location, None) };
+
+    Ok(upload_buffer)
 }

@@ -10,6 +10,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use glam::{Mat4, Vec3};
+use noise::utils::{NoiseMapBuilder, PlaneMapBuilder};
+use noise::{Fbm, MultiFractal, Perlin};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Direct3D::*;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -26,8 +28,8 @@ use imgui_sys::*;
 use mesh::{GpuMesh, LoadThreadPool, LoadedMesh};
 
 const WINDOW_REGISTRY_NAME: PCSTR = s!("rust-window");
-const WIDTH: u32 = 1280;
-const HEIGHT: u32 = 720;
+const WIDTH: u32 = 1920;
+const HEIGHT: u32 = 1080;
 const FRAME_COUNT: u32 = 3;
 const BACK_BUFFER_FORMAT: DXGI_FORMAT = DXGI_FORMAT_R8G8B8A8_UNORM;
 const DEPTH_BUFFER_FORMAT: DXGI_FORMAT = DXGI_FORMAT_D32_FLOAT;
@@ -42,8 +44,8 @@ macro_rules! imgui_text {
 fn main() -> anyhow::Result<()> {
     println!("Hello D3D12 Rust Triangle!");
 
-    let cam_pos = Vec3::ZERO;
-    let cam_front_dir = Vec3::new(0.0, 0.0, 1.0).normalize();
+    let cam_pos = Vec3::new(0.0, 100.0, -300.0);
+    let cam_front_dir = Vec3::new(0.0, -1.0, 1.0).normalize();
     let fov_y = 90_f32.to_radians();
     let near_plane = 0.1;
 
@@ -150,16 +152,6 @@ fn main() -> anyhow::Result<()> {
 
             Arc::new(device.cast::<ID3D12Device4>()?)
         };
-
-        if cfg!(debug_assertions) {
-            let info_queue = device.cast::<ID3D12InfoQueue1>()?;
-            info_queue.RegisterMessageCallback(
-                Some(d3d12_message_callback),
-                D3D12_MESSAGE_CALLBACK_FLAG_NONE,
-                std::ptr::null_mut(),
-                &mut 0u32,
-            )?;
-        }
 
         {
             let shader_model = D3D12_FEATURE_DATA_SHADER_MODEL {
@@ -292,7 +284,7 @@ fn main() -> anyhow::Result<()> {
         })?;
 
         let resource_heap = device.CreateDescriptorHeap::<ID3D12DescriptorHeap>(&D3D12_DESCRIPTOR_HEAP_DESC {
-            NumDescriptors: 1,
+            NumDescriptors: 2, // 0 - ImGui Font Texture, 1 - Height map src
             Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
             Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
             NodeMask: 0,
@@ -347,13 +339,28 @@ fn main() -> anyhow::Result<()> {
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
             }];
 
+            let static_samplers = [D3D12_STATIC_SAMPLER_DESC {
+                Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
+                AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                ComparisonFunc: D3D12_COMPARISON_FUNC_NEVER,
+                BorderColor: D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK,
+                MaxLOD: D3D12_FLOAT32_MAX,
+                ShaderRegister: 0, // s0
+                RegisterSpace: 0,
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+                ..Default::default()
+            }];
+
             D3D12SerializeRootSignature(
                 &D3D12_ROOT_SIGNATURE_DESC {
                     NumParameters: root_params.len() as u32,
                     pParameters: root_params.as_ptr(),
-                    NumStaticSamplers: 0,
-                    pStaticSamplers: std::ptr::null(),
-                    Flags: D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT,
+                    NumStaticSamplers: static_samplers.len() as u32,
+                    pStaticSamplers: static_samplers.as_ptr(),
+                    Flags: D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT
+                        | D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED,
                 },
                 D3D_ROOT_SIGNATURE_VERSION_1,
                 &mut blob,
@@ -366,14 +373,23 @@ fn main() -> anyhow::Result<()> {
             device.CreateRootSignature::<ID3D12RootSignature>(0, bytecode)?
         };
 
+        let to_bytecode = |blob: &[u8]| D3D12_SHADER_BYTECODE {
+            pShaderBytecode: blob.as_ptr() as _,
+            BytecodeLength: blob.len(),
+        };
+
+        let blend_state = D3D12_BLEND_DESC {
+            RenderTarget: {
+                let mut render_targets = [D3D12_RENDER_TARGET_BLEND_DESC::default(); 8];
+                render_targets[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8;
+                render_targets
+            },
+            ..Default::default()
+        };
+
         let pso = {
             let vs_blob = std::fs::read(Path::new("target/dxil/triangle.vs.dxil"))?;
             let ps_blob = std::fs::read(Path::new("target/dxil/triangle.ps.dxil"))?;
-
-            let to_bytecode = |blob: &[u8]| D3D12_SHADER_BYTECODE {
-                pShaderBytecode: blob.as_ptr() as _,
-                BytecodeLength: blob.len(),
-            };
 
             let input_elements = [
                 D3D12_INPUT_ELEMENT_DESC {
@@ -400,14 +416,7 @@ fn main() -> anyhow::Result<()> {
                 pRootSignature: ManuallyDrop::new(std::mem::transmute_copy(&root_signature)),
                 VS: to_bytecode(&vs_blob),
                 PS: to_bytecode(&ps_blob),
-                BlendState: D3D12_BLEND_DESC {
-                    RenderTarget: {
-                        let mut render_targets = [D3D12_RENDER_TARGET_BLEND_DESC::default(); 8];
-                        render_targets[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8;
-                        render_targets
-                    },
-                    ..Default::default()
-                },
+                BlendState: blend_state,
                 SampleMask: u32::MAX,
                 RasterizerState: D3D12_RASTERIZER_DESC {
                     FillMode: D3D12_FILL_MODE_SOLID,
@@ -425,6 +434,42 @@ fn main() -> anyhow::Result<()> {
                     pInputElementDescs: input_elements.as_ptr(),
                     NumElements: input_elements.len() as u32,
                 },
+                PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+                NumRenderTargets: 1,
+                RTVFormats: {
+                    let mut formats = [DXGI_FORMAT_UNKNOWN; 8];
+                    formats[0] = BACK_BUFFER_FORMAT;
+                    formats
+                },
+                DSVFormat: DEPTH_BUFFER_FORMAT,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                ..Default::default()
+            })?
+        };
+
+        let terrain_pso = {
+            let vs_blob = std::fs::read(Path::new("target/dxil/terrain.vs.dxil"))?;
+            let ps_blob = std::fs::read(Path::new("target/dxil/terrain.ps.dxil"))?;
+
+            device.CreateGraphicsPipelineState::<ID3D12PipelineState>(&D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+                pRootSignature: ManuallyDrop::new(std::mem::transmute_copy(&root_signature)),
+                VS: to_bytecode(&vs_blob),
+                PS: to_bytecode(&ps_blob),
+                BlendState: blend_state,
+                SampleMask: u32::MAX,
+                RasterizerState: D3D12_RASTERIZER_DESC {
+                    FillMode: D3D12_FILL_MODE_SOLID,
+                    CullMode: D3D12_CULL_MODE_NONE,
+                    FrontCounterClockwise: BOOL(0),
+                    ..Default::default()
+                },
+                DepthStencilState: D3D12_DEPTH_STENCIL_DESC {
+                    DepthEnable: BOOL(1),
+                    DepthWriteMask: D3D12_DEPTH_WRITE_MASK_ALL,
+                    DepthFunc: D3D12_COMPARISON_FUNC_GREATER,
+                    ..Default::default()
+                },
+                InputLayout: Default::default(),
                 PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
                 NumRenderTargets: 1,
                 RTVFormats: {
@@ -463,6 +508,16 @@ fn main() -> anyhow::Result<()> {
             });
         }
 
+        struct HeightMap {
+            texture: ID3D12Resource,
+            srv: D3D12_GPU_DESCRIPTOR_HANDLE,
+            size: usize,
+        }
+
+        let mut height_map: Option<HeightMap> = None;
+        let mut height_map_size = 512;
+        let mut height_map_scale = 5.0;
+
         let async_compute_thread =
             async_compute::start_thread(Arc::clone(&device), loaded_mesh_receiver, ready_mesh_sender);
 
@@ -471,6 +526,8 @@ fn main() -> anyhow::Result<()> {
 
         let mut mesh_spawn_count = 1;
         let mut pending_mesh_count = 0;
+
+        let mut deferred_release = Vec::new();
 
         loop {
             {
@@ -490,6 +547,8 @@ fn main() -> anyhow::Result<()> {
                     break;
                 }
             }
+
+            cpu_frame_index += 1;
 
             let (dt, fps) = frame_timer.tick();
 
@@ -532,9 +591,10 @@ fn main() -> anyhow::Result<()> {
             render_cmd_list.ClearRenderTargetView(rtv, &[0.3, 0.3, 0.3, 1.0], None);
             render_cmd_list.ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 0.0, 0, None);
 
+            render_cmd_list.SetDescriptorHeaps(&[Some(resource_heap.clone())]);
             render_cmd_list.SetGraphicsRootSignature(&root_signature);
-            render_cmd_list.SetPipelineState(&pso);
 
+            render_cmd_list.SetPipelineState(&pso);
             render_cmd_list.SetGraphicsRoot32BitConstants(0, 16, std::ptr::from_ref(&world_to_clip).cast(), 0);
 
             render_cmd_list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -574,10 +634,106 @@ fn main() -> anyhow::Result<()> {
                 }
             }
 
+            if let Some(hm) = height_map.as_ref() {
+                let vertex_count_per_instance = 2 * 3;
+                let instance_count = (hm.size - 1) * (hm.size - 1);
+
+                render_cmd_list.SetPipelineState(&terrain_pso);
+                render_cmd_list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                render_cmd_list.DrawInstanced(vertex_count_per_instance, instance_count as u32, 0, 0);
+            }
+
             {
                 cimgui_implwin32_new_frame();
                 cimgui_impldx12_new_frame();
                 ImGui_NewFrame();
+
+                ImGui_Begin(c"HeightMap".as_ptr(), std::ptr::null_mut(), 0);
+                {
+                    ImGui_InputInt(c"Terrain size".as_ptr(), &mut height_map_size);
+                    ImGui_InputFloat(c"Terrain scale".as_ptr(), &mut height_map_scale);
+
+                    if ImGui_Button(c"Generate height map".as_ptr()) {
+                        let fbm = Fbm::<Perlin>::new(123)
+                            .set_octaves(8)
+                            .set_frequency(1.0)
+                            .set_lacunarity(2.0)
+                            .set_persistence(0.7);
+
+                        let height_map_data = PlaneMapBuilder::new(fbm)
+                            .set_size(height_map_size as usize, height_map_size as usize)
+                            .set_x_bounds(0.0, height_map_scale as f64)
+                            .set_y_bounds(0.0, height_map_scale as f64)
+                            .build()
+                            .into_iter()
+                            .map(|n| n as f32)
+                            .collect::<Vec<_>>();
+
+                        let min = height_map_data.iter().cloned().fold(f32::INFINITY, f32::min);
+                        let max = height_map_data.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                        println!("min: {min}, max: {max}");
+
+                        let height_map_data = height_map_data
+                            .iter()
+                            .map(|n| (n - min) / (max - min))
+                            .collect::<Vec<_>>();
+
+                        let height_map_texture = ID3D12Resource::new_texture(
+                            &device,
+                            DXGI_FORMAT_R32_FLOAT,
+                            height_map_size as u32,
+                            height_map_size as u32,
+                        )?;
+
+                        let height_map_srv = {
+                            let resource_view_size =
+                                device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+                            let cpu_srv = D3D12_CPU_DESCRIPTOR_HANDLE {
+                                ptr: resource_heap.GetCPUDescriptorHandleForHeapStart().ptr
+                                    + resource_view_size as usize,
+                            };
+
+                            device.CreateShaderResourceView(&height_map_texture, None, cpu_srv);
+
+                            D3D12_GPU_DESCRIPTOR_HANDLE {
+                                ptr: resource_heap.GetGPUDescriptorHandleForHeapStart().ptr + resource_view_size as u64,
+                            }
+                        };
+
+                        let upload_buffer = d3d12_utils::upload_texture_data(
+                            &device,
+                            &render_cmd_list,
+                            std::slice::from_raw_parts(
+                                height_map_data.as_ptr() as *const u8,
+                                height_map_data.len() * size_of::<f32>(),
+                            ),
+                            &height_map_texture,
+                        )?;
+
+                        deferred_release.push((cpu_frame_index, upload_buffer.cast::<ID3D12Object>()?));
+
+                        let new_height_map = HeightMap {
+                            texture: height_map_texture,
+                            srv: height_map_srv,
+                            size: height_map_size as usize,
+                        };
+
+                        if let Some(prev_) = height_map.replace(new_height_map) {
+                            deferred_release.push((cpu_frame_index, prev_.texture.cast::<ID3D12Object>()?));
+                        }
+                    }
+
+                    if let Some(height_map) = height_map.as_ref() {
+                        ImGui_Image(
+                            ImTextureRef {
+                                _TexData: std::ptr::null_mut(),
+                                _TexID: height_map.srv.ptr,
+                            },
+                            ImVec2 { x: 512.0, y: 512.0 },
+                        );
+                    }
+                }
+                ImGui_End();
 
                 ImGui_Begin(c"Hello Rust".as_ptr(), std::ptr::null_mut(), 0);
                 {
@@ -625,7 +781,6 @@ fn main() -> anyhow::Result<()> {
                 ImGui_ShowDemoWindow(std::ptr::null_mut());
                 ImGui_Render();
 
-                render_cmd_list.SetDescriptorHeaps(&[Some(resource_heap.clone())]);
                 cimgui_impldx12_render_draw_data(ImGui_GetDrawData(), render_cmd_list.as_raw() as *mut _);
 
                 let io = *ImGui_GetIO();
@@ -646,15 +801,17 @@ fn main() -> anyhow::Result<()> {
             cmd_queue.ExecuteCommandLists(&[Some(render_cmd_list.cast::<ID3D12CommandList>()?)]);
 
             swap_chain.Present(0, DXGI_PRESENT_ALLOW_TEARING).ok()?;
-
-            cpu_frame_index += 1;
             cmd_queue.Signal(&render_fence, cpu_frame_index)?;
 
-            let gpu_frame_index = render_fence.GetCompletedValue();
+            let mut gpu_frame_index = render_fence.GetCompletedValue();
             if cpu_frame_index - gpu_frame_index >= FRAME_COUNT as u64 {
                 let gpu_frame_index_to_wait = cpu_frame_index - FRAME_COUNT as u64 + 1;
                 wait_for_gpu(&render_fence, render_fence_event, gpu_frame_index_to_wait)?;
+
+                gpu_frame_index = render_fence.GetCompletedValue();
             }
+
+            deferred_release.retain(|&(frame_index, _)| frame_index > gpu_frame_index);
         }
 
         wait_for_gpu(&render_fence, render_fence_event, cpu_frame_index)?;
@@ -665,6 +822,8 @@ fn main() -> anyhow::Result<()> {
             ImGui_DestroyContext(std::ptr::null_mut());
         }
 
+        assert!(deferred_release.is_empty());
+
         for gpu_mesh in gpu_meshes {
             drop(gpu_mesh.vertex_buffer);
             drop(gpu_mesh.index_buffer);
@@ -673,6 +832,11 @@ fn main() -> anyhow::Result<()> {
         drop(load_mesh_thread_pool);
         _ = async_compute_thread.join().unwrap();
 
+        if let Some(height_map) = height_map {
+            drop(height_map.texture);
+        }
+
+        drop(terrain_pso);
         drop(pso);
         drop(root_signature);
         drop(render_cmd_list);
