@@ -1,15 +1,15 @@
 mod async_compute;
+mod camera;
 mod d3d12_utils;
 mod mesh;
 
 use std::ffi::CString;
 use std::mem::ManuallyDrop;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use glam::{Mat4, Vec3};
 use noise::utils::{NoiseMapBuilder, PlaneMapBuilder};
 use noise::{Fbm, MultiFractal, Perlin};
 use windows::Win32::Foundation::*;
@@ -41,17 +41,29 @@ macro_rules! imgui_text {
     };
 }
 
+struct InputState {
+    keys: [bool; 256],
+    mouse_x: i32,
+    mouse_y: i32,
+    mouse_dx: i32,
+    mouse_dy: i32,
+    right_mouse_down: bool,
+}
+
+static INPUT: Mutex<InputState> = Mutex::new(InputState {
+    keys: [false; 256],
+    mouse_x: 0,
+    mouse_y: 0,
+    mouse_dx: 0,
+    mouse_dy: 0,
+    right_mouse_down: false,
+});
+
 fn main() -> anyhow::Result<()> {
     println!("Hello D3D12 Rust Triangle!");
 
-    let cam_pos = Vec3::new(0.0, 100.0, -300.0);
-    let cam_front_dir = Vec3::new(0.0, -1.0, 1.0).normalize();
-    let fov_y = 90_f32.to_radians();
-    let near_plane = 0.1;
-
-    let world_to_view = Mat4::look_to_lh(cam_pos, cam_front_dir, Vec3::Y);
-    let view_to_clip = Mat4::perspective_infinite_reverse_lh(fov_y, WIDTH as f32 / HEIGHT as f32, near_plane);
-    let world_to_clip = view_to_clip * world_to_view;
+    let mut camera = camera::Camera::new();
+    let mut camera_controller = camera::CameraController::new();
 
     let (loaded_mesh_sender, loaded_mesh_receiver) = std::sync::mpsc::channel::<Result<LoadedMesh>>();
     let (ready_mesh_sender, ready_mesh_receiver) = std::sync::mpsc::channel::<GpuMesh>();
@@ -552,6 +564,12 @@ fn main() -> anyhow::Result<()> {
 
             let (dt, fps) = frame_timer.tick();
 
+            camera_controller.control(dt, &mut camera);
+
+            let mut input = INPUT.lock().unwrap();
+            input.mouse_dx = 0;
+            input.mouse_dy = 0;
+
             let active_frame_index = swap_chain.GetCurrentBackBufferIndex();
             let cmd_allocator = &cmd_allocators[active_frame_index as usize];
 
@@ -595,7 +613,7 @@ fn main() -> anyhow::Result<()> {
             render_cmd_list.SetGraphicsRootSignature(&root_signature);
 
             render_cmd_list.SetPipelineState(&pso);
-            render_cmd_list.SetGraphicsRoot32BitConstants(0, 16, std::ptr::from_ref(&world_to_clip).cast(), 0);
+            render_cmd_list.SetGraphicsRoot32BitConstants(0, 16, std::ptr::from_ref(&camera.world_to_clip()).cast(), 0);
 
             render_cmd_list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
@@ -873,6 +891,34 @@ extern "system" fn handle_window_message(window_handle: HWND, message: u32, wpar
         }
 
         match message {
+            WM_KEYDOWN => {
+                INPUT.lock().unwrap().keys[wparam.0] = true;
+                LRESULT(0)
+            }
+            WM_KEYUP => {
+                INPUT.lock().unwrap().keys[wparam.0] = false;
+                LRESULT(0)
+            }
+            WM_MOUSEMOVE => {
+                let x = (lparam.0 & 0xFFFF) as i16 as i32;
+                let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
+
+                let mut input = INPUT.lock().unwrap();
+                input.mouse_dx = x - input.mouse_x;
+                input.mouse_dy = y - input.mouse_y;
+                input.mouse_x = x;
+                input.mouse_y = y;
+
+                LRESULT(0)
+            }
+            WM_RBUTTONDOWN => {
+                INPUT.lock().unwrap().right_mouse_down = true;
+                LRESULT(0)
+            }
+            WM_RBUTTONUP => {
+                INPUT.lock().unwrap().right_mouse_down = false;
+                LRESULT(0)
+            }
             WM_DESTROY => {
                 println!("WM_DESTROY");
                 PostQuitMessage(0);
