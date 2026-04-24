@@ -6,7 +6,7 @@ mod mesh;
 use std::ffi::CString;
 use std::mem::ManuallyDrop;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -50,20 +50,20 @@ struct InputState {
     right_mouse_down: bool,
 }
 
-static INPUT: Mutex<InputState> = Mutex::new(InputState {
-    keys: [false; 256],
-    mouse_x: 0,
-    mouse_y: 0,
-    mouse_dx: 0,
-    mouse_dy: 0,
-    right_mouse_down: false,
-});
-
 fn main() -> anyhow::Result<()> {
     println!("Hello D3D12 Rust Triangle!");
 
     let mut camera = camera::Camera::new();
-    let mut camera_controller = camera::CameraController::new();
+    let mut camera_controller = camera::CameraController::default();
+
+    let mut input = InputState {
+        keys: [false; 256],
+        mouse_x: 0,
+        mouse_y: 0,
+        mouse_dx: 0,
+        mouse_dy: 0,
+        right_mouse_down: false,
+    };
 
     let (loaded_mesh_sender, loaded_mesh_receiver) = std::sync::mpsc::channel::<Result<LoadedMesh>>();
     let (ready_mesh_sender, ready_mesh_receiver) = std::sync::mpsc::channel::<GpuMesh>();
@@ -111,6 +111,8 @@ fn main() -> anyhow::Result<()> {
                 None,
             )?
         };
+
+        SetWindowLongPtrA(window_handle, GWLP_USERDATA, &mut input as *mut InputState as isize);
 
         println!("{:?}, width: {}, height: {}", window_handle, WIDTH, HEIGHT);
 
@@ -564,11 +566,12 @@ fn main() -> anyhow::Result<()> {
 
             let (dt, fps) = frame_timer.tick();
 
-            camera_controller.control(dt, &mut camera);
+            {
+                camera_controller.control(dt, &input, &mut camera);
 
-            let mut input = INPUT.lock().unwrap();
-            input.mouse_dx = 0;
-            input.mouse_dy = 0;
+                input.mouse_dx = 0;
+                input.mouse_dy = 0;
+            }
 
             let active_frame_index = swap_chain.GetCurrentBackBufferIndex();
             let cmd_allocator = &cmd_allocators[active_frame_index as usize];
@@ -885,48 +888,53 @@ fn main() -> anyhow::Result<()> {
 }
 
 extern "system" fn handle_window_message(window_handle: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    unsafe {
-        if cimgui_implwin32_wnd_proc_handler(window_handle, message, wparam, lparam).0 != 0 {
-            return LRESULT(1);
+    if unsafe { cimgui_implwin32_wnd_proc_handler(window_handle, message, wparam, lparam).0 } != 0 {
+        return LRESULT::default();
+    }
+
+    let input = unsafe {
+        let input = GetWindowLongPtrA(window_handle, GWLP_USERDATA) as *mut InputState;
+        if input.is_null() {
+            return DefWindowProcA(window_handle, message, wparam, lparam);
         }
 
-        match message {
-            WM_KEYDOWN => {
-                INPUT.lock().unwrap().keys[wparam.0] = true;
-                LRESULT(0)
-            }
-            WM_KEYUP => {
-                INPUT.lock().unwrap().keys[wparam.0] = false;
-                LRESULT(0)
-            }
-            WM_MOUSEMOVE => {
-                let x = (lparam.0 & 0xFFFF) as i16 as i32;
-                let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
+        &mut *input
+    };
 
-                let mut input = INPUT.lock().unwrap();
-                input.mouse_dx = x - input.mouse_x;
-                input.mouse_dy = y - input.mouse_y;
-                input.mouse_x = x;
-                input.mouse_y = y;
-
-                LRESULT(0)
-            }
-            WM_RBUTTONDOWN => {
-                INPUT.lock().unwrap().right_mouse_down = true;
-                LRESULT(0)
-            }
-            WM_RBUTTONUP => {
-                INPUT.lock().unwrap().right_mouse_down = false;
-                LRESULT(0)
-            }
-            WM_DESTROY => {
-                println!("WM_DESTROY");
-                PostQuitMessage(0);
-                LRESULT::default()
-            }
-            // DestroyWindow is handled by DefWindowProcA
-            _ => DefWindowProcA(window_handle, message, wparam, lparam),
+    match message {
+        WM_KEYDOWN => {
+            input.keys[wparam.0] = true;
+            LRESULT::default()
         }
+        WM_KEYUP => {
+            input.keys[wparam.0] = false;
+            LRESULT::default()
+        }
+        WM_MOUSEMOVE => {
+            let x = (lparam.0 & 0xFFFF) as i16 as i32;
+            let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
+
+            input.mouse_dx = x - input.mouse_x;
+            input.mouse_dy = y - input.mouse_y;
+            input.mouse_x = x;
+            input.mouse_y = y;
+
+            LRESULT::default()
+        }
+        WM_RBUTTONDOWN => {
+            input.right_mouse_down = true;
+            LRESULT::default()
+        }
+        WM_RBUTTONUP => {
+            input.right_mouse_down = false;
+            LRESULT::default()
+        }
+        WM_DESTROY => {
+            unsafe { PostQuitMessage(0) };
+            LRESULT::default()
+        }
+        // DestroyWindow is handled by DefWindowProcA
+        _ => unsafe { DefWindowProcA(window_handle, message, wparam, lparam) },
     }
 }
 

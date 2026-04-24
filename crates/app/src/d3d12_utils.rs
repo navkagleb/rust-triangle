@@ -5,7 +5,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::System::Threading::{INFINITE, WaitForSingleObject};
-use windows::core::{Error, Interface, PCSTR, PCWSTR};
+use windows::core::{Error, Interface, PCWSTR};
 
 pub fn wait_for_gpu(fence: &ID3D12Fence, wait_event_handle: HANDLE, wait_value: u64) -> Result<()> {
     unsafe {
