@@ -42,6 +42,13 @@ macro_rules! imgui_text {
     };
 }
 
+#[repr(u32)]
+enum GpuResource {
+    ImGuiFont,
+    HeightMap,
+    Count,
+}
+
 struct InputState {
     keys: [bool; 256],
     mouse_x: i32,
@@ -299,31 +306,24 @@ fn main() -> anyhow::Result<()> {
         })?;
 
         let resource_heap = device.CreateDescriptorHeap::<ID3D12DescriptorHeap>(&D3D12_DESCRIPTOR_HEAP_DESC {
-            NumDescriptors: 2, // 0 - ImGui Font Texture, 1 - Height map src
+            NumDescriptors: GpuResource::Count as u32,
             Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
             Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
             NodeMask: 0,
         })?;
 
         let rtvs: [_; FRAME_COUNT as usize] = std::array::from_fn(|i| {
-            let rtv_begin_ptr = rtv_heap.GetCPUDescriptorHandleForHeapStart().ptr;
-            let rtv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV) as usize;
-            let rtv = D3D12_CPU_DESCRIPTOR_HANDLE {
-                ptr: rtv_begin_ptr + i * rtv_size,
-            };
+            let handle = rtv_heap.get_cpu_handle(&device, i as u32);
+            device.CreateRenderTargetView(&back_buffers[i], None, handle);
 
-            device.CreateRenderTargetView(&back_buffers[i], None, rtv);
-
-            rtv
+            handle
         });
 
         let dsv = {
-            let dsv_begin_ptr = dsv_heap.GetCPUDescriptorHandleForHeapStart().ptr;
-            let dsv = D3D12_CPU_DESCRIPTOR_HANDLE { ptr: dsv_begin_ptr };
+            let handle = dsv_heap.get_cpu_handle(&device, 0);
+            device.CreateDepthStencilView(&depth_buffer, None, handle);
 
-            device.CreateDepthStencilView(&depth_buffer, None, dsv);
-
-            dsv
+            handle
         };
 
         let cmd_allocators: [_; FRAME_COUNT as usize] = (0..FRAME_COUNT)
@@ -518,8 +518,8 @@ fn main() -> anyhow::Result<()> {
                 srv_descriptor_heap: resource_heap.as_raw() as *mut _,
                 srv_descriptor_alloc_fn: None,
                 srv_descriptor_free_fn: None,
-                legacy_srv_cpu: resource_heap.GetCPUDescriptorHandleForHeapStart(),
-                legacy_srv_gpu: resource_heap.GetGPUDescriptorHandleForHeapStart(),
+                legacy_srv_cpu: resource_heap.get_cpu_handle(&device, GpuResource::ImGuiFont as u32),
+                legacy_srv_gpu: resource_heap.get_gpu_handle(&device, GpuResource::ImGuiFont as u32),
             });
         }
 
@@ -711,18 +711,12 @@ fn main() -> anyhow::Result<()> {
                         )?;
 
                         let height_map_srv = {
-                            let resource_view_size =
-                                device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-                            let cpu_srv = D3D12_CPU_DESCRIPTOR_HANDLE {
-                                ptr: resource_heap.GetCPUDescriptorHandleForHeapStart().ptr
-                                    + resource_view_size as usize,
-                            };
+                            let cpu_handle = resource_heap.get_cpu_handle(&device, GpuResource::HeightMap as u32);
+                            let gpu_handle = resource_heap.get_gpu_handle(&device, GpuResource::HeightMap as u32);
 
-                            device.CreateShaderResourceView(&height_map_texture, None, cpu_srv);
+                            device.CreateShaderResourceView(&height_map_texture, None, cpu_handle);
 
-                            D3D12_GPU_DESCRIPTOR_HANDLE {
-                                ptr: resource_heap.GetGPUDescriptorHandleForHeapStart().ptr + resource_view_size as u64,
-                            }
+                            gpu_handle
                         };
 
                         let upload_buffer = d3d12_utils::upload_texture_data(

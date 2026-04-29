@@ -230,3 +230,26 @@ pub fn upload_texture_data(
 
     Ok(upload_buffer)
 }
+
+pub trait D3D12DescriptorHeapExt {
+    fn get_cpu_handle(&self, device: &ID3D12Device, index: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE;
+    fn get_gpu_handle(&self, device: &ID3D12Device, index: u32) -> D3D12_GPU_DESCRIPTOR_HANDLE;
+}
+
+impl D3D12DescriptorHeapExt for ID3D12DescriptorHeap {
+    fn get_cpu_handle(&self, device: &ID3D12Device, index: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+        let view_size = unsafe { device.GetDescriptorHandleIncrementSize(self.GetDesc().Type) };
+
+        D3D12_CPU_DESCRIPTOR_HANDLE {
+            ptr: unsafe { self.GetCPUDescriptorHandleForHeapStart().ptr } + (index * view_size) as usize,
+        }
+    }
+
+    fn get_gpu_handle(&self, device: &ID3D12Device, index: u32) -> D3D12_GPU_DESCRIPTOR_HANDLE {
+        let view_size = unsafe { device.GetDescriptorHandleIncrementSize(self.GetDesc().Type) };
+
+        D3D12_GPU_DESCRIPTOR_HANDLE {
+            ptr: unsafe { self.GetGPUDescriptorHandleForHeapStart().ptr } + (index * view_size) as u64,
+        }
+    }
+}
