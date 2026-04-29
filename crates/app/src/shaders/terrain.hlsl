@@ -69,9 +69,15 @@ VsOutput vs_main(VsInput input) {
     const float2 uv = float2(texel) / width;
     const float height = height_map.SampleLevel(POINT_CLAMP_SAMPLER, uv, 0).r;
 
-    const float height_scale = 10.0;
-    const float tile_offset = width / 2;
-    const float3 world_position = float3((float)texel.x - tile_offset, height * height_scale, (float)texel.y - tile_offset);
+    const float height_scale = 1.0;
+    const float tile_scale = 1.0;
+    const float tile_offset = 0; // width / 2;
+
+    const float3 world_position = float3(
+        ((float)texel.x - tile_offset) * tile_scale,
+        height * height_scale,
+        ((float)texel.y - tile_offset) * tile_scale
+    );
 
     VsOutput output = (VsOutput)0;
     output.clip_position = mul(CONSTS.world_to_clip, float4(world_position, 1.0));

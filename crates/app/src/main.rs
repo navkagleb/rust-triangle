@@ -2,6 +2,7 @@ mod async_compute;
 mod camera;
 mod d3d12_utils;
 mod mesh;
+mod terrain;
 
 use std::ffi::CString;
 use std::mem::ManuallyDrop;
@@ -671,6 +672,9 @@ fn main() -> anyhow::Result<()> {
 
                 ImGui_Begin(c"HeightMap".as_ptr(), std::ptr::null_mut(), 0);
                 {
+                    imgui_text!("Camera position: {}", camera.position());
+                    ImGui_NewLine();
+
                     ImGui_InputInt(c"Terrain size".as_ptr(), &mut height_map_size);
                     ImGui_InputFloat(c"Terrain scale".as_ptr(), &mut height_map_scale);
 
@@ -744,14 +748,63 @@ fn main() -> anyhow::Result<()> {
                         }
                     }
 
+                    let image_position = ImGui_GetCursorScreenPos();
+                    let image_size = {
+                        let size = ImGui_GetContentRegionAvail();
+                        size.x.min(size.y)
+                    };
+
                     if let Some(height_map) = height_map.as_ref() {
                         ImGui_Image(
                             ImTextureRef {
                                 _TexData: std::ptr::null_mut(),
                                 _TexID: height_map.srv.ptr,
                             },
-                            ImVec2 { x: 512.0, y: 512.0 },
+                            ImVec2 {
+                                x: image_size,
+                                y: image_size,
+                            },
                         );
+                    }
+
+                    let terrain_quad_tree = terrain::QuadTree::new(height_map_size as f32, camera.position());
+                    let leaf_nodes = terrain_quad_tree.traverse_leafs();
+
+                    let draw_list = ImGui_GetWindowDrawList();
+
+                    for node in leaf_nodes {
+                        let center_x = image_position.x + (node.center().x / height_map_size as f32) * image_size;
+                        let center_y = image_position.y + (node.center().y / height_map_size as f32) * image_size;
+                        let half_size = (node.half_size() / height_map_size as f32) * image_size;
+
+                        ImDrawList_AddRectEx(
+                            draw_list,
+                            ImVec2 {
+                                x: center_x - half_size,
+                                y: center_y - half_size,
+                            },
+                            ImVec2 {
+                                x: center_x + half_size,
+                                y: center_y + half_size,
+                            },
+                            0xB3FFFFFF,
+                            0.0,
+                            ImDrawFlags_None,
+                            0.5,
+                        );
+
+                        let text = CString::new(node.lod_level().to_string()).unwrap();
+                        let text_size = ImGui_CalcTextSize(text.as_ptr());
+
+                        ImDrawList_AddText(
+                            draw_list,
+                            ImVec2 {
+                                x: center_x - text_size.x / 2.0,
+                                y: center_y - text_size.y / 2.0,
+                            },
+                            0xFFFFFFFF,
+                            text.as_ptr(),
+                        )
                     }
                 }
                 ImGui_End();

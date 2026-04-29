@@ -25,6 +25,10 @@ impl Camera {
         }
     }
 
+    pub fn position(&self) -> &Vec3 {
+        &self.position
+    }
+
     pub fn world_to_clip(&self) -> Mat4 {
         self.view_to_clip * self.world_to_view
     }

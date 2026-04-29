@@ -33,7 +33,7 @@ fn main() -> anyhow::Result<()> {
         .header(dcimgui_dir.join("dcimgui.h").to_str().unwrap())
         .clang_arg(format!("-I{}", imgui_dir.display()))
         .clang_arg(format!("-I{}", dcimgui_dir.display()))
-        .allowlist_function("ImGui_.*")
+        .allowlist_function("Im.*")
         .allowlist_type("Im.*")
         .allowlist_var("ImGui.*")
         .prepend_enum_name(false)
