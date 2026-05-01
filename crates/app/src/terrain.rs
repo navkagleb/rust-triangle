@@ -1,7 +1,8 @@
 use glam::{Vec2, Vec3, f32};
 
-const MIN_NODE_SIZE: f32 = 8.0;
-const LOD_FACTOR: f32 = 2.0;
+const MIN_NODE_SIZE: f32 = 1.0;
+const LOD_FACTOR: f32 = 8.0;
+const CHUNK_GRID_SIZE: usize = 8;
 
 pub struct QuadTreeNode {
     center: Vec2,
@@ -47,28 +48,28 @@ impl QuadTree {
             children: None,
         };
 
-        Self::split_recursive(&mut root, Vec2::new(camera_position.x, camera_position.z));
+        Self::split_recursive(&mut root, camera_position);
 
         Self { root }
     }
 
-    pub fn traverse_leafs(&self) -> Vec<&QuadTreeNode> {
+    pub fn collect_leafs(&self) -> Vec<&QuadTreeNode> {
         let mut leafs = Vec::new();
         Self::traverse_node(&self.root, &mut leafs);
 
         leafs
     }
 
-    fn is_split_needed(node: &QuadTreeNode, camera_position: Vec2) -> bool {
+    fn is_split_needed(node: &QuadTreeNode, camera_position: &Vec3) -> bool {
         if node.half_size <= MIN_NODE_SIZE {
             return false;
         }
 
-        let distance = (camera_position - node.center).length();
+        let distance = (camera_position - Vec3::new(node.center.x, 0.0, node.center.y)).length();
         distance < node.half_size * LOD_FACTOR
     }
 
-    fn split_recursive(node: &mut QuadTreeNode, camera_position: Vec2) {
+    fn split_recursive(node: &mut QuadTreeNode, camera_position: &Vec3) {
         if !Self::is_split_needed(node, camera_position) {
             return;
         }
@@ -114,4 +115,27 @@ impl QuadTree {
             Self::traverse_node(child, leafs);
         }
     }
+}
+
+pub fn generate_chunk_indices() -> Vec<u32> {
+    let mut indices = Vec::new();
+
+    for z in 0..CHUNK_GRID_SIZE {
+        for x in 0..CHUNK_GRID_SIZE {
+            let tl = (z * (CHUNK_GRID_SIZE + 1) + x) as u32;
+            let tr = tl + 1;
+            let bl = tl + (CHUNK_GRID_SIZE + 1) as u32;
+            let br = bl + 1;
+
+            indices.push(tl);
+            indices.push(tr);
+            indices.push(bl);
+
+            indices.push(tr);
+            indices.push(br);
+            indices.push(bl);
+        }
+    }
+
+    indices
 }

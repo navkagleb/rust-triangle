@@ -13,9 +13,16 @@ struct Consts {
     float4x4 local_to_world;
 };
 
+struct TerrainNode {
+    float2 center;
+    float half_size;
+    uint lod_level;
+};
+
 ConstantBuffer<Consts> CONSTS;
 SamplerState POINT_CLAMP_SAMPLER : register(s0);
 
+static const uint CHUNK_SIZE = 8;
 static const uint2 OFFSETS[6] = {
     uint2(0, 0),
     uint2(1, 0),
@@ -55,16 +62,33 @@ float3 height_to_color(float h) {
     return snow;
 }
 
+float3 lod_to_color(uint lod) {
+    switch (lod) {
+        case 0: return float3(1.0, 0.0, 0.0); // red
+        case 1: return float3(1.0, 0.5, 0.0); // orange
+        case 2: return float3(1.0, 1.0, 0.0); // yellow
+        case 3: return float3(0.0, 1.0, 0.0); // green
+        case 4: return float3(0.0, 1.0, 1.0); // cyan
+        case 5: return float3(0.0, 0.0, 1.0); // blue
+        case 6: return float3(0.5, 0.0, 1.0); // purple
+    }
+
+    return float3(1.0, 1.0, 1.0); // white
+}
+
 VsOutput vs_main(VsInput input) {
     const Texture2D<float> height_map = ResourceDescriptorHeap[1];
+    const StructuredBuffer<TerrainNode> nodes = ResourceDescriptorHeap[2];
 
-    uint width;
-    uint dummy_height;
-    height_map.GetDimensions(width, dummy_height);
+    const TerrainNode node = nodes[input.instance_id];
 
-    const uint tile_x = input.instance_id % (width - 1);
-    const uint tile_z = input.instance_id / (width - 1);
+    const uint vx = input.vertex_id % (CHUNK_SIZE + 1);
+    const uint vz = input.vertex_id / (CHUNK_SIZE + 1);
 
+    const float2 local = float2(vx, vz) / (float)CHUNK_SIZE; // 0..1
+    const float2 world_xz = node.center + (local - 0.5) * node.half_size * 2.0;
+
+#if 0
     const uint2 texel = uint2(tile_x, tile_z) + OFFSETS[input.vertex_id];
     const float2 uv = float2(texel) / width;
     const float height = height_map.SampleLevel(POINT_CLAMP_SAMPLER, uv, 0).r;
@@ -72,16 +96,15 @@ VsOutput vs_main(VsInput input) {
     const float height_scale = 1.0;
     const float tile_scale = 1.0;
     const float tile_offset = 0; // width / 2;
+#endif
 
-    const float3 world_position = float3(
-        ((float)texel.x - tile_offset) * tile_scale,
-        height * height_scale,
-        ((float)texel.y - tile_offset) * tile_scale
-    );
+    const float world_scale = 1.0;
+
+    const float3 world_position = float3(world_xz.x * world_scale, 0.0, world_xz.y * world_scale);
 
     VsOutput output = (VsOutput)0;
     output.clip_position = mul(CONSTS.world_to_clip, float4(world_position, 1.0));
-    output.color = height_to_color(height);
+    output.color = lod_to_color(node.lod_level);
 
     return output;
 }

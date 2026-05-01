@@ -94,6 +94,8 @@ impl D3D12ResourceBarrierExt for D3D12_RESOURCE_BARRIER {
 pub trait D3D12ResourceExt {
     fn new_buffer(device: &ID3D12Device, heap_type: D3D12_HEAP_TYPE, size: usize) -> Result<ID3D12Resource>;
     fn new_texture(device: &ID3D12Device, format: DXGI_FORMAT, width: u32, height: u32) -> Result<ID3D12Resource>;
+
+    fn map_and_write<T>(&self, items: &[T]) -> Result<()>;
 }
 
 impl D3D12ResourceExt for ID3D12Resource {
@@ -155,6 +157,27 @@ impl D3D12ResourceExt for ID3D12Resource {
         }
 
         texture.ok_or(Error::from_thread().into())
+    }
+
+    fn map_and_write<T>(&self, items: &[T]) -> Result<()> {
+        unsafe {
+            let mut heap_props = std::mem::MaybeUninit::uninit();
+            self.GetHeapProperties(Some(heap_props.as_mut_ptr()), None)?;
+            assert_eq!(heap_props.assume_init_ref().Type, D3D12_HEAP_TYPE_UPLOAD);
+        }
+
+        let cpu_ptr = {
+            let mut cpu_ptr = std::ptr::null_mut::<std::ffi::c_void>();
+            unsafe { self.Map(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }), Some(&mut cpu_ptr))? };
+
+            cpu_ptr as *mut u8
+        };
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(items.as_ptr(), cpu_ptr as *mut T, items.len());
+        }
+
+        Ok(())
     }
 }
 

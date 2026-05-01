@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use glam::Vec2;
 use noise::utils::{NoiseMapBuilder, PlaneMapBuilder};
 use noise::{Fbm, MultiFractal, Perlin};
 use windows::Win32::Foundation::*;
@@ -46,7 +47,15 @@ macro_rules! imgui_text {
 enum GpuResource {
     ImGuiFont,
     HeightMap,
+    TerrainNodeBuffer,
     Count,
+}
+
+#[repr(C)]
+struct GpuTerrainNode {
+    center: Vec2,
+    half_size: f32,
+    lod_level: u32,
 }
 
 struct InputState {
@@ -473,7 +482,7 @@ fn main() -> anyhow::Result<()> {
                 BlendState: blend_state,
                 SampleMask: u32::MAX,
                 RasterizerState: D3D12_RASTERIZER_DESC {
-                    FillMode: D3D12_FILL_MODE_SOLID,
+                    FillMode: D3D12_FILL_MODE_WIREFRAME,
                     CullMode: D3D12_CULL_MODE_NONE,
                     FrontCounterClockwise: BOOL(0),
                     ..Default::default()
@@ -526,8 +535,41 @@ fn main() -> anyhow::Result<()> {
         struct HeightMap {
             texture: ID3D12Resource,
             srv: D3D12_GPU_DESCRIPTOR_HANDLE,
-            size: usize,
         }
+
+        let terrain_chunk_indices = terrain::generate_chunk_indices();
+        let terrain_chunk_index_buffer = ID3D12Resource::new_buffer(
+            &device,
+            D3D12_HEAP_TYPE_UPLOAD,
+            size_of_val(terrain_chunk_indices.as_slice()),
+        )?;
+
+        terrain_chunk_index_buffer.map_and_write(terrain_chunk_indices.as_slice())?;
+
+        let max_terrain_node_count = 1024;
+        let terrain_node_buffer = ID3D12Resource::new_buffer(
+            &device,
+            D3D12_HEAP_TYPE_UPLOAD,
+            max_terrain_node_count * size_of::<GpuTerrainNode>(),
+        )?;
+
+        device.CreateShaderResourceView(
+            &terrain_node_buffer,
+            Some(&D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: DXGI_FORMAT_UNKNOWN,
+                ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Buffer: D3D12_BUFFER_SRV {
+                        FirstElement: 0,
+                        NumElements: max_terrain_node_count as u32,
+                        StructureByteStride: size_of::<GpuTerrainNode>() as u32,
+                        Flags: D3D12_BUFFER_SRV_FLAG_NONE,
+                    },
+                },
+            }),
+            resource_heap.get_cpu_handle(&device, GpuResource::TerrainNodeBuffer as u32),
+        );
 
         let mut height_map: Option<HeightMap> = None;
         let mut height_map_size = 512;
@@ -573,6 +615,9 @@ fn main() -> anyhow::Result<()> {
                 input.mouse_dx = 0;
                 input.mouse_dy = 0;
             }
+
+            let terrain_quad_tree = terrain::QuadTree::new(height_map_size as f32, camera.position());
+            let leaf_nodes = terrain_quad_tree.collect_leafs();
 
             let active_frame_index = swap_chain.GetCurrentBackBufferIndex();
             let cmd_allocator = &cmd_allocators[active_frame_index as usize];
@@ -656,13 +701,35 @@ fn main() -> anyhow::Result<()> {
                 }
             }
 
-            if let Some(hm) = height_map.as_ref() {
-                let vertex_count_per_instance = 2 * 3;
-                let instance_count = (hm.size - 1) * (hm.size - 1);
+            {
+                terrain_node_buffer.map_and_write(
+                    leaf_nodes
+                        .iter()
+                        .map(|n| GpuTerrainNode {
+                            center: n.center(),
+                            half_size: n.half_size(),
+                            lod_level: n.lod_level(),
+                        })
+                        .collect::<Vec<_>>()
+                        .as_slice(),
+                )?;
 
                 render_cmd_list.SetPipelineState(&terrain_pso);
                 render_cmd_list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-                render_cmd_list.DrawInstanced(vertex_count_per_instance, instance_count as u32, 0, 0);
+
+                render_cmd_list.IASetIndexBuffer(Some(&D3D12_INDEX_BUFFER_VIEW {
+                    BufferLocation: terrain_chunk_index_buffer.GetGPUVirtualAddress(),
+                    SizeInBytes: size_of_val(terrain_chunk_indices.as_slice()) as u32,
+                    Format: DXGI_FORMAT_R32_UINT,
+                }));
+
+                render_cmd_list.DrawIndexedInstanced(
+                    terrain_chunk_indices.len() as u32,
+                    leaf_nodes.len() as u32,
+                    0,
+                    0,
+                    0,
+                );
             }
 
             {
@@ -710,14 +777,11 @@ fn main() -> anyhow::Result<()> {
                             height_map_size as u32,
                         )?;
 
-                        let height_map_srv = {
-                            let cpu_handle = resource_heap.get_cpu_handle(&device, GpuResource::HeightMap as u32);
-                            let gpu_handle = resource_heap.get_gpu_handle(&device, GpuResource::HeightMap as u32);
-
-                            device.CreateShaderResourceView(&height_map_texture, None, cpu_handle);
-
-                            gpu_handle
-                        };
+                        device.CreateShaderResourceView(
+                            &height_map_texture,
+                            None,
+                            resource_heap.get_cpu_handle(&device, GpuResource::HeightMap as u32),
+                        );
 
                         let upload_buffer = d3d12_utils::upload_texture_data(
                             &device,
@@ -733,12 +797,11 @@ fn main() -> anyhow::Result<()> {
 
                         let new_height_map = HeightMap {
                             texture: height_map_texture,
-                            srv: height_map_srv,
-                            size: height_map_size as usize,
+                            srv: resource_heap.get_gpu_handle(&device, GpuResource::HeightMap as u32),
                         };
 
-                        if let Some(prev_) = height_map.replace(new_height_map) {
-                            deferred_release.push((cpu_frame_index, prev_.texture.cast::<ID3D12Object>()?));
+                        if let Some(prev) = height_map.replace(new_height_map) {
+                            deferred_release.push((cpu_frame_index, prev.texture.cast::<ID3D12Object>()?));
                         }
                     }
 
@@ -760,9 +823,6 @@ fn main() -> anyhow::Result<()> {
                             },
                         );
                     }
-
-                    let terrain_quad_tree = terrain::QuadTree::new(height_map_size as f32, camera.position());
-                    let leaf_nodes = terrain_quad_tree.traverse_leafs();
 
                     let draw_list = ImGui_GetWindowDrawList();
 
