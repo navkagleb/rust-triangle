@@ -8,19 +8,26 @@ struct VsOutput {
     float3 color : Color;
 };
 
-struct Consts {
+struct FrameConsts {
     float4x4 world_to_clip;
     float4x4 local_to_world;
+};
+
+struct TerrainConsts {
+    float terrain_size;
+    float world_scale;
+    float height_scale;
 };
 
 struct TerrainNode {
     float2 center;
     float half_size;
-    uint lod_level;
+    uint lod_index;
 };
 
-ConstantBuffer<Consts> CONSTS;
-SamplerState POINT_CLAMP_SAMPLER : register(s0);
+ConstantBuffer<FrameConsts> frame_consts;
+ConstantBuffer<TerrainConsts> consts : register(b0, space1);
+SamplerState point_clamp_sampler : register(s0);
 
 static const uint CHUNK_SIZE = 8;
 static const uint2 OFFSETS[6] = {
@@ -76,6 +83,31 @@ float3 lod_to_color(uint lod) {
     return float3(1.0, 1.0, 1.0); // white
 }
 
+float3 hsv_to_rgb(float h, float s, float v) {
+    const float4 K = float4(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);
+    const float3 p = abs(frac(h + K.xyz) * 6.0 - K.www);
+
+    return v * lerp(K.xxx, saturate(p - K.xxx), s);
+}
+
+float3 node_color(TerrainNode node) {
+    const uint x = (uint)(node.center.x / node.half_size);
+    const uint z = (uint)(node.center.y / node.half_size);
+    const uint lod = node.lod_index;
+
+    uint hash = x * 73856093u;
+    hash = hash ^ (z * 19349663u);
+    hash = hash ^ (lod * 83492791u);
+    hash ^= hash >> 17;
+    hash *= 0xbf324c81u;
+    hash ^= hash >> 11;
+    hash *= 0x9a812d7du;
+    hash ^= hash >> 15;
+
+    const float hue = frac((float)(hash & 0xFFFF) / 65535.0 + 0.618033988);
+    return hsv_to_rgb(hue, 0.75 + 0.25 * frac((float)(hash >> 16) / 65535.0), 0.9);
+}
+
 VsOutput vs_main(VsInput input) {
     const Texture2D<float> height_map = ResourceDescriptorHeap[1];
     const StructuredBuffer<TerrainNode> nodes = ResourceDescriptorHeap[2];
@@ -88,23 +120,18 @@ VsOutput vs_main(VsInput input) {
     const float2 local = float2(vx, vz) / (float)CHUNK_SIZE; // 0..1
     const float2 world_xz = node.center + (local - 0.5) * node.half_size * 2.0;
 
-#if 0
-    const uint2 texel = uint2(tile_x, tile_z) + OFFSETS[input.vertex_id];
-    const float2 uv = float2(texel) / width;
-    const float height = height_map.SampleLevel(POINT_CLAMP_SAMPLER, uv, 0).r;
+    const float2 uv = world_xz / consts.terrain_size;
+    const float height = height_map.SampleLevel(point_clamp_sampler, uv, node.lod_index).r;
 
-    const float height_scale = 1.0;
-    const float tile_scale = 1.0;
-    const float tile_offset = 0; // width / 2;
-#endif
-
-    const float world_scale = 1.0;
-
-    const float3 world_position = float3(world_xz.x * world_scale, 0.0, world_xz.y * world_scale);
+    const float3 world_position = float3(
+        world_xz.x * consts.world_scale,
+        height * consts.height_scale,
+        world_xz.y * consts.world_scale
+    );
 
     VsOutput output = (VsOutput)0;
-    output.clip_position = mul(CONSTS.world_to_clip, float4(world_position, 1.0));
-    output.color = lod_to_color(node.lod_level);
+    output.clip_position = mul(frame_consts.world_to_clip, float4(world_position, 1.0));
+    output.color = node_color(node);
 
     return output;
 }

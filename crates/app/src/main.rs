@@ -11,7 +11,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use glam::Vec2;
 use noise::utils::{NoiseMapBuilder, PlaneMapBuilder};
 use noise::{Fbm, MultiFractal, Perlin};
 use windows::Win32::Foundation::*;
@@ -28,6 +27,7 @@ use windows::core::{BOOL, Interface, PCSTR, s};
 use d3d12_utils::*;
 use imgui_sys::*;
 use mesh::{GpuMesh, LoadThreadPool, LoadedMesh};
+use terrain::{GpuTerrainConsts, TerrainData, TerrainDataUi};
 
 const WINDOW_REGISTRY_NAME: PCSTR = s!("rust-window");
 const WIDTH: u32 = 1920;
@@ -51,13 +51,6 @@ enum GpuResource {
     Count,
 }
 
-#[repr(C)]
-struct GpuTerrainNode {
-    center: Vec2,
-    half_size: f32,
-    lod_level: u32,
-}
-
 struct InputState {
     keys: [bool; 256],
     mouse_x: i32,
@@ -67,9 +60,7 @@ struct InputState {
     right_mouse_down: bool,
 }
 
-fn main() -> anyhow::Result<()> {
-    println!("Hello D3D12 Rust Triangle!");
-
+fn main() -> Result<()> {
     let mut camera = camera::Camera::new();
     let mut camera_controller = camera::CameraController::default();
 
@@ -130,8 +121,6 @@ fn main() -> anyhow::Result<()> {
         };
 
         SetWindowLongPtrA(window_handle, GWLP_USERDATA, &mut input as *mut InputState as isize);
-
-        println!("{:?}, width: {}, height: {}", window_handle, WIDTH, HEIGHT);
 
         _ = ShowWindow(window_handle, SW_SHOW);
         _ = UpdateWindow(window_handle);
@@ -351,17 +340,29 @@ fn main() -> anyhow::Result<()> {
             let mut blob: Option<ID3DBlob> = None;
             let mut error: Option<ID3DBlob> = None;
 
-            let root_params = [D3D12_ROOT_PARAMETER {
-                ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
-                Anonymous: D3D12_ROOT_PARAMETER_0 {
-                    Constants: D3D12_ROOT_CONSTANTS {
-                        ShaderRegister: 0,
-                        RegisterSpace: 0,
-                        Num32BitValues: 32,
+            let root_params = [
+                D3D12_ROOT_PARAMETER {
+                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+                    Anonymous: D3D12_ROOT_PARAMETER_0 {
+                        Constants: D3D12_ROOT_CONSTANTS {
+                            ShaderRegister: 0,
+                            RegisterSpace: 0,
+                            Num32BitValues: 32,
+                        },
                     },
+                    ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
                 },
-                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
-            }];
+                D3D12_ROOT_PARAMETER {
+                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_CBV,
+                    Anonymous: D3D12_ROOT_PARAMETER_0 {
+                        Descriptor: D3D12_ROOT_DESCRIPTOR {
+                            ShaderRegister: 0,
+                            RegisterSpace: 1,
+                        },
+                    },
+                    ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+                },
+            ];
 
             let static_samplers = [D3D12_STATIC_SAMPLER_DESC {
                 Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
@@ -482,7 +483,7 @@ fn main() -> anyhow::Result<()> {
                 BlendState: blend_state,
                 SampleMask: u32::MAX,
                 RasterizerState: D3D12_RASTERIZER_DESC {
-                    FillMode: D3D12_FILL_MODE_WIREFRAME,
+                    FillMode: D3D12_FILL_MODE_SOLID,
                     CullMode: D3D12_CULL_MODE_NONE,
                     FrontCounterClockwise: BOOL(0),
                     ..Default::default()
@@ -532,48 +533,15 @@ fn main() -> anyhow::Result<()> {
             });
         }
 
-        struct HeightMap {
-            texture: ID3D12Resource,
-            srv: D3D12_GPU_DESCRIPTOR_HANDLE,
-        }
-
-        let terrain_chunk_indices = terrain::generate_chunk_indices();
-        let terrain_chunk_index_buffer = ID3D12Resource::new_buffer(
+        let mut terrain = TerrainData::new(
             &device,
-            D3D12_HEAP_TYPE_UPLOAD,
-            size_of_val(terrain_chunk_indices.as_slice()),
-        )?;
-
-        terrain_chunk_index_buffer.map_and_write(terrain_chunk_indices.as_slice())?;
-
-        let max_terrain_node_count = 1024;
-        let terrain_node_buffer = ID3D12Resource::new_buffer(
-            &device,
-            D3D12_HEAP_TYPE_UPLOAD,
-            max_terrain_node_count * size_of::<GpuTerrainNode>(),
-        )?;
-
-        device.CreateShaderResourceView(
-            &terrain_node_buffer,
-            Some(&D3D12_SHADER_RESOURCE_VIEW_DESC {
-                Format: DXGI_FORMAT_UNKNOWN,
-                ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
-                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
-                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
-                    Buffer: D3D12_BUFFER_SRV {
-                        FirstElement: 0,
-                        NumElements: max_terrain_node_count as u32,
-                        StructureByteStride: size_of::<GpuTerrainNode>() as u32,
-                        Flags: D3D12_BUFFER_SRV_FLAG_NONE,
-                    },
-                },
-            }),
             resource_heap.get_cpu_handle(&device, GpuResource::TerrainNodeBuffer as u32),
-        );
+        )?;
 
-        let mut height_map: Option<HeightMap> = None;
-        let mut height_map_size = 512;
-        let mut height_map_scale = 5.0;
+        let mut terrain_ui = TerrainDataUi {
+            height_map_size: terrain.height_map_size as i32,
+            height_map_scale: 5.0,
+        };
 
         let async_compute_thread =
             async_compute::start_thread(Arc::clone(&device), loaded_mesh_receiver, ready_mesh_sender);
@@ -616,8 +584,7 @@ fn main() -> anyhow::Result<()> {
                 input.mouse_dy = 0;
             }
 
-            let terrain_quad_tree = terrain::QuadTree::new(height_map_size as f32, camera.position());
-            let leaf_nodes = terrain_quad_tree.collect_leafs();
+            let terrain_nodes = terrain.collect_nodes(camera.position());
 
             let active_frame_index = swap_chain.GetCurrentBackBufferIndex();
             let cmd_allocator = &cmd_allocators[active_frame_index as usize];
@@ -702,30 +669,27 @@ fn main() -> anyhow::Result<()> {
             }
 
             {
-                terrain_node_buffer.map_and_write(
-                    leaf_nodes
-                        .iter()
-                        .map(|n| GpuTerrainNode {
-                            center: n.center(),
-                            half_size: n.half_size(),
-                            lod_level: n.lod_level(),
-                        })
-                        .collect::<Vec<_>>()
-                        .as_slice(),
-                )?;
+                terrain.node_buffer.map_and_write(terrain_nodes.as_slice())?;
+
+                render_cmd_list.SetGraphicsRootConstantBufferView(
+                    1,
+                    terrain.const_buffer.write(
+                        active_frame_index,
+                        &GpuTerrainConsts {
+                            terrain_size: terrain.size,
+                            world_scale: 1.0,
+                            height_scale: terrain.height_scale,
+                        },
+                    ),
+                );
 
                 render_cmd_list.SetPipelineState(&terrain_pso);
                 render_cmd_list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-
-                render_cmd_list.IASetIndexBuffer(Some(&D3D12_INDEX_BUFFER_VIEW {
-                    BufferLocation: terrain_chunk_index_buffer.GetGPUVirtualAddress(),
-                    SizeInBytes: size_of_val(terrain_chunk_indices.as_slice()) as u32,
-                    Format: DXGI_FORMAT_R32_UINT,
-                }));
+                render_cmd_list.IASetIndexBuffer(Some(&terrain.chunk_ibv));
 
                 render_cmd_list.DrawIndexedInstanced(
-                    terrain_chunk_indices.len() as u32,
-                    leaf_nodes.len() as u32,
+                    terrain.chunk_index_count as u32,
+                    terrain_nodes.len() as u32,
                     0,
                     0,
                     0,
@@ -743,8 +707,13 @@ fn main() -> anyhow::Result<()> {
                     ImGui_DragFloat(c"Camera speed".as_ptr(), &mut camera_controller.speed);
                     ImGui_NewLine();
 
-                    ImGui_InputInt(c"Terrain size".as_ptr(), &mut height_map_size);
-                    ImGui_InputFloat(c"Terrain scale".as_ptr(), &mut height_map_scale);
+                    ImGui_InputFloat(c"Height scale".as_ptr(), &mut terrain.height_scale);
+                    ImGui_InputFloat(c"LOD factor".as_ptr(), &mut terrain.lod_factor);
+                    ImGui_InputFloat(c"Terrain size".as_ptr(), &mut terrain.size);
+                    ImGui_NewLine();
+
+                    ImGui_InputInt(c"Height map size".as_ptr(), &mut terrain_ui.height_map_size);
+                    ImGui_InputFloat(c"Height map scale".as_ptr(), &mut terrain_ui.height_map_scale);
 
                     if ImGui_Button(c"Generate height map".as_ptr()) {
                         let fbm = Fbm::<Perlin>::new(123)
@@ -754,9 +723,9 @@ fn main() -> anyhow::Result<()> {
                             .set_persistence(0.7);
 
                         let height_map_data = PlaneMapBuilder::new(fbm)
-                            .set_size(height_map_size as usize, height_map_size as usize)
-                            .set_x_bounds(0.0, height_map_scale as f64)
-                            .set_y_bounds(0.0, height_map_scale as f64)
+                            .set_size(terrain_ui.height_map_size as usize, terrain_ui.height_map_size as usize)
+                            .set_x_bounds(0.0, terrain_ui.height_map_scale as f64)
+                            .set_y_bounds(0.0, terrain_ui.height_map_scale as f64)
                             .build()
                             .into_iter()
                             .map(|n| n as f32)
@@ -766,43 +735,51 @@ fn main() -> anyhow::Result<()> {
                         let max = height_map_data.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                         println!("min: {min}, max: {max}");
 
-                        let height_map_data = height_map_data
+                        let top_mip_data = height_map_data
                             .iter()
                             .map(|n| (n - min) / (max - min))
                             .collect::<Vec<_>>();
 
+                        let mips = terrain::generate_mips(top_mip_data, terrain_ui.height_map_size as usize);
+
                         let height_map_texture = ID3D12Resource::new_texture(
                             &device,
                             DXGI_FORMAT_R32_FLOAT,
-                            height_map_size as u32,
-                            height_map_size as u32,
+                            terrain_ui.height_map_size as u32,
+                            terrain_ui.height_map_size as u32,
+                            mips.len() as u32,
                         )?;
 
                         device.CreateShaderResourceView(
                             &height_map_texture,
-                            None,
+                            Some(&D3D12_SHADER_RESOURCE_VIEW_DESC {
+                                Format: DXGI_FORMAT_R32_FLOAT,
+                                ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+                                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                                    Texture2D: D3D12_TEX2D_SRV {
+                                        MostDetailedMip: 0,
+                                        MipLevels: mips.len() as u32,
+                                        PlaneSlice: 0,
+                                        ResourceMinLODClamp: 0.0,
+                                    },
+                                },
+                            }),
                             resource_heap.get_cpu_handle(&device, GpuResource::HeightMap as u32),
                         );
 
-                        let upload_buffer = d3d12_utils::upload_texture_data(
-                            &device,
-                            &render_cmd_list,
-                            std::slice::from_raw_parts(
-                                height_map_data.as_ptr() as *const u8,
-                                height_map_data.len() * size_of::<f32>(),
-                            ),
-                            &height_map_texture,
-                        )?;
+                        let mip_slices = mips
+                            .iter()
+                            .map(|m| std::slice::from_raw_parts(m.as_ptr() as *const u8, m.len() * size_of::<f32>()))
+                            .collect::<Vec<_>>();
+
+                        let upload_buffer =
+                            render_cmd_list.upload_mips(&device, mip_slices.as_slice(), &height_map_texture)?;
 
                         deferred_release.push((cpu_frame_index, upload_buffer.cast::<ID3D12Object>()?));
 
-                        let new_height_map = HeightMap {
-                            texture: height_map_texture,
-                            srv: resource_heap.get_gpu_handle(&device, GpuResource::HeightMap as u32),
-                        };
-
-                        if let Some(prev) = height_map.replace(new_height_map) {
-                            deferred_release.push((cpu_frame_index, prev.texture.cast::<ID3D12Object>()?));
+                        if let Some(prev) = terrain.height_map_texture.replace(height_map_texture) {
+                            deferred_release.push((cpu_frame_index, prev.cast::<ID3D12Object>()?));
                         }
                     }
 
@@ -812,11 +789,11 @@ fn main() -> anyhow::Result<()> {
                         size.x.min(size.y)
                     };
 
-                    if let Some(height_map) = height_map.as_ref() {
+                    if terrain.height_map_texture.is_some() {
                         ImGui_Image(
                             ImTextureRef {
                                 _TexData: std::ptr::null_mut(),
-                                _TexID: height_map.srv.ptr,
+                                _TexID: resource_heap.get_gpu_handle(&device, GpuResource::HeightMap as u32).ptr,
                             },
                             ImVec2 {
                                 x: image_size,
@@ -827,10 +804,10 @@ fn main() -> anyhow::Result<()> {
 
                     let draw_list = ImGui_GetWindowDrawList();
 
-                    for node in leaf_nodes {
-                        let center_x = image_position.x + (node.center().x / height_map_size as f32) * image_size;
-                        let center_y = image_position.y + (node.center().y / height_map_size as f32) * image_size;
-                        let half_size = (node.half_size() / height_map_size as f32) * image_size;
+                    for node in terrain_nodes {
+                        let center_x = image_position.x + (node.center.x / terrain.size) * image_size;
+                        let center_y = image_position.y + (node.center.y / terrain.size) * image_size;
+                        let half_size = (node.half_size / terrain.size) * image_size;
 
                         ImDrawList_AddRectEx(
                             draw_list,
@@ -848,7 +825,7 @@ fn main() -> anyhow::Result<()> {
                             0.5,
                         );
 
-                        let text = CString::new(node.lod_level().to_string()).unwrap();
+                        let text = CString::new(node.lod_index.to_string()).unwrap();
                         let text_size = ImGui_CalcTextSize(text.as_ptr());
 
                         ImDrawList_AddText(
@@ -867,7 +844,7 @@ fn main() -> anyhow::Result<()> {
                 ImGui_Begin(c"Hello Rust".as_ptr(), std::ptr::null_mut(), 0);
                 {
                     imgui_text!("Main TID: {}", GetCurrentThreadId());
-                    imgui_text!("FPS: {} ({:.2} ms)", fps, dt);
+                    imgui_text!("FPS: {} ({:.2} ms)", fps, dt * 1000.0);
 
                     let mut local_mem = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
                     let mut host_mem = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
@@ -961,10 +938,7 @@ fn main() -> anyhow::Result<()> {
         drop(load_mesh_thread_pool);
         _ = async_compute_thread.join().unwrap();
 
-        if let Some(height_map) = height_map {
-            drop(height_map.texture);
-        }
-
+        drop(terrain.height_map_texture);
         drop(terrain_pso);
         drop(pso);
         drop(root_signature);
@@ -1082,7 +1056,7 @@ impl FrameTimer {
             self.frame_count = 0;
         }
 
-        (delta.as_secs_f32() * 1000.0, self.fps)
+        (delta.as_secs_f32(), self.fps)
     }
 }
 

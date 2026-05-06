@@ -6,7 +6,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::System::Threading::{CreateEventA, GetCurrentProcessId};
 use windows::core::{Interface, s};
 
-use crate::d3d12_utils::{D3D12ResourceBarrierExt, D3D12ResourceExt, wait_for_gpu};
+use crate::d3d12_utils::{D3D12BufferExt, D3D12ResourceBarrierExt, wait_for_gpu};
 use crate::mesh::*;
 
 const ASYNC_COMPUTE_FRAME_COUNT: u64 = 3;

@@ -8,7 +8,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 
-use crate::d3d12_utils::D3D12ResourceExt;
+use crate::d3d12_utils::D3D12BufferExt;
 
 fn measure<F, R>(f: F) -> (R, f32)
 where
