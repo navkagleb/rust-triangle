@@ -740,6 +740,7 @@ fn main() -> anyhow::Result<()> {
                 ImGui_Begin(c"HeightMap".as_ptr(), std::ptr::null_mut(), 0);
                 {
                     imgui_text!("Camera position: {}", camera.position());
+                    ImGui_DragFloat(c"Camera speed".as_ptr(), &mut camera_controller.speed);
                     ImGui_NewLine();
 
                     ImGui_InputInt(c"Terrain size".as_ptr(), &mut height_map_size);

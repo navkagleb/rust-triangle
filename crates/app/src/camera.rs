@@ -3,8 +3,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::VK_SPACE;
 
 use crate::{HEIGHT, InputState, WIDTH};
 
-const SENSITIVIY: f32 = 0.1;
-const SPEED: f32 = 0.1;
+const MOUSE_SENSITIVITY: f32 = 100.0;
 
 pub struct Camera {
     position: Vec3,
@@ -35,6 +34,8 @@ impl Camera {
 }
 
 pub struct CameraController {
+    pub speed: f32,
+
     yaw: f32,
     pitch: f32,
 }
@@ -42,8 +43,10 @@ pub struct CameraController {
 impl CameraController {
     pub fn control(&mut self, dt: f32, input: &InputState, camera: &mut Camera) {
         if input.right_mouse_down {
-            self.yaw += input.mouse_dx as f32 * SENSITIVIY;
-            self.pitch += input.mouse_dy as f32 * SENSITIVIY;
+            let sensitivity = MOUSE_SENSITIVITY * dt;
+
+            self.yaw += input.mouse_dx as f32 * sensitivity;
+            self.pitch += input.mouse_dy as f32 * sensitivity;
             self.pitch = self.pitch.clamp(-89.0, 89.0);
         }
 
@@ -57,7 +60,7 @@ impl CameraController {
         )
         .normalize();
 
-        let speed = SPEED * dt;
+        let speed = self.speed * dt;
 
         if input.keys[b'W' as usize] {
             camera.position += front_dir * speed;
@@ -89,6 +92,10 @@ impl CameraController {
 
 impl Default for CameraController {
     fn default() -> Self {
-        Self { yaw: 0.0, pitch: 0.0 }
+        Self {
+            speed: 50.0,
+            yaw: 0.0,
+            pitch: 0.0,
+        }
     }
 }
