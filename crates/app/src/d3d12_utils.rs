@@ -95,6 +95,8 @@ impl D3D12ResourceBarrierExt for D3D12_RESOURCE_BARRIER {
 
 pub trait D3D12BufferExt {
     fn new_buffer(device: &ID3D12Device, heap_type: D3D12_HEAP_TYPE, size: usize) -> Result<ID3D12Resource>;
+    fn map<T>(&self) -> Result<*mut T>;
+    fn unmap(&self, size: usize);
 
     fn map_and_write<T>(&self, items: &[T]) -> Result<()>;
 }
@@ -131,33 +133,34 @@ impl D3D12BufferExt for ID3D12Resource {
         buffer.ok_or(Error::from_thread().into())
     }
 
-    fn map_and_write<T>(&self, items: &[T]) -> Result<()> {
+    fn map<T>(&self) -> Result<*mut T> {
+        #[cfg(debug_assertions)]
         unsafe {
             let mut heap_props = std::mem::MaybeUninit::uninit();
             self.GetHeapProperties(Some(heap_props.as_mut_ptr()), None)?;
             assert_eq!(heap_props.assume_init_ref().Type, D3D12_HEAP_TYPE_UPLOAD);
         }
 
-        let cpu_ptr = {
-            let mut cpu_ptr = std::ptr::null_mut::<std::ffi::c_void>();
-            unsafe { self.Map(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }), Some(&mut cpu_ptr))? };
+        let mut cpu_ptr = std::ptr::null_mut::<std::ffi::c_void>();
+        unsafe { self.Map(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }), Some(&mut cpu_ptr))? };
 
-            cpu_ptr as *mut u8
-        };
+        Ok(cpu_ptr as *mut T)
+    }
+
+    fn unmap(&self, size: usize) {
+        unsafe {
+            self.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: size }));
+        }
+    }
+
+    fn map_and_write<T>(&self, items: &[T]) -> Result<()> {
+        let cpu_ptr = self.map::<T>()?;
 
         unsafe {
-            std::ptr::copy_nonoverlapping(items.as_ptr(), cpu_ptr as *mut T, items.len());
+            std::ptr::copy_nonoverlapping(items.as_ptr(), cpu_ptr, items.len());
         }
 
-        unsafe {
-            self.Unmap(
-                0,
-                Some(&D3D12_RANGE {
-                    Begin: 0,
-                    End: size_of_val(items),
-                }),
-            );
-        }
+        self.unmap(size_of_val(items));
 
         Ok(())
     }
@@ -220,13 +223,10 @@ impl<T> ConstBuffer<T> {
     pub fn new(device: &ID3D12Device) -> Result<Self> {
         let resource = ID3D12Resource::new_buffer(device, D3D12_HEAP_TYPE_UPLOAD, Self::buffer_size())?;
 
-        let mut cpu_ptr = std::ptr::null_mut::<std::ffi::c_void>();
-        unsafe { resource.Map(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }), Some(&mut cpu_ptr))? };
-
         Ok(Self {
+            cpu_ptr: resource.map::<u8>()?,
             resource,
             phantom_data: std::marker::PhantomData,
-            cpu_ptr: cpu_ptr as *mut u8,
         })
     }
 
@@ -257,15 +257,7 @@ impl<T> ConstBuffer<T> {
 
 impl<T> Drop for ConstBuffer<T> {
     fn drop(&mut self) {
-        unsafe {
-            self.resource.Unmap(
-                0,
-                Some(&D3D12_RANGE {
-                    Begin: 0,
-                    End: Self::buffer_size(),
-                }),
-            );
-        }
+        self.resource.unmap(Self::buffer_size());
     }
 }
 
@@ -295,12 +287,7 @@ impl D3D12GraphicsCommandListExt for ID3D12GraphicsCommandList {
         };
 
         let upload_buffer = ID3D12Resource::new_buffer(device, D3D12_HEAP_TYPE_UPLOAD, texture_size as usize)?;
-        let upload_cpu_ptr = {
-            let mut cpu_ptr = std::ptr::null_mut::<std::ffi::c_void>();
-            unsafe { upload_buffer.Map(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }), Some(&mut cpu_ptr))? };
-
-            cpu_ptr as *mut u8
-        };
+        let upload_cpu_ptr = upload_buffer.map::<u8>()?;
 
         for row_index in 0..row_count {
             let data_row_offset = row_size as usize * row_index as usize;
@@ -315,15 +302,7 @@ impl D3D12GraphicsCommandListExt for ID3D12GraphicsCommandList {
             }
         }
 
-        unsafe {
-            upload_buffer.Unmap(
-                0,
-                Some(&D3D12_RANGE {
-                    Begin: 0,
-                    End: texture_size as usize,
-                }),
-            );
-        }
+        upload_buffer.unmap(texture_size as usize);
 
         let dst_location = D3D12_TEXTURE_COPY_LOCATION {
             pResource: unsafe { std::mem::transmute_copy(texture) },
@@ -367,12 +346,7 @@ impl D3D12GraphicsCommandListExt for ID3D12GraphicsCommandList {
         };
 
         let upload_buffer = ID3D12Resource::new_buffer(device, D3D12_HEAP_TYPE_UPLOAD, texture_size as usize)?;
-        let upload_cpu_ptr = {
-            let mut cpu_ptr = std::ptr::null_mut::<std::ffi::c_void>();
-            unsafe { upload_buffer.Map(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }), Some(&mut cpu_ptr))? };
-
-            cpu_ptr as *mut u8
-        };
+        let upload_cpu_ptr = upload_buffer.map::<u8>()?;
 
         for si in 0..subresource_count {
             let layout = layouts[si];
@@ -394,15 +368,7 @@ impl D3D12GraphicsCommandListExt for ID3D12GraphicsCommandList {
             }
         }
 
-        unsafe {
-            upload_buffer.Unmap(
-                0,
-                Some(&D3D12_RANGE {
-                    Begin: 0,
-                    End: texture_size as usize,
-                }),
-            );
-        }
+        upload_buffer.unmap(texture_size as usize);
 
         for (i, &layout) in layouts.iter().enumerate() {
             let dst_location = D3D12_TEXTURE_COPY_LOCATION {

@@ -79,12 +79,8 @@ fn async_compute_routine(
                     .sum();
 
                 let upload_buffer = ID3D12Resource::new_buffer(device, D3D12_HEAP_TYPE_UPLOAD, upload_size)?;
-
-                let mut mapped_ptr = std::ptr::null_mut::<std::ffi::c_void>();
-                upload_buffer.Map(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }), Some(&mut mapped_ptr))?;
-
-                let mapped_ptr = mapped_ptr as *mut u8;
-                let mut upload_buf_offset = 0;
+                let upload_buffer_ptr = upload_buffer.map::<u8>()?;
+                let mut upload_buffer_offset = 0;
 
                 let batch_len = batch.len();
                 let cmd_allocator = &cmd_allocators[fence_value as usize % ASYNC_COMPUTE_FRAME_COUNT as usize];
@@ -98,13 +94,13 @@ fn async_compute_routine(
 
                     std::ptr::copy_nonoverlapping(
                         mesh.vertices.as_ptr(),
-                        mapped_ptr.add(upload_buf_offset) as *mut MeshVertex,
+                        upload_buffer_ptr.add(upload_buffer_offset) as *mut MeshVertex,
                         mesh.vertices.len(),
                     );
 
                     std::ptr::copy_nonoverlapping(
                         mesh.indices.as_ptr(),
-                        mapped_ptr.add(upload_buf_offset + vertices_size) as *mut u32,
+                        upload_buffer_ptr.add(upload_buffer_offset + vertices_size) as *mut u32,
                         mesh.indices.len(),
                     );
 
@@ -125,30 +121,24 @@ fn async_compute_routine(
                         &gpu_mesh.vertex_buffer,
                         0,
                         &upload_buffer,
-                        upload_buf_offset as u64,
+                        upload_buffer_offset as u64,
                         vertices_size as u64,
                     );
-                    upload_buf_offset += vertices_size;
+                    upload_buffer_offset += vertices_size;
 
                     cmd_list.CopyBufferRegion(
                         &gpu_mesh.index_buffer,
                         0,
                         &upload_buffer,
-                        upload_buf_offset as u64,
+                        upload_buffer_offset as u64,
                         indices_size as u64,
                     );
-                    upload_buf_offset += indices_size;
+                    upload_buffer_offset += indices_size;
 
                     pending_gpu_meshes.push((fence_value, gpu_mesh));
                 }
 
-                upload_buffer.Unmap(
-                    0,
-                    Some(&D3D12_RANGE {
-                        Begin: 0,
-                        End: upload_size,
-                    }),
-                );
+                upload_buffer.unmap(upload_size);
 
                 pending_release.push((fence_value, upload_buffer.cast::<ID3D12Object>()?));
 
