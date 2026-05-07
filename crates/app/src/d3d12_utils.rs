@@ -264,7 +264,12 @@ impl<T> Drop for ConstBuffer<T> {
 pub trait D3D12GraphicsCommandListExt {
     #[allow(dead_code)]
     fn upload_top_mip(&self, device: &ID3D12Device, data: &[u8], texture: &ID3D12Resource) -> Result<ID3D12Resource>;
-    fn upload_mips(&self, device: &ID3D12Device, mips: &[&[u8]], texture: &ID3D12Resource) -> Result<ID3D12Resource>;
+    fn upload_mips<T>(
+        &self,
+        device: &ID3D12Device,
+        mips: &[Vec<T>],
+        texture: &ID3D12Resource,
+    ) -> Result<ID3D12Resource>;
 }
 
 impl D3D12GraphicsCommandListExt for ID3D12GraphicsCommandList {
@@ -323,7 +328,12 @@ impl D3D12GraphicsCommandListExt for ID3D12GraphicsCommandList {
         Ok(upload_buffer)
     }
 
-    fn upload_mips(&self, device: &ID3D12Device, mips: &[&[u8]], texture: &ID3D12Resource) -> Result<ID3D12Resource> {
+    fn upload_mips<T>(
+        &self,
+        device: &ID3D12Device,
+        mips: &[Vec<T>],
+        texture: &ID3D12Resource,
+    ) -> Result<ID3D12Resource> {
         let subresource_count = mips.len();
 
         let mut layouts = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); subresource_count];
@@ -352,7 +362,7 @@ impl D3D12GraphicsCommandListExt for ID3D12GraphicsCommandList {
             let layout = layouts[si];
             let row_count = row_counts[si];
             let row_size = row_sizes[si];
-            let mip = mips[si];
+            let mip = &mips[si];
 
             for ri in 0..row_count {
                 let cpu_offset = row_size as usize * ri as usize;
@@ -360,7 +370,7 @@ impl D3D12GraphicsCommandListExt for ID3D12GraphicsCommandList {
 
                 unsafe {
                     std::ptr::copy_nonoverlapping(
-                        mip.as_ptr().add(cpu_offset),
+                        (mip.as_ptr() as *const u8).add(cpu_offset),
                         upload_cpu_ptr.add(gpu_offset),
                         row_size as usize,
                     );

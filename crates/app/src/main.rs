@@ -11,8 +11,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use noise::utils::{NoiseMapBuilder, PlaneMapBuilder};
-use noise::{Fbm, MultiFractal, Perlin};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Direct3D::*;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -27,7 +25,7 @@ use windows::core::{BOOL, Interface, PCSTR, s};
 use d3d12_utils::*;
 use imgui_sys::*;
 use mesh::{GpuMesh, LoadThreadPool, LoadedMesh};
-use terrain::{GpuTerrainConsts, TerrainData, TerrainDataUi};
+use terrain::{GpuTerrainConsts, MapGeneratorParams, TerrainData};
 
 const WINDOW_REGISTRY_NAME: PCSTR = s!("rust-window");
 const WIDTH: u32 = 1920;
@@ -46,7 +44,8 @@ macro_rules! imgui_text {
 #[repr(u32)]
 enum GpuResource {
     ImGuiFont,
-    HeightMap,
+    TerrainHeightMap,
+    TerrainNormalMap,
     TerrainNodeBuffer,
     Count,
 }
@@ -364,19 +363,34 @@ fn main() -> Result<()> {
                 },
             ];
 
-            let static_samplers = [D3D12_STATIC_SAMPLER_DESC {
-                Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
-                AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
-                AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
-                AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
-                ComparisonFunc: D3D12_COMPARISON_FUNC_NEVER,
-                BorderColor: D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK,
-                MaxLOD: D3D12_FLOAT32_MAX,
-                ShaderRegister: 0, // s0
-                RegisterSpace: 0,
-                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
-                ..Default::default()
-            }];
+            let static_samplers = [
+                D3D12_STATIC_SAMPLER_DESC {
+                    Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
+                    AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                    AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                    AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                    ComparisonFunc: D3D12_COMPARISON_FUNC_NEVER,
+                    BorderColor: D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK,
+                    MaxLOD: D3D12_FLOAT32_MAX,
+                    ShaderRegister: 0, // s0
+                    RegisterSpace: 0,  // space0
+                    ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+                    ..Default::default()
+                },
+                D3D12_STATIC_SAMPLER_DESC {
+                    Filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+                    AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                    AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                    AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                    ComparisonFunc: D3D12_COMPARISON_FUNC_NEVER,
+                    BorderColor: D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK,
+                    MaxLOD: D3D12_FLOAT32_MAX,
+                    ShaderRegister: 0, // s0
+                    RegisterSpace: 1,  // space1
+                    ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+                    ..Default::default()
+                },
+            ];
 
             D3D12SerializeRootSignature(
                 &D3D12_ROOT_SIGNATURE_DESC {
@@ -538,10 +552,7 @@ fn main() -> Result<()> {
             resource_heap.get_cpu_handle(&device, GpuResource::TerrainNodeBuffer as u32),
         )?;
 
-        let mut terrain_ui = TerrainDataUi {
-            height_map_size: terrain.height_map_size as i32,
-            height_map_scale: 5.0,
-        };
+        let mut terrain_map_generator = MapGeneratorParams::new(terrain.size as usize * 2);
 
         let async_compute_thread =
             async_compute::start_thread(Arc::clone(&device), loaded_mesh_receiver, ready_mesh_sender);
@@ -712,73 +723,83 @@ fn main() -> Result<()> {
                     ImGui_InputFloat(c"Terrain size".as_ptr(), &mut terrain.size);
                     ImGui_NewLine();
 
-                    ImGui_InputInt(c"Height map size".as_ptr(), &mut terrain_ui.height_map_size);
-                    ImGui_InputFloat(c"Height map scale".as_ptr(), &mut terrain_ui.height_map_scale);
+                    ImGui_InputInt(
+                        c"Height map size".as_ptr(),
+                        &mut terrain_map_generator.size as *mut usize as _,
+                    );
+                    ImGui_InputFloat(c"Height map scale".as_ptr(), &mut terrain_map_generator.scale);
 
                     if ImGui_Button(c"Generate height map".as_ptr()) {
-                        let fbm = Fbm::<Perlin>::new(123)
-                            .set_octaves(8)
-                            .set_frequency(1.0)
-                            .set_lacunarity(2.0)
-                            .set_persistence(0.7);
+                        let map_data = terrain_map_generator.generate(terrain.size as usize);
 
-                        let height_map_data = PlaneMapBuilder::new(fbm)
-                            .set_size(terrain_ui.height_map_size as usize, terrain_ui.height_map_size as usize)
-                            .set_x_bounds(0.0, terrain_ui.height_map_scale as f64)
-                            .set_y_bounds(0.0, terrain_ui.height_map_scale as f64)
-                            .build()
-                            .into_iter()
-                            .map(|n| n as f32)
-                            .collect::<Vec<_>>();
+                        let height_format = DXGI_FORMAT_R32_FLOAT;
+                        let normal_format = DXGI_FORMAT_R32G32B32_FLOAT;
 
-                        let min = height_map_data.iter().cloned().fold(f32::INFINITY, f32::min);
-                        let max = height_map_data.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                        println!("min: {min}, max: {max}");
-
-                        let top_mip_data = height_map_data
-                            .iter()
-                            .map(|n| (n - min) / (max - min))
-                            .collect::<Vec<_>>();
-
-                        let mips = terrain::generate_mips(top_mip_data, terrain_ui.height_map_size as usize);
-
-                        let height_map_texture = ID3D12Resource::new_texture(
+                        let height_map = ID3D12Resource::new_texture(
                             &device,
-                            DXGI_FORMAT_R32_FLOAT,
-                            terrain_ui.height_map_size as u32,
-                            terrain_ui.height_map_size as u32,
-                            mips.len() as u32,
+                            height_format,
+                            terrain_map_generator.size as u32,
+                            terrain_map_generator.size as u32,
+                            map_data.height_mips.len() as u32,
+                        )?;
+
+                        let normal_map = ID3D12Resource::new_texture(
+                            &device,
+                            normal_format,
+                            terrain_map_generator.size as u32,
+                            terrain_map_generator.size as u32,
+                            map_data.normal_mips.len() as u32,
                         )?;
 
                         device.CreateShaderResourceView(
-                            &height_map_texture,
+                            &height_map,
                             Some(&D3D12_SHADER_RESOURCE_VIEW_DESC {
-                                Format: DXGI_FORMAT_R32_FLOAT,
+                                Format: height_format,
                                 ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
                                 Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
                                 Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
                                     Texture2D: D3D12_TEX2D_SRV {
                                         MostDetailedMip: 0,
-                                        MipLevels: mips.len() as u32,
+                                        MipLevels: map_data.height_mips.len() as u32,
                                         PlaneSlice: 0,
                                         ResourceMinLODClamp: 0.0,
                                     },
                                 },
                             }),
-                            resource_heap.get_cpu_handle(&device, GpuResource::HeightMap as u32),
+                            resource_heap.get_cpu_handle(&device, GpuResource::TerrainHeightMap as u32),
                         );
 
-                        let mip_slices = mips
-                            .iter()
-                            .map(|m| std::slice::from_raw_parts(m.as_ptr() as *const u8, m.len() * size_of::<f32>()))
-                            .collect::<Vec<_>>();
+                        device.CreateShaderResourceView(
+                            &normal_map,
+                            Some(&D3D12_SHADER_RESOURCE_VIEW_DESC {
+                                Format: normal_format,
+                                ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+                                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                                    Texture2D: D3D12_TEX2D_SRV {
+                                        MostDetailedMip: 0,
+                                        MipLevels: map_data.normal_mips.len() as u32,
+                                        PlaneSlice: 0,
+                                        ResourceMinLODClamp: 0.0,
+                                    },
+                                },
+                            }),
+                            resource_heap.get_cpu_handle(&device, GpuResource::TerrainNormalMap as u32),
+                        );
 
-                        let upload_buffer =
-                            render_cmd_list.upload_mips(&device, mip_slices.as_slice(), &height_map_texture)?;
+                        let height_upload_buffer =
+                            render_cmd_list.upload_mips(&device, map_data.height_mips.as_slice(), &height_map)?;
+                        let normal_upload_buffer =
+                            render_cmd_list.upload_mips(&device, map_data.normal_mips.as_slice(), &normal_map)?;
 
-                        deferred_release.push((cpu_frame_index, upload_buffer.cast::<ID3D12Object>()?));
+                        deferred_release.push((cpu_frame_index, height_upload_buffer.cast::<ID3D12Object>()?));
+                        deferred_release.push((cpu_frame_index, normal_upload_buffer.cast::<ID3D12Object>()?));
 
-                        if let Some(prev) = terrain.height_map_texture.replace(height_map_texture) {
+                        if let Some(prev) = terrain.height_map.replace(height_map) {
+                            deferred_release.push((cpu_frame_index, prev.cast::<ID3D12Object>()?));
+                        }
+
+                        if let Some(prev) = terrain.normal_map.replace(normal_map) {
                             deferred_release.push((cpu_frame_index, prev.cast::<ID3D12Object>()?));
                         }
                     }
@@ -789,11 +810,13 @@ fn main() -> Result<()> {
                         size.x.min(size.y)
                     };
 
-                    if terrain.height_map_texture.is_some() {
+                    if terrain.height_map.is_some() {
                         ImGui_Image(
                             ImTextureRef {
                                 _TexData: std::ptr::null_mut(),
-                                _TexID: resource_heap.get_gpu_handle(&device, GpuResource::HeightMap as u32).ptr,
+                                _TexID: resource_heap
+                                    .get_gpu_handle(&device, GpuResource::TerrainHeightMap as u32)
+                                    .ptr,
                             },
                             ImVec2 {
                                 x: image_size,
@@ -938,7 +961,11 @@ fn main() -> Result<()> {
         drop(load_mesh_thread_pool);
         _ = async_compute_thread.join().unwrap();
 
-        drop(terrain.height_map_texture);
+        drop(terrain.const_buffer);
+        drop(terrain.node_buffer);
+        drop(terrain.chunk_index_buffer);
+        drop(terrain.height_map);
+        drop(terrain.normal_map);
         drop(terrain_pso);
         drop(pso);
         drop(root_signature);

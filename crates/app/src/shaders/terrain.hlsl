@@ -5,7 +5,10 @@ struct VsInput {
 
 struct VsOutput {
     float4 clip_position : SV_Position;
-    float3 color : Color;
+    float3 debug_color: Color;
+    nointerpolation uint lod_index : LodIndex;
+    float2 uv : Uv;
+    float height : Height;
 };
 
 struct FrameConsts {
@@ -27,7 +30,9 @@ struct TerrainNode {
 
 ConstantBuffer<FrameConsts> frame_consts;
 ConstantBuffer<TerrainConsts> consts : register(b0, space1);
-SamplerState point_clamp_sampler : register(s0);
+
+SamplerState point_clamp_sampler : register(s0, space0);
+SamplerState linear_clamp_sampler : register(s0, space1);
 
 static const uint CHUNK_SIZE = 8;
 static const uint2 OFFSETS[6] = {
@@ -108,9 +113,13 @@ float3 node_color(TerrainNode node) {
     return hsv_to_rgb(hue, 0.75 + 0.25 * frac((float)(hash >> 16) / 65535.0), 0.9);
 }
 
+static const uint HEIGHT_MAP_INDEX = 1;
+static const uint NORMAL_MAP_INDEX = 2;
+static const uint TERRAIN_NODE_BUFFER_INDEX = 3;
+
 VsOutput vs_main(VsInput input) {
-    const Texture2D<float> height_map = ResourceDescriptorHeap[1];
-    const StructuredBuffer<TerrainNode> nodes = ResourceDescriptorHeap[2];
+    const Texture2D<float> height_map = ResourceDescriptorHeap[HEIGHT_MAP_INDEX];
+    const StructuredBuffer<TerrainNode> nodes = ResourceDescriptorHeap[TERRAIN_NODE_BUFFER_INDEX];
 
     const TerrainNode node = nodes[input.instance_id];
 
@@ -131,11 +140,23 @@ VsOutput vs_main(VsInput input) {
 
     VsOutput output = (VsOutput)0;
     output.clip_position = mul(frame_consts.world_to_clip, float4(world_position, 1.0));
-    output.color = node_color(node);
+    output.debug_color = node_color(node);
+    output.lod_index = node.lod_index;
+    output.uv = uv;
+    output.height = height;
 
     return output;
 }
 
 float4 ps_main(VsOutput input) : SV_Target {
-    return float4(input.color, 1.0);
+    const Texture2D<float3> normal_map = ResourceDescriptorHeap[NORMAL_MAP_INDEX];
+    const float3 normal = normal_map.Sample(linear_clamp_sampler, input.uv);
+
+    const float3 light_dir = normalize(float3(1.0, 2.0, 1.0));
+    const float ndotl = saturate(dot(normal, light_dir));
+    const float3 ambient = float3(0.0, 0.0, 0.0);
+    const float3 color = height_to_color(input.height) * (ambient + ndotl);
+    // const float3 color = input.debug_color * (ambient + ndotl);
+
+    return float4(color, 1.0);
 }

@@ -1,5 +1,7 @@
 use anyhow::Result;
 use glam::{Vec2, Vec3, f32};
+use noise::utils::{NoiseMapBuilder, PlaneMapBuilder};
+use noise::{Fbm, MultiFractal, Perlin};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
@@ -21,11 +23,6 @@ pub struct GpuTerrainConsts {
     pub height_scale: f32,
 }
 
-pub struct TerrainDataUi {
-    pub height_map_size: i32,
-    pub height_map_scale: f32,
-}
-
 pub struct TerrainData {
     pub size: f32,
     pub height_map_size: f32,
@@ -37,8 +34,9 @@ pub struct TerrainData {
 
     pub const_buffer: ConstBuffer<GpuTerrainConsts>,
     pub node_buffer: ID3D12Resource,
-    pub height_map_texture: Option<ID3D12Resource>,
-    _chunk_index_buffer: ID3D12Resource,
+    pub chunk_index_buffer: ID3D12Resource,
+    pub height_map: Option<ID3D12Resource>,
+    pub normal_map: Option<ID3D12Resource>,
 }
 
 impl TerrainData {
@@ -88,8 +86,9 @@ impl TerrainData {
             },
             chunk_index_count: chunk_indices.len(),
             node_buffer,
-            height_map_texture: None,
-            _chunk_index_buffer: chunk_index_buffer,
+            chunk_index_buffer,
+            height_map: None,
+            normal_map: None,
         })
     }
 
@@ -238,31 +237,130 @@ fn generate_chunk_indices() -> Vec<u32> {
     indices
 }
 
-pub fn generate_mips(data: Vec<f32>, size: usize) -> Vec<Vec<f32>> {
-    let mut mips = vec![data];
-    let mut current_size = size;
+pub struct MapData {
+    pub height_mips: Vec<Vec<f32>>,
+    pub normal_mips: Vec<Vec<Vec3>>,
+}
 
-    while current_size > 1 {
-        current_size /= 2;
+pub struct MapGeneratorParams {
+    pub size: usize,
+    pub scale: f32,
+    pub octaves: usize,
+    pub frequency: f64,
+    pub lacunarity: f64,
+    pub persistence: f64,
+    pub seed: u32,
+}
 
-        let prev = mips.last().unwrap();
-        let mip: Vec<f32> = (0..current_size * current_size)
-            .map(|i| {
-                let x = (i % current_size) * 2;
-                let y = (i / current_size) * 2;
-                let prev_size = current_size * 2;
-
-                let s00 = prev[y * prev_size + x];
-                let s10 = prev[y * prev_size + x + 1];
-                let s01 = prev[(y + 1) * prev_size + x];
-                let s11 = prev[(y + 1) * prev_size + x + 1];
-
-                (s00 + s10 + s01 + s11) / 4.0
-            })
-            .collect();
-
-        mips.push(mip);
+impl MapGeneratorParams {
+    pub fn new(size: usize) -> Self {
+        Self {
+            size,
+            scale: 7.0,
+            octaves: 6,
+            frequency: 1.0,
+            lacunarity: 2.0,
+            persistence: 0.5,
+            seed: 123,
+        }
     }
 
-    mips
+    pub fn generate(&self, terrain_size: usize) -> MapData {
+        let fbm = Fbm::<Perlin>::new(self.seed)
+            .set_octaves(self.octaves)
+            .set_frequency(self.frequency)
+            .set_lacunarity(self.lacunarity)
+            .set_persistence(self.persistence);
+
+        let height_map = PlaneMapBuilder::new(fbm)
+            .set_size(self.size, self.size)
+            .set_x_bounds(0.0, self.scale as f64)
+            .set_y_bounds(0.0, self.scale as f64)
+            .build()
+            .into_iter()
+            .map(|n| n as f32)
+            .collect::<Vec<_>>();
+
+        let min = height_map.iter().cloned().fold(f32::INFINITY, f32::min);
+        let max = height_map.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        println!("height map: min={}, max={}", min, max);
+
+        let height_map = height_map.iter().map(|n| (n - min) / (max - min)).collect::<Vec<_>>();
+        let normal_map = self.generate_normals(height_map.as_slice(), terrain_size);
+
+        MapData {
+            height_mips: self.generate_mips(height_map, |s0, s1, s2, s3| (s0 + s1 + s2 + s3) * 0.25),
+            normal_mips: self.generate_mips(normal_map, |s0, s1, s2, s3| {
+                let n = (s0 + s1 + s2 + s3) * 0.25;
+
+                if n.length_squared() > 1e-8 {
+                    n.normalize()
+                } else {
+                    Vec3::Y
+                }
+            }),
+        }
+    }
+
+    fn generate_mips<T, F>(&self, data: Vec<T>, mut downsample: F) -> Vec<Vec<T>>
+    where
+        T: Copy,
+        F: FnMut(T, T, T, T) -> T,
+    {
+        let mut mips = vec![data];
+        let mut current_size = self.size;
+
+        while current_size > 1 {
+            current_size /= 2;
+
+            let prev = mips.last().unwrap();
+            let mip = (0..current_size * current_size)
+                .map(|i| {
+                    let x = (i % current_size) * 2;
+                    let y = (i / current_size) * 2;
+                    let prev_size = current_size * 2;
+
+                    let s00 = prev[y * prev_size + x];
+                    let s10 = prev[y * prev_size + x + 1];
+                    let s01 = prev[(y + 1) * prev_size + x];
+                    let s11 = prev[(y + 1) * prev_size + x + 1];
+
+                    downsample(s00, s10, s01, s11)
+                })
+                .collect();
+
+            mips.push(mip);
+        }
+
+        mips
+    }
+
+    fn generate_normals(&self, height_map: &[f32], terrain_size: usize) -> Vec<Vec3> {
+        let world_scale = terrain_size as f32 / self.size as f32;
+        let mut normals = vec![Vec3::ZERO; self.size * self.size];
+
+        for z in 0..self.size {
+            for x in 0..self.size {
+                let sample = |sx: i32, sz: i32| -> f32 {
+                    let cx = sx.clamp(0, self.size as i32 - 1) as usize;
+                    let cz = sz.clamp(0, self.size as i32 - 1) as usize;
+
+                    height_map[cz * self.size + cx]
+                };
+
+                let hl = sample(x as i32 - 1, z as i32);
+                let hr = sample(x as i32 + 1, z as i32);
+                let hb = sample(x as i32, z as i32 - 1);
+                let ht = sample(x as i32, z as i32 + 1);
+
+                let height_scale = 10.0;
+                let dx = (hl - hr) * height_scale;
+                let dz = (hb - ht) * height_scale;
+
+                normals[z * self.size + x] = glam::Vec3::new(dx, 2.0 * world_scale, dz).normalize();
+            }
+        }
+
+        normals
+    }
 }
