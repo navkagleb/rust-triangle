@@ -34,16 +34,6 @@ ConstantBuffer<TerrainConsts> consts : register(b0, space1);
 SamplerState point_clamp_sampler : register(s0, space0);
 SamplerState linear_clamp_sampler : register(s0, space1);
 
-static const uint CHUNK_SIZE = 8;
-static const uint2 OFFSETS[6] = {
-    uint2(0, 0),
-    uint2(1, 0),
-    uint2(0, 1),
-    uint2(1, 0),
-    uint2(1, 1),
-    uint2(0, 1),
-};
-
 float3 height_to_color(float h) {
     float3 deep_water = float3(0.0, 0.1, 0.4);
     float3 shallow = float3(0.1, 0.3, 0.6);
@@ -116,17 +106,22 @@ float3 node_color(TerrainNode node) {
 static const uint HEIGHT_MAP_INDEX = 1;
 static const uint NORMAL_MAP_INDEX = 2;
 static const uint TERRAIN_NODE_BUFFER_INDEX = 3;
+static const uint CHUNK_INDEX_BUFFER_INDEX = 4;
 
-VsOutput vs_main(VsInput input) {
+static const uint CHUNK_QUAD_COUNT = 8;
+static const uint CHUNK_VERTEX_COUNT = (CHUNK_QUAD_COUNT + 1) * (CHUNK_QUAD_COUNT + 1);
+static const uint CHUNK_TRIANGLE_COUNT = CHUNK_QUAD_COUNT * CHUNK_QUAD_COUNT * 2;
+
+VsOutput ProcessVertex(uint vertex_id, uint instance_id) {
     const Texture2D<float> height_map = ResourceDescriptorHeap[HEIGHT_MAP_INDEX];
     const StructuredBuffer<TerrainNode> nodes = ResourceDescriptorHeap[TERRAIN_NODE_BUFFER_INDEX];
 
-    const TerrainNode node = nodes[input.instance_id];
+    const TerrainNode node = nodes[instance_id];
 
-    const uint vx = input.vertex_id % (CHUNK_SIZE + 1);
-    const uint vz = input.vertex_id / (CHUNK_SIZE + 1);
+    const uint vx = vertex_id % (CHUNK_QUAD_COUNT + 1);
+    const uint vz = vertex_id / (CHUNK_QUAD_COUNT + 1);
 
-    const float2 local = float2(vx, vz) / (float)CHUNK_SIZE; // 0..1
+    const float2 local = float2(vx, vz) / (float)CHUNK_QUAD_COUNT; // 0..1
     const float2 world_xz = node.center + (local - 0.5) * node.half_size * 2.0;
 
     const float2 uv = world_xz / consts.terrain_size;
@@ -146,6 +141,35 @@ VsOutput vs_main(VsInput input) {
     output.height = height;
 
     return output;
+}
+
+VsOutput vs_main(VsInput input) {
+    return ProcessVertex(input.vertex_id, input.instance_id);
+}
+
+[NumThreads(128, 1, 1)]
+[OutputTopology("triangle")]
+void ms_main(
+    uint gtid : SV_GroupThreadID,
+    uint gid : SV_GroupID,
+    out vertices VsOutput vertices[CHUNK_VERTEX_COUNT],
+    out indices uint3 triangles[CHUNK_TRIANGLE_COUNT]
+) {
+    SetMeshOutputCounts(CHUNK_VERTEX_COUNT, CHUNK_TRIANGLE_COUNT);
+
+    if (gtid < CHUNK_VERTEX_COUNT) {
+        vertices[gtid] = ProcessVertex(gtid, gid);
+    }
+
+    const Buffer<uint> index_buffer = ResourceDescriptorHeap[CHUNK_INDEX_BUFFER_INDEX];
+
+    if (gtid < CHUNK_TRIANGLE_COUNT) { 
+        triangles[gtid] = uint3(
+            index_buffer[gtid * 3 + 0],
+            index_buffer[gtid * 3 + 1],
+            index_buffer[gtid * 3 + 2]
+        );
+    }
 }
 
 float4 ps_main(VsOutput input) : SV_Target {

@@ -47,6 +47,7 @@ enum GpuResource {
     TerrainHeightMap,
     TerrainNormalMap,
     TerrainNodeBuffer,
+    TerrainChunkIndexBuffer,
     Count,
 }
 
@@ -329,7 +330,7 @@ fn main() -> Result<()> {
             .try_into()
             .expect("0..FRAME_COUNT must produce exactly FRAME_COUNT elements");
 
-        let render_cmd_list = device.CreateCommandList1::<ID3D12GraphicsCommandList1>(
+        let render_cmd_list = device.CreateCommandList1::<ID3D12GraphicsCommandList6>(
             0,
             D3D12_COMMAND_LIST_TYPE_DIRECT,
             D3D12_COMMAND_LIST_FLAG_NONE,
@@ -412,20 +413,6 @@ fn main() -> Result<()> {
             device.CreateRootSignature::<ID3D12RootSignature>(0, bytecode)?
         };
 
-        let to_bytecode = |blob: &[u8]| D3D12_SHADER_BYTECODE {
-            pShaderBytecode: blob.as_ptr() as _,
-            BytecodeLength: blob.len(),
-        };
-
-        let blend_state = D3D12_BLEND_DESC {
-            RenderTarget: {
-                let mut render_targets = [D3D12_RENDER_TARGET_BLEND_DESC::default(); 8];
-                render_targets[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8;
-                render_targets
-            },
-            ..Default::default()
-        };
-
         let pso = {
             let vs_blob = std::fs::read(Path::new("target/dxil/triangle.vs.dxil"))?;
             let ps_blob = std::fs::read(Path::new("target/dxil/triangle.ps.dxil"))?;
@@ -453,9 +440,16 @@ fn main() -> Result<()> {
 
             device.CreateGraphicsPipelineState::<ID3D12PipelineState>(&D3D12_GRAPHICS_PIPELINE_STATE_DESC {
                 pRootSignature: ManuallyDrop::new(std::mem::transmute_copy(&root_signature)),
-                VS: to_bytecode(&vs_blob),
-                PS: to_bytecode(&ps_blob),
-                BlendState: blend_state,
+                VS: D3D12_SHADER_BYTECODE::from_slice(&vs_blob),
+                PS: D3D12_SHADER_BYTECODE::from_slice(&ps_blob),
+                BlendState: D3D12_BLEND_DESC {
+                    RenderTarget: {
+                        let mut render_targets = [D3D12_RENDER_TARGET_BLEND_DESC::default(); 8];
+                        render_targets[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8;
+                        render_targets
+                    },
+                    ..Default::default()
+                },
                 SampleMask: u32::MAX,
                 RasterizerState: D3D12_RASTERIZER_DESC {
                     FillMode: D3D12_FILL_MODE_SOLID,
@@ -473,42 +467,6 @@ fn main() -> Result<()> {
                     pInputElementDescs: input_elements.as_ptr(),
                     NumElements: input_elements.len() as u32,
                 },
-                PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
-                NumRenderTargets: 1,
-                RTVFormats: {
-                    let mut formats = [DXGI_FORMAT_UNKNOWN; 8];
-                    formats[0] = BACK_BUFFER_FORMAT;
-                    formats
-                },
-                DSVFormat: DEPTH_BUFFER_FORMAT,
-                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-                ..Default::default()
-            })?
-        };
-
-        let terrain_pso = {
-            let vs_blob = std::fs::read(Path::new("target/dxil/terrain.vs.dxil"))?;
-            let ps_blob = std::fs::read(Path::new("target/dxil/terrain.ps.dxil"))?;
-
-            device.CreateGraphicsPipelineState::<ID3D12PipelineState>(&D3D12_GRAPHICS_PIPELINE_STATE_DESC {
-                pRootSignature: ManuallyDrop::new(std::mem::transmute_copy(&root_signature)),
-                VS: to_bytecode(&vs_blob),
-                PS: to_bytecode(&ps_blob),
-                BlendState: blend_state,
-                SampleMask: u32::MAX,
-                RasterizerState: D3D12_RASTERIZER_DESC {
-                    FillMode: D3D12_FILL_MODE_SOLID,
-                    CullMode: D3D12_CULL_MODE_NONE,
-                    FrontCounterClockwise: BOOL(0),
-                    ..Default::default()
-                },
-                DepthStencilState: D3D12_DEPTH_STENCIL_DESC {
-                    DepthEnable: BOOL(1),
-                    DepthWriteMask: D3D12_DEPTH_WRITE_MASK_ALL,
-                    DepthFunc: D3D12_COMPARISON_FUNC_GREATER,
-                    ..Default::default()
-                },
-                InputLayout: Default::default(),
                 PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
                 NumRenderTargets: 1,
                 RTVFormats: {
@@ -549,7 +507,9 @@ fn main() -> Result<()> {
 
         let mut terrain = TerrainData::new(
             &device,
+            &root_signature,
             resource_heap.get_cpu_handle(&device, GpuResource::TerrainNodeBuffer as u32),
+            resource_heap.get_cpu_handle(&device, GpuResource::TerrainChunkIndexBuffer as u32),
         )?;
 
         let mut terrain_map_generator = MapGeneratorParams::new(terrain.size as usize * 2);
@@ -694,17 +654,22 @@ fn main() -> Result<()> {
                     ),
                 );
 
-                render_cmd_list.SetPipelineState(&terrain_pso);
-                render_cmd_list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-                render_cmd_list.IASetIndexBuffer(Some(&terrain.chunk_ibv));
+                if terrain.mesh_pipeline_enabled {
+                    render_cmd_list.SetPipelineState(&terrain.mesh_pso);
+                    render_cmd_list.DispatchMesh(terrain_nodes.len() as u32, 1, 1);
+                } else {
+                    render_cmd_list.SetPipelineState(&terrain.vertex_pso);
+                    render_cmd_list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                    render_cmd_list.IASetIndexBuffer(Some(&terrain.chunk_ibv));
 
-                render_cmd_list.DrawIndexedInstanced(
-                    terrain.chunk_index_count as u32,
-                    terrain_nodes.len() as u32,
-                    0,
-                    0,
-                    0,
-                );
+                    render_cmd_list.DrawIndexedInstanced(
+                        terrain.chunk_index_count as u32,
+                        terrain_nodes.len() as u32,
+                        0,
+                        0,
+                        0,
+                    );
+                }
             }
 
             {
@@ -721,6 +686,9 @@ fn main() -> Result<()> {
                     ImGui_InputFloat(c"Height scale".as_ptr(), &mut terrain.height_scale);
                     ImGui_InputFloat(c"LOD factor".as_ptr(), &mut terrain.lod_factor);
                     ImGui_InputFloat(c"Terrain size".as_ptr(), &mut terrain.size);
+                    ImGui_NewLine();
+
+                    ImGui_Checkbox(c"Mesh pipeline".as_ptr(), &mut terrain.mesh_pipeline_enabled);
                     ImGui_NewLine();
 
                     ImGui_InputInt(
@@ -966,7 +934,8 @@ fn main() -> Result<()> {
         drop(terrain.chunk_index_buffer);
         drop(terrain.height_map);
         drop(terrain.normal_map);
-        drop(terrain_pso);
+        drop(terrain.vertex_pso);
+        drop(terrain.mesh_pso);
         drop(pso);
         drop(root_signature);
         drop(render_cmd_list);

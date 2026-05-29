@@ -8,6 +8,7 @@ use anyhow::Context;
 #[serde(rename_all = "snake_case")]
 enum ShaderType {
     Vs,
+    Ms,
     Ps,
 }
 
@@ -15,6 +16,7 @@ impl ShaderType {
     fn entry_point(&self) -> &str {
         match self {
             ShaderType::Vs => "vs_main",
+            ShaderType::Ms => "ms_main",
             ShaderType::Ps => "ps_main",
         }
     }
@@ -22,6 +24,7 @@ impl ShaderType {
     fn target(&self) -> &str {
         match self {
             ShaderType::Vs => "vs_6_6",
+            ShaderType::Ms => "ms_6_6",
             ShaderType::Ps => "ps_6_6",
         }
     }
@@ -31,6 +34,7 @@ impl fmt::Display for ShaderType {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             ShaderType::Vs => write!(f, "vs"),
+            ShaderType::Ms => write!(f, "ms"),
             ShaderType::Ps => write!(f, "ps"),
         }
     }

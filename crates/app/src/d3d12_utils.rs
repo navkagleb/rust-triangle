@@ -426,3 +426,43 @@ impl D3D12DescriptorHeapExt for ID3D12DescriptorHeap {
         }
     }
 }
+
+pub trait ShaderBytecodeExt {
+    fn from_slice(blob: &[u8]) -> Self;
+}
+
+impl ShaderBytecodeExt for D3D12_SHADER_BYTECODE {
+    fn from_slice(blob: &[u8]) -> Self {
+        Self {
+            pShaderBytecode: blob.as_ptr() as _,
+            BytecodeLength: blob.len(),
+        }
+    }
+}
+
+#[repr(C)]
+pub struct MeshPipelineStream {
+    pub root_signature: PsoSubobject<*mut std::ffi::c_void, { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE.0 }>,
+    pub ms: PsoSubobject<D3D12_SHADER_BYTECODE, { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 }>,
+    pub ps: PsoSubobject<D3D12_SHADER_BYTECODE, { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS.0 }>,
+    pub rasterizer: PsoSubobject<D3D12_RASTERIZER_DESC, { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER.0 }>,
+    pub depth_stencil: PsoSubobject<D3D12_DEPTH_STENCIL_DESC, { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL.0 }>,
+    pub rtv_fmts: PsoSubobject<D3D12_RT_FORMAT_ARRAY, { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS.0 }>,
+    pub dsv_fmt: PsoSubobject<DXGI_FORMAT, { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT.0 }>,
+    pub sample_desc: PsoSubobject<DXGI_SAMPLE_DESC, { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC.0 }>,
+}
+
+#[repr(C, align(8))]
+pub struct PsoSubobject<T, const TYPE: i32> {
+    subobject_type: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE,
+    value: T,
+}
+
+impl<T, const TYPE: i32> PsoSubobject<T, TYPE> {
+    pub fn new(value: T) -> Self {
+        Self {
+            subobject_type: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE(TYPE),
+            value,
+        }
+    }
+}

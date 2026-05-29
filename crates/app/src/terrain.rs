@@ -5,7 +5,8 @@ use noise::{Fbm, MultiFractal, Perlin};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
-use crate::d3d12_utils::{ConstBuffer, D3D12BufferExt};
+use crate::d3d12_utils::{ConstBuffer, D3D12BufferExt, MeshPipelineStream, PsoSubobject, ShaderBytecodeExt};
+use crate::{BACK_BUFFER_FORMAT, DEPTH_BUFFER_FORMAT};
 
 const CHUNK_QUAD_COUNT: usize = 8;
 
@@ -37,10 +38,19 @@ pub struct TerrainData {
     pub chunk_index_buffer: ID3D12Resource,
     pub height_map: Option<ID3D12Resource>,
     pub normal_map: Option<ID3D12Resource>,
+    pub vertex_pso: ID3D12PipelineState,
+    pub mesh_pso: ID3D12PipelineState,
+
+    pub mesh_pipeline_enabled: bool,
 }
 
 impl TerrainData {
-    pub fn new(device: &ID3D12Device, node_buffer_cpu_srv: D3D12_CPU_DESCRIPTOR_HANDLE) -> Result<Self> {
+    pub fn new(
+        device: &ID3D12Device4,
+        root_signature: &ID3D12RootSignature,
+        node_buffer_cpu_srv: D3D12_CPU_DESCRIPTOR_HANDLE,
+        chunk_index_buffer_cpu_srv: D3D12_CPU_DESCRIPTOR_HANDLE,
+    ) -> Result<Self> {
         let chunk_indices = generate_chunk_indices();
         let chunk_index_buffer =
             ID3D12Resource::new_buffer(device, D3D12_HEAP_TYPE_UPLOAD, size_of_val(chunk_indices.as_slice()))?;
@@ -69,7 +79,100 @@ impl TerrainData {
                 }),
                 node_buffer_cpu_srv,
             );
+
+            device.CreateShaderResourceView(
+                &chunk_index_buffer,
+                Some(&D3D12_SHADER_RESOURCE_VIEW_DESC {
+                    Format: DXGI_FORMAT_R32_UINT,
+                    ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                    Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                    Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                        Buffer: D3D12_BUFFER_SRV {
+                            FirstElement: 0,
+                            NumElements: chunk_indices.len() as u32,
+                            StructureByteStride: 0,
+                            Flags: D3D12_BUFFER_SRV_FLAG_NONE,
+                        },
+                    },
+                }),
+                chunk_index_buffer_cpu_srv,
+            );
         }
+
+        let vs_blob = std::fs::read(std::path::Path::new("target/dxil/terrain.vs.dxil"))?;
+        let ms_blob = std::fs::read(std::path::Path::new("target/dxil/terrain.ms.dxil"))?;
+        let ps_blob = std::fs::read(std::path::Path::new("target/dxil/terrain.ps.dxil"))?;
+
+        let rasterizer_state = D3D12_RASTERIZER_DESC {
+            FillMode: D3D12_FILL_MODE_SOLID,
+            CullMode: D3D12_CULL_MODE_NONE,
+            FrontCounterClockwise: false.into(),
+            ..Default::default()
+        };
+
+        let depth_stencil_state = D3D12_DEPTH_STENCIL_DESC {
+            DepthEnable: true.into(),
+            DepthWriteMask: D3D12_DEPTH_WRITE_MASK_ALL,
+            DepthFunc: D3D12_COMPARISON_FUNC_GREATER,
+            ..Default::default()
+        };
+
+        let rtv_fmts = {
+            let mut fmts = [DXGI_FORMAT_UNKNOWN; 8];
+            fmts[0] = BACK_BUFFER_FORMAT;
+            fmts
+        };
+
+        let vertex_pso = {
+            unsafe {
+                device.CreateGraphicsPipelineState::<ID3D12PipelineState>(&D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::ManuallyDrop::new(std::mem::transmute_copy(root_signature)),
+                    VS: D3D12_SHADER_BYTECODE::from_slice(&vs_blob),
+                    PS: D3D12_SHADER_BYTECODE::from_slice(&ps_blob),
+                    BlendState: D3D12_BLEND_DESC {
+                        RenderTarget: {
+                            let mut render_targets = [D3D12_RENDER_TARGET_BLEND_DESC::default(); 8];
+                            render_targets[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8;
+                            render_targets
+                        },
+                        ..Default::default()
+                    },
+                    SampleMask: u32::MAX,
+                    RasterizerState: rasterizer_state,
+                    DepthStencilState: depth_stencil_state,
+                    InputLayout: Default::default(),
+                    PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+                    NumRenderTargets: 1,
+                    RTVFormats: rtv_fmts,
+                    DSVFormat: DEPTH_BUFFER_FORMAT,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    ..Default::default()
+                })?
+            }
+        };
+
+        let mesh_pso = {
+            let mut stream = MeshPipelineStream {
+                root_signature: PsoSubobject::new(unsafe { std::mem::transmute_copy(root_signature) }),
+                ms: PsoSubobject::new(D3D12_SHADER_BYTECODE::from_slice(&ms_blob)),
+                ps: PsoSubobject::new(D3D12_SHADER_BYTECODE::from_slice(&ps_blob)),
+                rasterizer: PsoSubobject::new(rasterizer_state),
+                depth_stencil: PsoSubobject::new(depth_stencil_state),
+                rtv_fmts: PsoSubobject::new(D3D12_RT_FORMAT_ARRAY {
+                    RTFormats: rtv_fmts,
+                    NumRenderTargets: 1,
+                }),
+                dsv_fmt: PsoSubobject::new(DXGI_FORMAT_D32_FLOAT),
+                sample_desc: PsoSubobject::new(DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }),
+            };
+
+            unsafe {
+                device.CreatePipelineState::<ID3D12PipelineState>(&D3D12_PIPELINE_STATE_STREAM_DESC {
+                    SizeInBytes: size_of::<MeshPipelineStream>(),
+                    pPipelineStateSubobjectStream: &mut stream as *mut _ as *mut _,
+                })?
+            }
+        };
 
         let size = 256.0;
 
@@ -89,6 +192,9 @@ impl TerrainData {
             chunk_index_buffer,
             height_map: None,
             normal_map: None,
+            vertex_pso,
+            mesh_pso,
+            mesh_pipeline_enabled: false,
         })
     }
 
@@ -215,7 +321,7 @@ impl QuadTree {
 }
 
 fn generate_chunk_indices() -> Vec<u32> {
-    let mut indices = Vec::new();
+    let mut indices = Vec::with_capacity(CHUNK_QUAD_COUNT * CHUNK_QUAD_COUNT * 6);
 
     for z in 0..CHUNK_QUAD_COUNT {
         for x in 0..CHUNK_QUAD_COUNT {
