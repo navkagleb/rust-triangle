@@ -1,4 +1,5 @@
 use anyhow::Result;
+use bitflags::bitflags;
 use glam::{Vec2, Vec3, f32};
 use noise::utils::{NoiseMapBuilder, PlaneMapBuilder};
 use noise::{Fbm, MultiFractal, Perlin};
@@ -10,11 +11,27 @@ use crate::{BACK_BUFFER_FORMAT, DEPTH_BUFFER_FORMAT};
 
 const CHUNK_QUAD_COUNT: usize = 8;
 
+bitflags! {
+    #[repr(transparent)]
+    #[derive(Clone, Copy, Debug)]
+    pub struct StitchMask: u32 {
+        const TOP = 1 << 0;
+        const BOTTOM = 1 << 1;
+        const LEFT = 1 << 2;
+        const RIGHT = 1 << 3;
+        const TOP_LEFT = 1 << 4;
+        const TOP_RIGHT = 1 << 5;
+        const BOTTOM_LEFT = 1 << 6;
+        const BOTTOM_RIGHT = 1 << 7;
+    }
+}
+
 #[repr(C)]
 pub struct GpuTerrainNode {
     pub center: Vec2,
     pub half_size: f32,
     pub lod_index: u32,
+    pub stitch_mask: StitchMask,
 }
 
 #[repr(C)]
@@ -22,6 +39,7 @@ pub struct GpuTerrainConsts {
     pub terrain_size: f32,
     pub world_scale: f32,
     pub height_scale: f32,
+    pub wireframe: bool,
 }
 
 pub struct TerrainData {
@@ -33,15 +51,17 @@ pub struct TerrainData {
     pub chunk_ibv: D3D12_INDEX_BUFFER_VIEW,
     pub chunk_index_count: usize,
 
-    pub const_buffer: ConstBuffer<GpuTerrainConsts>,
+    pub solid_const_buffer: ConstBuffer<GpuTerrainConsts>,
+    pub wireframe_const_buffer: ConstBuffer<GpuTerrainConsts>,
+
     pub node_buffer: ID3D12Resource,
     pub chunk_index_buffer: ID3D12Resource,
     pub height_map: Option<ID3D12Resource>,
     pub normal_map: Option<ID3D12Resource>,
-    pub vertex_pso: ID3D12PipelineState,
-    pub mesh_pso: ID3D12PipelineState,
 
-    pub mesh_pipeline_enabled: bool,
+    pub vertex_pso: ID3D12PipelineState,
+    pub mesh_solid_pso: ID3D12PipelineState,
+    pub mesh_wireframe_pso: ID3D12PipelineState,
 }
 
 impl TerrainData {
@@ -151,18 +171,48 @@ impl TerrainData {
             }
         };
 
-        let mesh_pso = {
+        let mesh_solid_pso = {
             let mut stream = MeshPipelineStream {
                 root_signature: PsoSubobject::new(unsafe { std::mem::transmute_copy(root_signature) }),
                 ms: PsoSubobject::new(D3D12_SHADER_BYTECODE::from_slice(&ms_blob)),
                 ps: PsoSubobject::new(D3D12_SHADER_BYTECODE::from_slice(&ps_blob)),
                 rasterizer: PsoSubobject::new(rasterizer_state),
                 depth_stencil: PsoSubobject::new(depth_stencil_state),
-                rtv_fmts: PsoSubobject::new(D3D12_RT_FORMAT_ARRAY {
+                rtv_formats: PsoSubobject::new(D3D12_RT_FORMAT_ARRAY {
                     RTFormats: rtv_fmts,
                     NumRenderTargets: 1,
                 }),
-                dsv_fmt: PsoSubobject::new(DXGI_FORMAT_D32_FLOAT),
+                dsv_format: PsoSubobject::new(DEPTH_BUFFER_FORMAT),
+                sample_desc: PsoSubobject::new(DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }),
+            };
+
+            unsafe {
+                device.CreatePipelineState::<ID3D12PipelineState>(&D3D12_PIPELINE_STATE_STREAM_DESC {
+                    SizeInBytes: size_of::<MeshPipelineStream>(),
+                    pPipelineStateSubobjectStream: &mut stream as *mut _ as *mut _,
+                })?
+            }
+        };
+
+        let mesh_wireframe_pso = {
+            let mut stream = MeshPipelineStream {
+                root_signature: PsoSubobject::new(unsafe { std::mem::transmute_copy(root_signature) }),
+                ms: PsoSubobject::new(D3D12_SHADER_BYTECODE::from_slice(&ms_blob)),
+                ps: PsoSubobject::new(D3D12_SHADER_BYTECODE::from_slice(&ps_blob)),
+                rasterizer: PsoSubobject::new(D3D12_RASTERIZER_DESC {
+                    FillMode: D3D12_FILL_MODE_WIREFRAME,
+                    CullMode: D3D12_CULL_MODE_NONE,
+                    FrontCounterClockwise: false.into(),
+                    DepthBias: 1000,
+                    SlopeScaledDepthBias: 1.0,
+                    ..Default::default()
+                }),
+                depth_stencil: PsoSubobject::new(depth_stencil_state),
+                rtv_formats: PsoSubobject::new(D3D12_RT_FORMAT_ARRAY {
+                    RTFormats: rtv_fmts,
+                    NumRenderTargets: 1,
+                }),
+                dsv_format: PsoSubobject::new(DEPTH_BUFFER_FORMAT),
                 sample_desc: PsoSubobject::new(DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }),
             };
 
@@ -181,7 +231,8 @@ impl TerrainData {
             height_map_size: size * 2.0,
             lod_factor: 5.0,
             height_scale: 15.0,
-            const_buffer: ConstBuffer::new(device)?,
+            solid_const_buffer: ConstBuffer::new(device)?,
+            wireframe_const_buffer: ConstBuffer::new(device)?,
             chunk_ibv: D3D12_INDEX_BUFFER_VIEW {
                 BufferLocation: unsafe { chunk_index_buffer.GetGPUVirtualAddress() },
                 SizeInBytes: size_of_val(chunk_indices.as_slice()) as u32,
@@ -193,22 +244,55 @@ impl TerrainData {
             height_map: None,
             normal_map: None,
             vertex_pso,
-            mesh_pso,
-            mesh_pipeline_enabled: false,
+            mesh_solid_pso,
+            mesh_wireframe_pso,
         })
     }
 
     pub fn collect_nodes(&self, camera_position: &Vec3) -> Vec<GpuTerrainNode> {
         let min_node_size = (self.size / self.height_map_size) * CHUNK_QUAD_COUNT as f32;
         let qtree = QuadTree::new(self.size, min_node_size, self.lod_factor, camera_position);
+        let leafs = qtree.collect_leafs();
 
-        qtree
-            .collect_leafs()
+        let is_neighbor_coarser = |node: &QuadTreeNode, direction: Vec2| -> bool {
+            let probe = node.center + direction * node.half_size * 2.0;
+            let neighbor_lod_index = leafs
+                .iter()
+                .find(|n| (n.center - probe).length() < n.half_size)
+                .map(|n| n.lod_index)
+                .unwrap_or(node.lod_index);
+
+            neighbor_lod_index > node.lod_index
+        };
+
+        leafs
             .iter()
-            .map(|n| GpuTerrainNode {
-                center: n.center,
-                half_size: n.half_size,
-                lod_index: n.lod_index,
+            .map(|n| {
+                let directions = [
+                    (StitchMask::TOP, Vec2::new(0.0, -1.0)),
+                    (StitchMask::BOTTOM, Vec2::new(0.0, 1.0)),
+                    (StitchMask::LEFT, Vec2::new(-1.0, 0.0)),
+                    (StitchMask::RIGHT, Vec2::new(1.0, 0.0)),
+                    (StitchMask::TOP_LEFT, Vec2::new(-1.0, -1.0)),
+                    (StitchMask::TOP_RIGHT, Vec2::new(1.0, -1.0)),
+                    (StitchMask::BOTTOM_LEFT, Vec2::new(-1.0, 1.0)),
+                    (StitchMask::BOTTOM_RIGHT, Vec2::new(1.0, 1.0)),
+                ];
+
+                let mut stitch_mask = StitchMask::empty();
+
+                for (flag, direction) in directions.iter() {
+                    if is_neighbor_coarser(n, *direction) {
+                        stitch_mask.insert(*flag);
+                    }
+                }
+
+                GpuTerrainNode {
+                    center: n.center,
+                    half_size: n.half_size,
+                    lod_index: n.lod_index,
+                    stitch_mask,
+                }
             })
             .collect()
     }

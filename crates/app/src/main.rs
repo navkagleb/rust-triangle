@@ -25,7 +25,7 @@ use windows::core::{BOOL, Interface, PCSTR, s};
 use d3d12_utils::*;
 use imgui_sys::*;
 use mesh::{GpuMesh, LoadThreadPool, LoadedMesh};
-use terrain::{GpuTerrainConsts, MapGeneratorParams, TerrainData};
+use terrain::{GpuTerrainConsts, MapGeneratorParams, StitchMask, TerrainData};
 
 const WINDOW_REGISTRY_NAME: PCSTR = s!("rust-window");
 const WIDTH: u32 = 1920;
@@ -525,6 +525,11 @@ fn main() -> Result<()> {
 
         let mut deferred_release = Vec::new();
 
+        let mut freeze_camera = false;
+        let mut mesh_pipeline_enabled = true;
+        let mut wireframe_enabled = true;
+        let mut camera_position: glam::Vec3 = *camera.position();
+
         loop {
             {
                 let mut message = MSG::default();
@@ -555,7 +560,11 @@ fn main() -> Result<()> {
                 input.mouse_dy = 0;
             }
 
-            let terrain_nodes = terrain.collect_nodes(camera.position());
+            if !freeze_camera {
+                camera_position = *camera.position();
+            }
+
+            let terrain_nodes = terrain.collect_nodes(&camera_position);
 
             let active_frame_index = swap_chain.GetCurrentBackBufferIndex();
             let cmd_allocator = &cmd_allocators[active_frame_index as usize];
@@ -640,23 +649,43 @@ fn main() -> Result<()> {
             }
 
             {
+                // TODO: Should be used storage per frame"
                 terrain.node_buffer.map_and_write(terrain_nodes.as_slice())?;
 
-                render_cmd_list.SetGraphicsRootConstantBufferView(
-                    1,
-                    terrain.const_buffer.write(
-                        active_frame_index,
-                        &GpuTerrainConsts {
-                            terrain_size: terrain.size,
-                            world_scale: 1.0,
-                            height_scale: terrain.height_scale,
-                        },
-                    ),
-                );
+                if mesh_pipeline_enabled {
+                    render_cmd_list.SetGraphicsRootConstantBufferView(
+                        1,
+                        terrain.solid_const_buffer.write(
+                            active_frame_index,
+                            &GpuTerrainConsts {
+                                terrain_size: terrain.size,
+                                world_scale: 1.0,
+                                height_scale: terrain.height_scale,
+                                wireframe: false,
+                            },
+                        ),
+                    );
 
-                if terrain.mesh_pipeline_enabled {
-                    render_cmd_list.SetPipelineState(&terrain.mesh_pso);
+                    render_cmd_list.SetPipelineState(&terrain.mesh_solid_pso);
                     render_cmd_list.DispatchMesh(terrain_nodes.len() as u32, 1, 1);
+
+                    if wireframe_enabled {
+                        render_cmd_list.SetGraphicsRootConstantBufferView(
+                            1,
+                            terrain.wireframe_const_buffer.write(
+                                active_frame_index,
+                                &GpuTerrainConsts {
+                                    terrain_size: terrain.size,
+                                    world_scale: 1.0,
+                                    height_scale: terrain.height_scale,
+                                    wireframe: true,
+                                },
+                            ),
+                        );
+
+                        render_cmd_list.SetPipelineState(&terrain.mesh_wireframe_pso);
+                        render_cmd_list.DispatchMesh(terrain_nodes.len() as u32, 1, 1);
+                    }
                 } else {
                     render_cmd_list.SetPipelineState(&terrain.vertex_pso);
                     render_cmd_list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -688,7 +717,9 @@ fn main() -> Result<()> {
                     ImGui_InputFloat(c"Terrain size".as_ptr(), &mut terrain.size);
                     ImGui_NewLine();
 
-                    ImGui_Checkbox(c"Mesh pipeline".as_ptr(), &mut terrain.mesh_pipeline_enabled);
+                    ImGui_Checkbox(c"Mesh pipeline".as_ptr(), &mut mesh_pipeline_enabled);
+                    ImGui_Checkbox(c"Wireframe".as_ptr(), &mut wireframe_enabled);
+                    ImGui_Checkbox(c"Freeze camera".as_ptr(), &mut freeze_camera);
                     ImGui_NewLine();
 
                     ImGui_InputInt(
@@ -799,6 +830,7 @@ fn main() -> Result<()> {
                         let center_x = image_position.x + (node.center.x / terrain.size) * image_size;
                         let center_y = image_position.y + (node.center.y / terrain.size) * image_size;
                         let half_size = (node.half_size / terrain.size) * image_size;
+                        let cell_size = half_size * 2.0;
 
                         ImDrawList_AddRectEx(
                             draw_list,
@@ -816,18 +848,98 @@ fn main() -> Result<()> {
                             0.5,
                         );
 
-                        let text = CString::new(node.lod_index.to_string()).unwrap();
-                        let text_size = ImGui_CalcTextSize(text.as_ptr());
+                        let center_label = CString::new(node.lod_index.to_string()).unwrap();
+                        let center_label_size = ImGui_CalcTextSize(center_label.as_ptr());
+
+                        if center_label_size.x >= cell_size || center_label_size.y >= cell_size {
+                            continue;
+                        }
 
                         ImDrawList_AddText(
                             draw_list,
                             ImVec2 {
-                                x: center_x - text_size.x / 2.0,
-                                y: center_y - text_size.y / 2.0,
+                                x: center_x - center_label_size.x / 2.0,
+                                y: center_y - center_label_size.y / 2.0,
                             },
                             0xFFFFFFFF,
-                            text.as_ptr(),
-                        )
+                            center_label.as_ptr(),
+                        );
+
+                        let style = *ImGui_GetStyle();
+                        let padding_x = style.WindowPadding.x / 4.0;
+                        let padding_y = style.WindowPadding.y / 4.0;
+                        let star_size = ImGui_CalcTextSize(c"*".as_ptr());
+                        let required_x = padding_x * 2.0 + star_size.x + star_size.x + center_label_size.x;
+                        let required_y = padding_y * 2.0 + star_size.y + star_size.y + center_label_size.y;
+
+                        if required_x > cell_size || required_y > cell_size {
+                            continue;
+                        }
+
+                        let stitch_labels = [
+                            (
+                                StitchMask::TOP,
+                                ImVec2 {
+                                    x: center_x - star_size.x / 2.0,
+                                    y: center_y - half_size + padding_y,
+                                },
+                            ),
+                            (
+                                StitchMask::BOTTOM,
+                                ImVec2 {
+                                    x: center_x - star_size.x / 2.0,
+                                    y: center_y + half_size - star_size.y - padding_y,
+                                },
+                            ),
+                            (
+                                StitchMask::LEFT,
+                                ImVec2 {
+                                    x: center_x - half_size + padding_x,
+                                    y: center_y - star_size.y / 2.0,
+                                },
+                            ),
+                            (
+                                StitchMask::RIGHT,
+                                ImVec2 {
+                                    x: center_x + half_size - star_size.x - padding_x,
+                                    y: center_y - star_size.y / 2.0,
+                                },
+                            ),
+                            (
+                                StitchMask::TOP_LEFT,
+                                ImVec2 {
+                                    x: center_x - half_size + padding_x,
+                                    y: center_y - half_size + padding_y,
+                                },
+                            ),
+                            (
+                                StitchMask::TOP_RIGHT,
+                                ImVec2 {
+                                    x: center_x + half_size - star_size.x - padding_x,
+                                    y: center_y - half_size + padding_y,
+                                },
+                            ),
+                            (
+                                StitchMask::BOTTOM_LEFT,
+                                ImVec2 {
+                                    x: center_x - half_size + padding_x,
+                                    y: center_y + half_size - star_size.y - padding_y,
+                                },
+                            ),
+                            (
+                                StitchMask::BOTTOM_RIGHT,
+                                ImVec2 {
+                                    x: center_x + half_size - star_size.x - padding_x,
+                                    y: center_y + half_size - star_size.y - padding_y,
+                                },
+                            ),
+                        ];
+
+                        for (flag, pos) in &stitch_labels {
+                            if node.stitch_mask.contains(*flag) {
+                                ImDrawList_AddText(draw_list, *pos, 0xFFFFFFFF, c"*".as_ptr());
+                            }
+                        }
                     }
                 }
                 ImGui_End();
@@ -929,13 +1041,15 @@ fn main() -> Result<()> {
         drop(load_mesh_thread_pool);
         _ = async_compute_thread.join().unwrap();
 
-        drop(terrain.const_buffer);
+        drop(terrain.solid_const_buffer);
+        drop(terrain.wireframe_const_buffer);
         drop(terrain.node_buffer);
         drop(terrain.chunk_index_buffer);
         drop(terrain.height_map);
         drop(terrain.normal_map);
         drop(terrain.vertex_pso);
-        drop(terrain.mesh_pso);
+        drop(terrain.mesh_solid_pso);
+        drop(terrain.mesh_wireframe_pso);
         drop(pso);
         drop(root_signature);
         drop(render_cmd_list);
