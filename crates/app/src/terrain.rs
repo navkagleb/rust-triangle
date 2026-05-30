@@ -39,7 +39,8 @@ pub struct GpuTerrainConsts {
     pub terrain_size: f32,
     pub world_scale: f32,
     pub height_scale: f32,
-    pub wireframe: bool,
+    pub wireframe_pass: u32,
+    pub stitching_enabled: u32,
 }
 
 pub struct TerrainData {

@@ -528,6 +528,8 @@ fn main() -> Result<()> {
         let mut freeze_camera = false;
         let mut mesh_pipeline_enabled = true;
         let mut wireframe_enabled = true;
+        let mut stitching_enabled = true;
+
         let mut camera_position: glam::Vec3 = *camera.position();
 
         loop {
@@ -653,34 +655,28 @@ fn main() -> Result<()> {
                 terrain.node_buffer.map_and_write(terrain_nodes.as_slice())?;
 
                 if mesh_pipeline_enabled {
+                    let mut consts = GpuTerrainConsts {
+                        terrain_size: terrain.size,
+                        world_scale: 1.0,
+                        height_scale: terrain.height_scale,
+                        wireframe_pass: false.into(),
+                        stitching_enabled: stitching_enabled.into(),
+                    };
+
                     render_cmd_list.SetGraphicsRootConstantBufferView(
                         1,
-                        terrain.solid_const_buffer.write(
-                            active_frame_index,
-                            &GpuTerrainConsts {
-                                terrain_size: terrain.size,
-                                world_scale: 1.0,
-                                height_scale: terrain.height_scale,
-                                wireframe: false,
-                            },
-                        ),
+                        terrain.solid_const_buffer.write(active_frame_index, &consts),
                     );
 
                     render_cmd_list.SetPipelineState(&terrain.mesh_solid_pso);
                     render_cmd_list.DispatchMesh(terrain_nodes.len() as u32, 1, 1);
 
                     if wireframe_enabled {
+                        consts.wireframe_pass = true.into();
+
                         render_cmd_list.SetGraphicsRootConstantBufferView(
                             1,
-                            terrain.wireframe_const_buffer.write(
-                                active_frame_index,
-                                &GpuTerrainConsts {
-                                    terrain_size: terrain.size,
-                                    world_scale: 1.0,
-                                    height_scale: terrain.height_scale,
-                                    wireframe: true,
-                                },
-                            ),
+                            terrain.wireframe_const_buffer.write(active_frame_index, &consts),
                         );
 
                         render_cmd_list.SetPipelineState(&terrain.mesh_wireframe_pso);
@@ -717,9 +713,10 @@ fn main() -> Result<()> {
                     ImGui_InputFloat(c"Terrain size".as_ptr(), &mut terrain.size);
                     ImGui_NewLine();
 
+                    ImGui_Checkbox(c"Freeze camera".as_ptr(), &mut freeze_camera);
                     ImGui_Checkbox(c"Mesh pipeline".as_ptr(), &mut mesh_pipeline_enabled);
                     ImGui_Checkbox(c"Wireframe".as_ptr(), &mut wireframe_enabled);
-                    ImGui_Checkbox(c"Freeze camera".as_ptr(), &mut freeze_camera);
+                    ImGui_Checkbox(c"Stitching".as_ptr(), &mut stitching_enabled);
                     ImGui_NewLine();
 
                     ImGui_InputInt(

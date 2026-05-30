@@ -20,7 +20,8 @@ struct TerrainConsts {
     float terrain_size;
     float world_scale;
     float height_scale;
-    bool is_wireframe;
+    uint wireframe_pass;
+    uint stitching_enabled;
 };
 
 struct TerrainNode {
@@ -131,29 +132,37 @@ VsOutput ProcessVertex(uint vertex_id, uint instance_id) {
 
     uint vx = vertex_id % (CHUNK_QUAD_COUNT + 1);
     uint vz = vertex_id / (CHUNK_QUAD_COUNT + 1);
+    uint height_mip_index = node.lod_index;
 
-    const bool stitch_x = (vz == 0 && node.stitch_mask & TOP_STITCH_BIT) || (vz == CHUNK_QUAD_COUNT && node.stitch_mask & BOTTOM_STITCH_BIT);
-    const bool stitch_z = (vx == 0 && node.stitch_mask & LEFT_STITCH_BIT) || (vx == CHUNK_QUAD_COUNT && node.stitch_mask & RIGHT_STITCH_BIT);
-    const bool corner_stitch =
-        (vx == 0 && vz == 0 && node.stitch_mask & TOP_LEFT_STITCH_BIT) ||
-        (vx == CHUNK_QUAD_COUNT && vz == 0 && node.stitch_mask & TOP_RIGHT_STITCH_BIT)||
-        (vx == 0 && vz == CHUNK_QUAD_COUNT && node.stitch_mask & BOTTOM_LEFT_STITCH_BIT) ||
-        (vx == CHUNK_QUAD_COUNT && vz == CHUNK_QUAD_COUNT && node.stitch_mask & BOTTOM_RIGHT_STITCH_BIT);
+    if (consts.stitching_enabled)
+    {
+        const bool stitch_x = (vz == 0 && node.stitch_mask & TOP_STITCH_BIT) || (vz == CHUNK_QUAD_COUNT && node.stitch_mask & BOTTOM_STITCH_BIT);
+        const bool stitch_z = (vx == 0 && node.stitch_mask & LEFT_STITCH_BIT) || (vx == CHUNK_QUAD_COUNT && node.stitch_mask & RIGHT_STITCH_BIT);
 
-    if (stitch_x) {
-        vx = (vx / 2) * 2;
-    }
+        if (stitch_x) {
+            vx = (vx / 2) * 2;
+        }
 
-    if (stitch_z) {
-        vz = (vz / 2) * 2;
+        if (stitch_z) {
+            vz = (vz / 2) * 2;
+        }
+
+        const bool stitch_corner =
+            (vx == 0 && vz == 0 && node.stitch_mask & TOP_LEFT_STITCH_BIT) ||
+            (vx == CHUNK_QUAD_COUNT && vz == 0 && node.stitch_mask & TOP_RIGHT_STITCH_BIT)||
+            (vx == 0 && vz == CHUNK_QUAD_COUNT && node.stitch_mask & BOTTOM_LEFT_STITCH_BIT) ||
+            (vx == CHUNK_QUAD_COUNT && vz == CHUNK_QUAD_COUNT && node.stitch_mask & BOTTOM_RIGHT_STITCH_BIT);
+
+        if (stitch_x || stitch_z || stitch_corner) {
+            height_mip_index += 1;
+        }
     }
 
     const float2 local = float2(vx, vz) / (float)CHUNK_QUAD_COUNT; // 0..1
     const float2 world_xz = node.center + (local - 0.5) * node.half_size * 2.0;
 
     const float2 uv = world_xz / consts.terrain_size;
-    const float lod_index = stitch_x || stitch_z || corner_stitch ? node.lod_index + 1 : node.lod_index;
-    const float height = height_map.SampleLevel(point_clamp_sampler, uv, lod_index).r;
+    const float height = height_map.SampleLevel(point_clamp_sampler, uv, height_mip_index).r;
 
     const float3 world_position = float3(
         world_xz.x * consts.world_scale,
@@ -208,7 +217,7 @@ float4 ps_main(VsOutput input) : SV_Target {
     const float ndotl = saturate(dot(normal, light_dir));
     const float3 ambient = 0.1;
     
-    float3 color = !consts.is_wireframe ? height_to_color(input.height) : input.debug_color;
+    float3 color = !consts.wireframe_pass ? height_to_color(input.height) : input.debug_color;
     color *= ambient + ndotl;
 
     return float4(color, 1.0);
