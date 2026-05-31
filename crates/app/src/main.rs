@@ -1,12 +1,8 @@
-mod async_compute;
 mod camera;
 mod d3d12_utils;
-mod mesh;
 mod terrain;
 
 use std::ffi::CString;
-use std::mem::ManuallyDrop;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -18,13 +14,12 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::Graphics::Gdi::UpdateWindow;
 use windows::Win32::System::LibraryLoader::GetModuleHandleA;
-use windows::Win32::System::Threading::{CreateEventA, GetCurrentThreadId};
+use windows::Win32::System::Threading::CreateEventA;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{BOOL, Interface, PCSTR, s};
 
 use d3d12_utils::*;
 use imgui_sys::*;
-use mesh::{GpuMesh, LoadThreadPool, LoadedMesh};
 use terrain::{GpuTerrainConsts, MapGeneratorParams, StitchMask, TerrainData};
 
 const WINDOW_REGISTRY_NAME: PCSTR = s!("rust-window");
@@ -33,7 +28,6 @@ const HEIGHT: u32 = 1080;
 const FRAME_COUNT: u32 = 3;
 const BACK_BUFFER_FORMAT: DXGI_FORMAT = DXGI_FORMAT_R8G8B8A8_UNORM;
 const DEPTH_BUFFER_FORMAT: DXGI_FORMAT = DXGI_FORMAT_D32_FLOAT;
-const GPU_MESH_THREAD_POOL_SIZE: usize = 4;
 
 macro_rules! imgui_text {
     ($($arg:tt)*) => {
@@ -72,14 +66,6 @@ fn main() -> Result<()> {
         mouse_dy: 0,
         right_mouse_down: false,
     };
-
-    let (loaded_mesh_sender, loaded_mesh_receiver) = std::sync::mpsc::channel::<Result<LoadedMesh>>();
-    let (ready_mesh_sender, ready_mesh_receiver) = std::sync::mpsc::channel::<GpuMesh>();
-    let load_mesh_thread_pool = LoadThreadPool::new(GPU_MESH_THREAD_POOL_SIZE, loaded_mesh_sender);
-
-    let mut gpu_meshes = Vec::new();
-
-    let mesh_paths = collect_mesh_paths(Path::new("assets"))?;
 
     unsafe {
         let class_atom = RegisterClassA(&WNDCLASSA {
@@ -219,8 +205,8 @@ fn main() -> Result<()> {
             NodeMask: 0,
         })?;
 
-        let render_fence = device.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE)?;
-        let render_fence_event = CreateEventA(None, false, false, s!("render_fence_event"))?;
+        let fence = device.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE)?;
+        let fence_event = CreateEventA(None, false, false, s!("render_fence_event"))?;
 
         let swap_chain = {
             let mut is_tearring_supported: u32 = 0;
@@ -330,7 +316,7 @@ fn main() -> Result<()> {
             .try_into()
             .expect("0..FRAME_COUNT must produce exactly FRAME_COUNT elements");
 
-        let render_cmd_list = device.CreateCommandList1::<ID3D12GraphicsCommandList6>(
+        let cmd_list = device.CreateCommandList1::<ID3D12GraphicsCommandList6>(
             0,
             D3D12_COMMAND_LIST_TYPE_DIRECT,
             D3D12_COMMAND_LIST_FLAG_NONE,
@@ -413,73 +399,6 @@ fn main() -> Result<()> {
             device.CreateRootSignature::<ID3D12RootSignature>(0, bytecode)?
         };
 
-        let pso = {
-            let vs_blob = std::fs::read(Path::new("target/dxil/triangle.vs.dxil"))?;
-            let ps_blob = std::fs::read(Path::new("target/dxil/triangle.ps.dxil"))?;
-
-            let input_elements = [
-                D3D12_INPUT_ELEMENT_DESC {
-                    SemanticName: s!("sem_Position"),
-                    SemanticIndex: 0,
-                    Format: DXGI_FORMAT_R32G32B32_FLOAT,
-                    InputSlot: 0,
-                    AlignedByteOffset: 0,
-                    InputSlotClass: D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
-                    InstanceDataStepRate: 0,
-                },
-                D3D12_INPUT_ELEMENT_DESC {
-                    SemanticName: s!("sem_Normal"),
-                    SemanticIndex: 0,
-                    Format: DXGI_FORMAT_R32G32B32_FLOAT,
-                    InputSlot: 0,
-                    AlignedByteOffset: size_of::<f32>() as u32 * 3,
-                    InputSlotClass: D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
-                    InstanceDataStepRate: 0,
-                },
-            ];
-
-            device.CreateGraphicsPipelineState::<ID3D12PipelineState>(&D3D12_GRAPHICS_PIPELINE_STATE_DESC {
-                pRootSignature: ManuallyDrop::new(std::mem::transmute_copy(&root_signature)),
-                VS: D3D12_SHADER_BYTECODE::from_slice(&vs_blob),
-                PS: D3D12_SHADER_BYTECODE::from_slice(&ps_blob),
-                BlendState: D3D12_BLEND_DESC {
-                    RenderTarget: {
-                        let mut render_targets = [D3D12_RENDER_TARGET_BLEND_DESC::default(); 8];
-                        render_targets[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8;
-                        render_targets
-                    },
-                    ..Default::default()
-                },
-                SampleMask: u32::MAX,
-                RasterizerState: D3D12_RASTERIZER_DESC {
-                    FillMode: D3D12_FILL_MODE_SOLID,
-                    CullMode: D3D12_CULL_MODE_BACK,
-                    FrontCounterClockwise: BOOL(0),
-                    ..Default::default()
-                },
-                DepthStencilState: D3D12_DEPTH_STENCIL_DESC {
-                    DepthEnable: BOOL(1),
-                    DepthWriteMask: D3D12_DEPTH_WRITE_MASK_ALL,
-                    DepthFunc: D3D12_COMPARISON_FUNC_GREATER,
-                    ..Default::default()
-                },
-                InputLayout: D3D12_INPUT_LAYOUT_DESC {
-                    pInputElementDescs: input_elements.as_ptr(),
-                    NumElements: input_elements.len() as u32,
-                },
-                PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
-                NumRenderTargets: 1,
-                RTVFormats: {
-                    let mut formats = [DXGI_FORMAT_UNKNOWN; 8];
-                    formats[0] = BACK_BUFFER_FORMAT;
-                    formats
-                },
-                DSVFormat: DEPTH_BUFFER_FORMAT,
-                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-                ..Default::default()
-            })?
-        };
-
         {
             ImGui_CreateContext(std::ptr::null_mut());
             ImGui_StyleColorsClassic(std::ptr::null_mut());
@@ -514,14 +433,8 @@ fn main() -> Result<()> {
 
         let mut terrain_map_generator = MapGeneratorParams::new(terrain.size as usize * 2);
 
-        let async_compute_thread =
-            async_compute::start_thread(Arc::clone(&device), loaded_mesh_receiver, ready_mesh_sender);
-
         let mut cpu_frame_index = 0;
         let mut frame_timer = FrameTimer::new();
-
-        let mut mesh_spawn_count = 1;
-        let mut pending_mesh_count = 0;
 
         let mut deferred_release = Vec::new();
 
@@ -571,15 +484,10 @@ fn main() -> Result<()> {
             let active_frame_index = swap_chain.GetCurrentBackBufferIndex();
             let cmd_allocator = &cmd_allocators[active_frame_index as usize];
 
-            while let Ok(gpu_mesh) = ready_mesh_receiver.try_recv() {
-                pending_mesh_count -= 1;
-                gpu_meshes.push(gpu_mesh);
-            }
-
             cmd_allocator.Reset()?;
-            render_cmd_list.Reset(cmd_allocator, None)?;
+            cmd_list.Reset(cmd_allocator, None)?;
 
-            render_cmd_list.RSSetViewports(&[D3D12_VIEWPORT {
+            cmd_list.RSSetViewports(&[D3D12_VIEWPORT {
                 TopLeftX: 0.0,
                 TopLeftY: 0.0,
                 Width: WIDTH as f32,
@@ -588,14 +496,14 @@ fn main() -> Result<()> {
                 MaxDepth: 1.0,
             }]);
 
-            render_cmd_list.RSSetScissorRects(&[RECT {
+            cmd_list.RSSetScissorRects(&[RECT {
                 left: 0,
                 top: 0,
                 right: WIDTH as i32,
                 bottom: HEIGHT as i32,
             }]);
 
-            render_cmd_list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER::new_transition(
+            cmd_list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER::new_transition(
                 &back_buffers[active_frame_index as usize],
                 D3D12_RESOURCE_STATE_PRESENT,
                 D3D12_RESOURCE_STATE_RENDER_TARGET,
@@ -603,97 +511,61 @@ fn main() -> Result<()> {
 
             let rtv = rtvs[active_frame_index as usize];
 
-            render_cmd_list.OMSetRenderTargets(1, Some(&rtv), false, Some(&dsv));
-            render_cmd_list.ClearRenderTargetView(rtv, &[0.3, 0.3, 0.3, 1.0], None);
-            render_cmd_list.ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 0.0, 0, None);
+            cmd_list.OMSetRenderTargets(1, Some(&rtv), false, Some(&dsv));
+            cmd_list.ClearRenderTargetView(rtv, &[0.3, 0.3, 0.3, 1.0], None);
+            cmd_list.ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 0.0, 0, None);
 
-            render_cmd_list.SetDescriptorHeaps(&[Some(resource_heap.clone())]);
-            render_cmd_list.SetGraphicsRootSignature(&root_signature);
-
-            render_cmd_list.SetPipelineState(&pso);
-            render_cmd_list.SetGraphicsRoot32BitConstants(0, 16, std::ptr::from_ref(&camera.world_to_clip()).cast(), 0);
-
-            render_cmd_list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-
-            for gpu_mesh in &gpu_meshes {
-                render_cmd_list.SetGraphicsRoot32BitConstants(
-                    0,
-                    16,
-                    std::ptr::from_ref(&gpu_mesh.local_to_world).cast(),
-                    16,
-                );
-
-                render_cmd_list.ResourceBarrier(&[
-                    D3D12_RESOURCE_BARRIER::new_transition(
-                        &gpu_mesh.vertex_buffer,
-                        D3D12_RESOURCE_STATE_COPY_DEST,
-                        D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER,
-                    ),
-                    D3D12_RESOURCE_BARRIER::new_transition(
-                        &gpu_mesh.index_buffer,
-                        D3D12_RESOURCE_STATE_COPY_DEST,
-                        D3D12_RESOURCE_STATE_INDEX_BUFFER,
-                    ),
-                ]);
-
-                render_cmd_list.IASetVertexBuffers(0, Some(&[gpu_mesh.vbv]));
-                render_cmd_list.IASetIndexBuffer(Some(&gpu_mesh.ibv));
-
-                for draw in &gpu_mesh.draws {
-                    render_cmd_list.DrawIndexedInstanced(
-                        draw.index_count,
-                        1,
-                        draw.index_offset,
-                        draw.vertex_offset as i32,
-                        0,
-                    );
-                }
-            }
+            cmd_list.SetDescriptorHeaps(&[Some(resource_heap.clone())]);
+            cmd_list.SetGraphicsRootSignature(&root_signature);
 
             {
                 // TODO: Should be used storage per frame"
                 terrain.node_buffer.map_and_write(terrain_nodes.as_slice())?;
 
-                if mesh_pipeline_enabled {
-                    let mut consts = GpuTerrainConsts {
-                        terrain_size: terrain.size,
-                        world_scale: 1.0,
-                        height_scale: terrain.height_scale,
-                        wireframe_pass: false.into(),
-                        stitching_enabled: stitching_enabled.into(),
-                    };
+                let mut consts = GpuTerrainConsts {
+                    world_to_clip: camera.world_to_clip(),
+                    terrain_size: terrain.size,
+                    world_scale: 1.0,
+                    height_scale: terrain.height_scale,
+                    wireframe_pass: false.into(),
+                    stitching_enabled: stitching_enabled.into(),
+                };
 
-                    render_cmd_list.SetGraphicsRootConstantBufferView(
-                        1,
-                        terrain.solid_const_buffer.write(active_frame_index, &consts),
-                    );
+                cmd_list.SetGraphicsRootConstantBufferView(
+                    1,
+                    terrain.solid_const_buffer.write(active_frame_index, &consts),
+                );
 
-                    render_cmd_list.SetPipelineState(&terrain.mesh_solid_pso);
-                    render_cmd_list.DispatchMesh(terrain_nodes.len() as u32, 1, 1);
+                let render_terrain = |vertex_pso: &ID3D12PipelineState, mesh_pso: &ID3D12PipelineState| {
+                    if mesh_pipeline_enabled {
+                        cmd_list.SetPipelineState(mesh_pso);
+                        cmd_list.DispatchMesh(terrain_nodes.len() as u32, 1, 1);
+                    } else {
+                        cmd_list.SetPipelineState(vertex_pso);
+                        cmd_list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                        cmd_list.IASetIndexBuffer(Some(&terrain.chunk_ibv));
 
-                    if wireframe_enabled {
-                        consts.wireframe_pass = true.into();
-
-                        render_cmd_list.SetGraphicsRootConstantBufferView(
-                            1,
-                            terrain.wireframe_const_buffer.write(active_frame_index, &consts),
+                        cmd_list.DrawIndexedInstanced(
+                            terrain.chunk_index_count as u32,
+                            terrain_nodes.len() as u32,
+                            0,
+                            0,
+                            0,
                         );
-
-                        render_cmd_list.SetPipelineState(&terrain.mesh_wireframe_pso);
-                        render_cmd_list.DispatchMesh(terrain_nodes.len() as u32, 1, 1);
                     }
-                } else {
-                    render_cmd_list.SetPipelineState(&terrain.vertex_pso);
-                    render_cmd_list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-                    render_cmd_list.IASetIndexBuffer(Some(&terrain.chunk_ibv));
+                };
 
-                    render_cmd_list.DrawIndexedInstanced(
-                        terrain.chunk_index_count as u32,
-                        terrain_nodes.len() as u32,
-                        0,
-                        0,
-                        0,
+                render_terrain(&terrain.solid_vertex_pso, &terrain.solid_mesh_pso);
+
+                if wireframe_enabled {
+                    consts.wireframe_pass = true.into();
+
+                    cmd_list.SetGraphicsRootConstantBufferView(
+                        1,
+                        terrain.wireframe_const_buffer.write(active_frame_index, &consts),
                     );
+
+                    render_terrain(&terrain.wireframe_vertex_pso, &terrain.wireframe_mesh_pso);
                 }
             }
 
@@ -701,6 +573,26 @@ fn main() -> Result<()> {
                 cimgui_implwin32_new_frame();
                 cimgui_impldx12_new_frame();
                 ImGui_NewFrame();
+
+                ImGui_Begin(c"App".as_ptr(), std::ptr::null_mut(), 0);
+                {
+                    imgui_text!("FPS: {} ({:.2} ms)", fps, dt * 1000.0);
+
+                    let mut local_mem = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+                    let mut host_mem = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+
+                    adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut local_mem)?;
+                    adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &mut host_mem)?;
+
+                    imgui_text!(
+                        "Local VRAM: {} / {} mb",
+                        local_mem.CurrentUsage / (1024 * 1024),
+                        local_mem.Budget / (1024 * 1024)
+                    );
+
+                    imgui_text!("Host VRAM: {} mb", host_mem.CurrentUsage / (1024 * 1024));
+                }
+                ImGui_End();
 
                 ImGui_Begin(c"HeightMap".as_ptr(), std::ptr::null_mut(), 0);
                 {
@@ -784,9 +676,9 @@ fn main() -> Result<()> {
                         );
 
                         let height_upload_buffer =
-                            render_cmd_list.upload_mips(&device, map_data.height_mips.as_slice(), &height_map)?;
+                            cmd_list.upload_mips(&device, map_data.height_mips.as_slice(), &height_map)?;
                         let normal_upload_buffer =
-                            render_cmd_list.upload_mips(&device, map_data.normal_mips.as_slice(), &normal_map)?;
+                            cmd_list.upload_mips(&device, map_data.normal_mips.as_slice(), &normal_map)?;
 
                         deferred_release.push((cpu_frame_index, height_upload_buffer.cast::<ID3D12Object>()?));
                         deferred_release.push((cpu_frame_index, normal_upload_buffer.cast::<ID3D12Object>()?));
@@ -941,53 +833,10 @@ fn main() -> Result<()> {
                 }
                 ImGui_End();
 
-                ImGui_Begin(c"Hello Rust".as_ptr(), std::ptr::null_mut(), 0);
-                {
-                    imgui_text!("Main TID: {}", GetCurrentThreadId());
-                    imgui_text!("FPS: {} ({:.2} ms)", fps, dt * 1000.0);
-
-                    let mut local_mem = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
-                    let mut host_mem = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
-
-                    adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut local_mem)?;
-                    adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &mut host_mem)?;
-
-                    imgui_text!(
-                        "Local VRAM: {} / {} mb",
-                        local_mem.CurrentUsage / (1024 * 1024),
-                        local_mem.Budget / (1024 * 1024)
-                    );
-
-                    imgui_text!("Host VRAM: {} mb", host_mem.CurrentUsage / (1024 * 1024));
-
-                    ImGui_NewLine();
-
-                    imgui_text!("Mesh count: {}", gpu_meshes.len());
-
-                    ImGui_InputInt(c"Spawn count".as_ptr(), &mut mesh_spawn_count);
-
-                    for path in &mesh_paths {
-                        let button_text =
-                            CString::new(format!("Load '{}'", path.file_name().unwrap().to_str().unwrap())).unwrap();
-
-                        if ImGui_Button(button_text.as_ptr()) {
-                            for _ in 0..mesh_spawn_count {
-                                load_mesh_thread_pool.submit(&device, path.clone());
-                                pending_mesh_count += 1;
-                            }
-                        }
-                    }
-
-                    if pending_mesh_count > 0 {
-                        imgui_text!("Loading... ({} pending)", pending_mesh_count);
-                    }
-                }
-                ImGui_End();
-
                 ImGui_ShowDemoWindow(std::ptr::null_mut());
                 ImGui_Render();
 
-                cimgui_impldx12_render_draw_data(ImGui_GetDrawData(), render_cmd_list.as_raw() as *mut _);
+                cimgui_impldx12_render_draw_data(ImGui_GetDrawData(), cmd_list.as_raw() as *mut _);
 
                 let io = *ImGui_GetIO();
                 if io.ConfigFlags & ImGuiConfigFlags_ViewportsEnable != 0 {
@@ -996,31 +845,31 @@ fn main() -> Result<()> {
                 }
             }
 
-            render_cmd_list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER::new_transition(
+            cmd_list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER::new_transition(
                 &back_buffers[active_frame_index as usize],
                 D3D12_RESOURCE_STATE_RENDER_TARGET,
                 D3D12_RESOURCE_STATE_PRESENT,
             )]);
 
-            render_cmd_list.Close()?;
+            cmd_list.Close()?;
 
-            cmd_queue.ExecuteCommandLists(&[Some(render_cmd_list.cast::<ID3D12CommandList>()?)]);
+            cmd_queue.ExecuteCommandLists(&[Some(cmd_list.cast::<ID3D12CommandList>()?)]);
 
             swap_chain.Present(0, DXGI_PRESENT_ALLOW_TEARING).ok()?;
-            cmd_queue.Signal(&render_fence, cpu_frame_index)?;
+            cmd_queue.Signal(&fence, cpu_frame_index)?;
 
-            let mut gpu_frame_index = render_fence.GetCompletedValue();
+            let mut gpu_frame_index = fence.GetCompletedValue();
             if cpu_frame_index - gpu_frame_index >= FRAME_COUNT as u64 {
                 let gpu_frame_index_to_wait = cpu_frame_index - FRAME_COUNT as u64 + 1;
-                wait_for_gpu(&render_fence, render_fence_event, gpu_frame_index_to_wait)?;
+                wait_for_gpu(&fence, fence_event, gpu_frame_index_to_wait)?;
 
-                gpu_frame_index = render_fence.GetCompletedValue();
+                gpu_frame_index = fence.GetCompletedValue();
             }
 
             deferred_release.retain(|&(frame_index, _)| frame_index > gpu_frame_index);
         }
 
-        wait_for_gpu(&render_fence, render_fence_event, cpu_frame_index)?;
+        wait_for_gpu(&fence, fence_event, cpu_frame_index)?;
 
         {
             cimgui_impldx12_shutdown();
@@ -1030,26 +879,18 @@ fn main() -> Result<()> {
 
         assert!(deferred_release.is_empty());
 
-        for gpu_mesh in gpu_meshes {
-            drop(gpu_mesh.vertex_buffer);
-            drop(gpu_mesh.index_buffer);
-        }
-
-        drop(load_mesh_thread_pool);
-        _ = async_compute_thread.join().unwrap();
-
         drop(terrain.solid_const_buffer);
         drop(terrain.wireframe_const_buffer);
         drop(terrain.node_buffer);
         drop(terrain.chunk_index_buffer);
         drop(terrain.height_map);
         drop(terrain.normal_map);
-        drop(terrain.vertex_pso);
-        drop(terrain.mesh_solid_pso);
-        drop(terrain.mesh_wireframe_pso);
-        drop(pso);
+        drop(terrain.solid_vertex_pso);
+        drop(terrain.solid_mesh_pso);
+        drop(terrain.wireframe_vertex_pso);
+        drop(terrain.wireframe_mesh_pso);
         drop(root_signature);
-        drop(render_cmd_list);
+        drop(cmd_list);
         drop(cmd_allocators);
         drop(resource_heap);
         drop(dsv_heap);
@@ -1057,8 +898,8 @@ fn main() -> Result<()> {
         drop(depth_buffer);
         drop(back_buffers);
         drop(swap_chain);
-        CloseHandle(render_fence_event)?;
-        drop(render_fence);
+        CloseHandle(fence_event)?;
+        drop(fence);
         drop(cmd_queue);
 
         if cfg!(debug_assertions) {
@@ -1165,22 +1006,4 @@ impl FrameTimer {
 
         (delta.as_secs_f32(), self.fps)
     }
-}
-
-fn collect_mesh_paths(dir: &Path) -> Result<Vec<PathBuf>> {
-    // Could be more efficient if Vec is passed as &mut,
-    // but for app startup this is fine
-    let mut result = Vec::new();
-
-    for entry in std::fs::read_dir(dir)?.flatten() {
-        let path = entry.path();
-
-        if path.is_dir() {
-            result.extend(collect_mesh_paths(&path)?);
-        } else if matches!(path.extension().and_then(|e| e.to_str()), Some("glb") | Some("gltf")) {
-            result.push(path);
-        }
-    }
-
-    Ok(result)
 }

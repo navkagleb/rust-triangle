@@ -11,12 +11,8 @@ struct VsOutput {
     float height : Height;
 };
 
-struct FrameConsts {
-    float4x4 world_to_clip;
-    float4x4 local_to_world;
-};
-
 struct TerrainConsts {
+    float4x4 world_to_clip;
     float terrain_size;
     float world_scale;
     float height_scale;
@@ -31,7 +27,6 @@ struct TerrainNode {
     uint stitch_mask;
 };
 
-ConstantBuffer<FrameConsts> frame_consts;
 ConstantBuffer<TerrainConsts> consts : register(b0, space1);
 
 SamplerState point_clamp_sampler : register(s0, space0);
@@ -171,7 +166,7 @@ VsOutput ProcessVertex(uint vertex_id, uint instance_id) {
     );
 
     VsOutput output = (VsOutput)0;
-    output.clip_position = mul(frame_consts.world_to_clip, float4(world_position, 1.0));
+    output.clip_position = mul(consts.world_to_clip, float4(world_position, 1.0));
     output.debug_color = node_color(node);
     output.lod_index = node.lod_index;
     output.uv = uv;

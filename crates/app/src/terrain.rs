@@ -1,6 +1,6 @@
 use anyhow::Result;
 use bitflags::bitflags;
-use glam::{Vec2, Vec3, f32};
+use glam::{Mat4, Vec2, Vec3, f32};
 use noise::utils::{NoiseMapBuilder, PlaneMapBuilder};
 use noise::{Fbm, MultiFractal, Perlin};
 use windows::Win32::Graphics::Direct3D12::*;
@@ -36,6 +36,7 @@ pub struct GpuTerrainNode {
 
 #[repr(C)]
 pub struct GpuTerrainConsts {
+    pub world_to_clip: Mat4,
     pub terrain_size: f32,
     pub world_scale: f32,
     pub height_scale: f32,
@@ -60,9 +61,10 @@ pub struct TerrainData {
     pub height_map: Option<ID3D12Resource>,
     pub normal_map: Option<ID3D12Resource>,
 
-    pub vertex_pso: ID3D12PipelineState,
-    pub mesh_solid_pso: ID3D12PipelineState,
-    pub mesh_wireframe_pso: ID3D12PipelineState,
+    pub solid_vertex_pso: ID3D12PipelineState,
+    pub solid_mesh_pso: ID3D12PipelineState,
+    pub wireframe_vertex_pso: ID3D12PipelineState,
+    pub wireframe_mesh_pso: ID3D12PipelineState,
 }
 
 impl TerrainData {
@@ -124,13 +126,6 @@ impl TerrainData {
         let ms_blob = std::fs::read(std::path::Path::new("target/dxil/terrain.ms.dxil"))?;
         let ps_blob = std::fs::read(std::path::Path::new("target/dxil/terrain.ps.dxil"))?;
 
-        let rasterizer_state = D3D12_RASTERIZER_DESC {
-            FillMode: D3D12_FILL_MODE_SOLID,
-            CullMode: D3D12_CULL_MODE_NONE,
-            FrontCounterClockwise: false.into(),
-            ..Default::default()
-        };
-
         let depth_stencil_state = D3D12_DEPTH_STENCIL_DESC {
             DepthEnable: true.into(),
             DepthWriteMask: D3D12_DEPTH_WRITE_MASK_ALL,
@@ -144,35 +139,51 @@ impl TerrainData {
             fmts
         };
 
-        let vertex_pso = {
-            unsafe {
-                device.CreateGraphicsPipelineState::<ID3D12PipelineState>(&D3D12_GRAPHICS_PIPELINE_STATE_DESC {
-                    pRootSignature: std::mem::ManuallyDrop::new(std::mem::transmute_copy(root_signature)),
-                    VS: D3D12_SHADER_BYTECODE::from_slice(&vs_blob),
-                    PS: D3D12_SHADER_BYTECODE::from_slice(&ps_blob),
-                    BlendState: D3D12_BLEND_DESC {
-                        RenderTarget: {
-                            let mut render_targets = [D3D12_RENDER_TARGET_BLEND_DESC::default(); 8];
-                            render_targets[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8;
-                            render_targets
-                        },
-                        ..Default::default()
-                    },
-                    SampleMask: u32::MAX,
-                    RasterizerState: rasterizer_state,
-                    DepthStencilState: depth_stencil_state,
-                    InputLayout: Default::default(),
-                    PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
-                    NumRenderTargets: 1,
-                    RTVFormats: rtv_fmts,
-                    DSVFormat: DEPTH_BUFFER_FORMAT,
-                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-                    ..Default::default()
-                })?
+        let create_rasterizer_state = |fill_mode: D3D12_FILL_MODE| -> D3D12_RASTERIZER_DESC {
+            let mut state = D3D12_RASTERIZER_DESC {
+                FillMode: fill_mode,
+                CullMode: D3D12_CULL_MODE_NONE,
+                FrontCounterClockwise: false.into(),
+                ..Default::default()
+            };
+
+            if fill_mode == D3D12_FILL_MODE_WIREFRAME {
+                state.DepthBias = 1000;
+                state.SlopeScaledDepthBias = 1.0;
             }
+
+            state
         };
 
-        let mesh_solid_pso = {
+        let create_vertex_pso =
+            |rasterizer_state: D3D12_RASTERIZER_DESC| -> windows::core::Result<ID3D12PipelineState> {
+                unsafe {
+                    device.CreateGraphicsPipelineState::<ID3D12PipelineState>(&D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+                        pRootSignature: std::mem::ManuallyDrop::new(std::mem::transmute_copy(root_signature)),
+                        VS: D3D12_SHADER_BYTECODE::from_slice(&vs_blob),
+                        PS: D3D12_SHADER_BYTECODE::from_slice(&ps_blob),
+                        BlendState: D3D12_BLEND_DESC {
+                            RenderTarget: {
+                                let mut render_targets = [D3D12_RENDER_TARGET_BLEND_DESC::default(); 8];
+                                render_targets[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8;
+                                render_targets
+                            },
+                            ..Default::default()
+                        },
+                        SampleMask: u32::MAX,
+                        RasterizerState: rasterizer_state,
+                        DepthStencilState: depth_stencil_state,
+                        PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+                        NumRenderTargets: 1,
+                        RTVFormats: rtv_fmts,
+                        DSVFormat: DEPTH_BUFFER_FORMAT,
+                        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                        ..Default::default()
+                    })
+                }
+            };
+
+        let create_mesh_pso = |rasterizer_state: D3D12_RASTERIZER_DESC| -> windows::core::Result<ID3D12PipelineState> {
             let mut stream = MeshPipelineStream {
                 root_signature: PsoSubobject::new(unsafe { std::mem::transmute_copy(root_signature) }),
                 ms: PsoSubobject::new(D3D12_SHADER_BYTECODE::from_slice(&ms_blob)),
@@ -191,41 +202,14 @@ impl TerrainData {
                 device.CreatePipelineState::<ID3D12PipelineState>(&D3D12_PIPELINE_STATE_STREAM_DESC {
                     SizeInBytes: size_of::<MeshPipelineStream>(),
                     pPipelineStateSubobjectStream: &mut stream as *mut _ as *mut _,
-                })?
-            }
-        };
-
-        let mesh_wireframe_pso = {
-            let mut stream = MeshPipelineStream {
-                root_signature: PsoSubobject::new(unsafe { std::mem::transmute_copy(root_signature) }),
-                ms: PsoSubobject::new(D3D12_SHADER_BYTECODE::from_slice(&ms_blob)),
-                ps: PsoSubobject::new(D3D12_SHADER_BYTECODE::from_slice(&ps_blob)),
-                rasterizer: PsoSubobject::new(D3D12_RASTERIZER_DESC {
-                    FillMode: D3D12_FILL_MODE_WIREFRAME,
-                    CullMode: D3D12_CULL_MODE_NONE,
-                    FrontCounterClockwise: false.into(),
-                    DepthBias: 1000,
-                    SlopeScaledDepthBias: 1.0,
-                    ..Default::default()
-                }),
-                depth_stencil: PsoSubobject::new(depth_stencil_state),
-                rtv_formats: PsoSubobject::new(D3D12_RT_FORMAT_ARRAY {
-                    RTFormats: rtv_fmts,
-                    NumRenderTargets: 1,
-                }),
-                dsv_format: PsoSubobject::new(DEPTH_BUFFER_FORMAT),
-                sample_desc: PsoSubobject::new(DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }),
-            };
-
-            unsafe {
-                device.CreatePipelineState::<ID3D12PipelineState>(&D3D12_PIPELINE_STATE_STREAM_DESC {
-                    SizeInBytes: size_of::<MeshPipelineStream>(),
-                    pPipelineStateSubobjectStream: &mut stream as *mut _ as *mut _,
-                })?
+                })
             }
         };
 
         let size = 256.0;
+
+        let solid_state = create_rasterizer_state(D3D12_FILL_MODE_SOLID);
+        let wireframe_state = create_rasterizer_state(D3D12_FILL_MODE_WIREFRAME);
 
         Ok(Self {
             size,
@@ -244,9 +228,10 @@ impl TerrainData {
             chunk_index_buffer,
             height_map: None,
             normal_map: None,
-            vertex_pso,
-            mesh_solid_pso,
-            mesh_wireframe_pso,
+            solid_vertex_pso: create_vertex_pso(solid_state)?,
+            wireframe_vertex_pso: create_vertex_pso(wireframe_state)?,
+            solid_mesh_pso: create_mesh_pso(solid_state)?,
+            wireframe_mesh_pso: create_mesh_pso(wireframe_state)?,
         })
     }
 
