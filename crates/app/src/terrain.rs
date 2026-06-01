@@ -9,7 +9,10 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use crate::d3d12_utils::{ConstBuffer, D3D12BufferExt, MeshPipelineStream, PsoSubobject, ShaderBytecodeExt};
 use crate::{BACK_BUFFER_FORMAT, DEPTH_BUFFER_FORMAT};
 
-const CHUNK_QUAD_COUNT: usize = 8;
+pub const TILE_PIXEL_SIZE: f32 = 128.0;
+pub const TILE_WORLD_SIZE: f32 = TILE_PIXEL_SIZE * 0.5;
+
+const CELL_QUAD_COUNT: usize = 8;
 
 bitflags! {
     #[repr(transparent)]
@@ -45,19 +48,18 @@ pub struct GpuTerrainConsts {
 }
 
 pub struct TerrainData {
-    pub size: f32,
     pub height_map_size: f32,
     pub lod_factor: f32,
     pub height_scale: f32,
 
-    pub chunk_ibv: D3D12_INDEX_BUFFER_VIEW,
-    pub chunk_index_count: usize,
+    pub cell_ibv: D3D12_INDEX_BUFFER_VIEW,
+    pub cell_index_count: usize,
 
     pub solid_const_buffer: ConstBuffer<GpuTerrainConsts>,
     pub wireframe_const_buffer: ConstBuffer<GpuTerrainConsts>,
 
     pub node_buffer: ID3D12Resource,
-    pub chunk_index_buffer: ID3D12Resource,
+    pub cell_index_buffer: ID3D12Resource,
     pub height_map: Option<ID3D12Resource>,
     pub normal_map: Option<ID3D12Resource>,
 
@@ -71,18 +73,22 @@ impl TerrainData {
     pub fn new(
         device: &ID3D12Device4,
         root_signature: &ID3D12RootSignature,
+        render_distance: f32,
         node_buffer_cpu_srv: D3D12_CPU_DESCRIPTOR_HANDLE,
-        chunk_index_buffer_cpu_srv: D3D12_CPU_DESCRIPTOR_HANDLE,
+        cell_index_buffer_cpu_srv: D3D12_CPU_DESCRIPTOR_HANDLE,
     ) -> Result<Self> {
-        let chunk_indices = generate_chunk_indices();
-        let chunk_index_buffer =
-            ID3D12Resource::new_buffer(device, D3D12_HEAP_TYPE_UPLOAD, size_of_val(chunk_indices.as_slice()))?;
+        let cell_indices = generate_cell_indices();
+        let cell_index_buffer =
+            ID3D12Resource::new_buffer(device, D3D12_HEAP_TYPE_UPLOAD, size_of_val(cell_indices.as_slice()))?;
 
-        chunk_index_buffer.map_and_write(chunk_indices.as_slice())?;
+        cell_index_buffer.map_and_write(cell_indices.as_slice())?;
 
-        let node_size = size_of::<GpuTerrainNode>();
-        let node_count = 1024;
-        let node_buffer = ID3D12Resource::new_buffer(device, D3D12_HEAP_TYPE_UPLOAD, node_count * node_size)?;
+        let max_node_count = (render_distance * 2.0 / TILE_WORLD_SIZE).powi(2) as usize;
+        let node_buffer = ID3D12Resource::new_buffer(
+            device,
+            D3D12_HEAP_TYPE_UPLOAD,
+            max_node_count * size_of::<GpuTerrainNode>(),
+        )?;
 
         unsafe {
             device.CreateShaderResourceView(
@@ -94,8 +100,8 @@ impl TerrainData {
                     Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
                         Buffer: D3D12_BUFFER_SRV {
                             FirstElement: 0,
-                            NumElements: node_count as u32,
-                            StructureByteStride: node_size as u32,
+                            NumElements: max_node_count as u32,
+                            StructureByteStride: size_of::<GpuTerrainNode>() as u32,
                             Flags: D3D12_BUFFER_SRV_FLAG_NONE,
                         },
                     },
@@ -104,7 +110,7 @@ impl TerrainData {
             );
 
             device.CreateShaderResourceView(
-                &chunk_index_buffer,
+                &cell_index_buffer,
                 Some(&D3D12_SHADER_RESOURCE_VIEW_DESC {
                     Format: DXGI_FORMAT_R32_UINT,
                     ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
@@ -112,13 +118,13 @@ impl TerrainData {
                     Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
                         Buffer: D3D12_BUFFER_SRV {
                             FirstElement: 0,
-                            NumElements: chunk_indices.len() as u32,
+                            NumElements: cell_indices.len() as u32,
                             StructureByteStride: 0,
                             Flags: D3D12_BUFFER_SRV_FLAG_NONE,
                         },
                     },
                 }),
-                chunk_index_buffer_cpu_srv,
+                cell_index_buffer_cpu_srv,
             );
         }
 
@@ -206,26 +212,23 @@ impl TerrainData {
             }
         };
 
-        let size = 256.0;
-
         let solid_state = create_rasterizer_state(D3D12_FILL_MODE_SOLID);
         let wireframe_state = create_rasterizer_state(D3D12_FILL_MODE_WIREFRAME);
 
         Ok(Self {
-            size,
-            height_map_size: size * 2.0,
-            lod_factor: 5.0,
+            height_map_size: 256.0 * 2.0,
+            lod_factor: 4.0,
             height_scale: 15.0,
             solid_const_buffer: ConstBuffer::new(device)?,
             wireframe_const_buffer: ConstBuffer::new(device)?,
-            chunk_ibv: D3D12_INDEX_BUFFER_VIEW {
-                BufferLocation: unsafe { chunk_index_buffer.GetGPUVirtualAddress() },
-                SizeInBytes: size_of_val(chunk_indices.as_slice()) as u32,
+            cell_ibv: D3D12_INDEX_BUFFER_VIEW {
+                BufferLocation: unsafe { cell_index_buffer.GetGPUVirtualAddress() },
+                SizeInBytes: size_of_val(cell_indices.as_slice()) as u32,
                 Format: DXGI_FORMAT_R32_UINT,
             },
-            chunk_index_count: chunk_indices.len(),
+            cell_index_count: cell_indices.len(),
             node_buffer,
-            chunk_index_buffer,
+            cell_index_buffer,
             height_map: None,
             normal_map: None,
             solid_vertex_pso: create_vertex_pso(solid_state)?,
@@ -235,9 +238,12 @@ impl TerrainData {
         })
     }
 
-    pub fn collect_nodes(&self, camera_position: &Vec3) -> Vec<GpuTerrainNode> {
-        let min_node_size = (self.size / self.height_map_size) * CHUNK_QUAD_COUNT as f32;
-        let qtree = QuadTree::new(self.size, min_node_size, self.lod_factor, camera_position);
+    pub fn collect_nodes(&self, camera_position: &Vec3, render_distance: f32) -> Vec<GpuTerrainNode> {
+        let root_center = Vec2::new(
+            (camera_position.x / TILE_WORLD_SIZE).round() * TILE_WORLD_SIZE,
+            (camera_position.z / TILE_WORLD_SIZE).round() * TILE_WORLD_SIZE,
+        );
+        let qtree = QuadTree::new(root_center, render_distance, camera_position, self.lod_factor);
         let leafs = qtree.collect_leafs();
 
         let is_neighbor_coarser = |node: &QuadTreeNode, direction: Vec2| -> bool {
@@ -306,26 +312,12 @@ struct QuadTree {
     root: QuadTreeNode,
 }
 
-struct QuadSplitParams<'a> {
-    camera_position: &'a Vec3,
-    min_node_size: f32,
-    lod_factor: f32,
-}
-
 impl QuadTree {
-    fn new(size: f32, min_node_size: f32, lod_factor: f32, camera_position: &Vec3) -> Self {
-        let half_size = size / 2.0;
-        let max_depth = (size / CHUNK_QUAD_COUNT as f32).log2() as u32;
-        let mut root = QuadTreeNode::new(Vec2::new(half_size, half_size), half_size, max_depth);
+    fn new(root_center: Vec2, root_half_size: f32, camera_position: &Vec3, lod_factor: f32) -> Self {
+        let root_lod_index = (root_half_size * 2.0 / TILE_WORLD_SIZE).log2() as u32;
+        let mut root = QuadTreeNode::new(root_center, root_half_size, root_lod_index);
 
-        Self::split_recursive(
-            &mut root,
-            &QuadSplitParams {
-                camera_position,
-                min_node_size,
-                lod_factor,
-            },
-        );
+        Self::split_recursive(&mut root, camera_position, lod_factor);
 
         Self { root }
     }
@@ -337,13 +329,14 @@ impl QuadTree {
         leafs
     }
 
-    fn split_recursive(node: &mut QuadTreeNode, params: &QuadSplitParams) {
-        if node.half_size <= params.min_node_size {
+    fn split_recursive(node: &mut QuadTreeNode, camera_position: &Vec3, lod_factor: f32) {
+        // || node.lod_index == 0
+        if node.half_size <= TILE_WORLD_SIZE * 0.5 {
             return;
         }
 
-        let distance = (params.camera_position - Vec3::new(node.center.x, 0.0, node.center.y)).length();
-        if distance >= node.half_size * params.lod_factor {
+        let distance = (camera_position - Vec3::new(node.center.x, 0.0, node.center.y)).length();
+        if distance >= node.half_size * lod_factor {
             return;
         }
 
@@ -374,7 +367,7 @@ impl QuadTree {
         ]));
 
         for child in node.children.as_mut().unwrap().iter_mut() {
-            Self::split_recursive(child, params);
+            Self::split_recursive(child, camera_position, lod_factor);
         }
     }
 
@@ -390,14 +383,14 @@ impl QuadTree {
     }
 }
 
-fn generate_chunk_indices() -> Vec<u32> {
-    let mut indices = Vec::with_capacity(CHUNK_QUAD_COUNT * CHUNK_QUAD_COUNT * 6);
+fn generate_cell_indices() -> Vec<u32> {
+    let mut indices = Vec::with_capacity(CELL_QUAD_COUNT * CELL_QUAD_COUNT * 6);
 
-    for z in 0..CHUNK_QUAD_COUNT {
-        for x in 0..CHUNK_QUAD_COUNT {
-            let tl = (z * (CHUNK_QUAD_COUNT + 1) + x) as u32;
+    for z in 0..CELL_QUAD_COUNT {
+        for x in 0..CELL_QUAD_COUNT {
+            let tl = (z * (CELL_QUAD_COUNT + 1) + x) as u32;
             let tr = tl + 1;
-            let bl = tl + (CHUNK_QUAD_COUNT + 1) as u32;
+            let bl = tl + (CELL_QUAD_COUNT + 1) as u32;
             let br = bl + 1;
 
             indices.push(tl);

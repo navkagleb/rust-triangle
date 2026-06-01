@@ -84,8 +84,8 @@ float3 hsv_to_rgb(float h, float s, float v) {
 }
 
 float3 node_color(TerrainNode node) {
-    const uint x = (uint)(node.center.x / node.half_size);
-    const uint z = (uint)(node.center.y / node.half_size);
+    const int x = (int)(node.center.x / node.half_size);
+    const int z = (int)(node.center.y / node.half_size);
     const uint lod = node.lod_index;
 
     uint hash = x * 73856093u;
@@ -104,11 +104,11 @@ float3 node_color(TerrainNode node) {
 static const uint HEIGHT_MAP_INDEX = 1;
 static const uint NORMAL_MAP_INDEX = 2;
 static const uint TERRAIN_NODE_BUFFER_INDEX = 3;
-static const uint CHUNK_INDEX_BUFFER_INDEX = 4;
+static const uint CELL_INDEX_BUFFER_INDEX = 4;
 
-static const uint CHUNK_QUAD_COUNT = 8;
-static const uint CHUNK_VERTEX_COUNT = (CHUNK_QUAD_COUNT + 1) * (CHUNK_QUAD_COUNT + 1);
-static const uint CHUNK_TRIANGLE_COUNT = CHUNK_QUAD_COUNT * CHUNK_QUAD_COUNT * 2;
+static const uint CELL_QUAD_COUNT = 8;
+static const uint CELL_VERTEX_COUNT = (CELL_QUAD_COUNT + 1) * (CELL_QUAD_COUNT + 1);
+static const uint CELL_TRIANGLE_COUNT = CELL_QUAD_COUNT * CELL_QUAD_COUNT * 2;
 
 static const uint TOP_STITCH_BIT = 1 << 0;
 static const uint BOTTOM_STITCH_BIT = 1 << 1;
@@ -125,14 +125,14 @@ VsOutput ProcessVertex(uint vertex_id, uint instance_id) {
 
     const TerrainNode node = nodes[instance_id];
 
-    uint vx = vertex_id % (CHUNK_QUAD_COUNT + 1);
-    uint vz = vertex_id / (CHUNK_QUAD_COUNT + 1);
+    int vx = vertex_id % (CELL_QUAD_COUNT + 1);
+    int vz = vertex_id / (CELL_QUAD_COUNT + 1);
     uint height_mip_index = node.lod_index;
 
     if (consts.stitching_enabled)
     {
-        const bool stitch_x = (vz == 0 && node.stitch_mask & TOP_STITCH_BIT) || (vz == CHUNK_QUAD_COUNT && node.stitch_mask & BOTTOM_STITCH_BIT);
-        const bool stitch_z = (vx == 0 && node.stitch_mask & LEFT_STITCH_BIT) || (vx == CHUNK_QUAD_COUNT && node.stitch_mask & RIGHT_STITCH_BIT);
+        const bool stitch_x = (vz == 0 && node.stitch_mask & TOP_STITCH_BIT) || (vz == CELL_QUAD_COUNT && node.stitch_mask & BOTTOM_STITCH_BIT);
+        const bool stitch_z = (vx == 0 && node.stitch_mask & LEFT_STITCH_BIT) || (vx == CELL_QUAD_COUNT && node.stitch_mask & RIGHT_STITCH_BIT);
 
         if (stitch_x) {
             vx = (vx / 2) * 2;
@@ -144,16 +144,16 @@ VsOutput ProcessVertex(uint vertex_id, uint instance_id) {
 
         const bool stitch_corner =
             (vx == 0 && vz == 0 && node.stitch_mask & TOP_LEFT_STITCH_BIT) ||
-            (vx == CHUNK_QUAD_COUNT && vz == 0 && node.stitch_mask & TOP_RIGHT_STITCH_BIT)||
-            (vx == 0 && vz == CHUNK_QUAD_COUNT && node.stitch_mask & BOTTOM_LEFT_STITCH_BIT) ||
-            (vx == CHUNK_QUAD_COUNT && vz == CHUNK_QUAD_COUNT && node.stitch_mask & BOTTOM_RIGHT_STITCH_BIT);
+            (vx == CELL_QUAD_COUNT && vz == 0 && node.stitch_mask & TOP_RIGHT_STITCH_BIT)||
+            (vx == 0 && vz == CELL_QUAD_COUNT && node.stitch_mask & BOTTOM_LEFT_STITCH_BIT) ||
+            (vx == CELL_QUAD_COUNT && vz == CELL_QUAD_COUNT && node.stitch_mask & BOTTOM_RIGHT_STITCH_BIT);
 
         if (stitch_x || stitch_z || stitch_corner) {
             height_mip_index += 1;
         }
     }
 
-    const float2 local = float2(vx, vz) / (float)CHUNK_QUAD_COUNT; // 0..1
+    const float2 local = float2(vx, vz) / (float)CELL_QUAD_COUNT; // 0..1
     const float2 world_xz = node.center + (local - 0.5) * node.half_size * 2.0;
 
     const float2 uv = world_xz / consts.terrain_size;
@@ -184,18 +184,18 @@ VsOutput vs_main(VsInput input) {
 void ms_main(
     uint gtid : SV_GroupThreadID,
     uint gid : SV_GroupID,
-    out vertices VsOutput vertices[CHUNK_VERTEX_COUNT],
-    out indices uint3 triangles[CHUNK_TRIANGLE_COUNT]
+    out vertices VsOutput vertices[CELL_VERTEX_COUNT],
+    out indices uint3 triangles[CELL_TRIANGLE_COUNT]
 ) {
-    SetMeshOutputCounts(CHUNK_VERTEX_COUNT, CHUNK_TRIANGLE_COUNT);
+    SetMeshOutputCounts(CELL_VERTEX_COUNT, CELL_TRIANGLE_COUNT);
 
-    if (gtid < CHUNK_VERTEX_COUNT) {
+    if (gtid < CELL_VERTEX_COUNT) {
         vertices[gtid] = ProcessVertex(gtid, gid);
     }
 
-    const Buffer<uint> index_buffer = ResourceDescriptorHeap[CHUNK_INDEX_BUFFER_INDEX];
+    const Buffer<uint> index_buffer = ResourceDescriptorHeap[CELL_INDEX_BUFFER_INDEX];
 
-    if (gtid < CHUNK_TRIANGLE_COUNT) { 
+    if (gtid < CELL_TRIANGLE_COUNT) { 
         triangles[gtid] = uint3(
             index_buffer[gtid * 3 + 0],
             index_buffer[gtid * 3 + 1],
@@ -212,8 +212,11 @@ float4 ps_main(VsOutput input) : SV_Target {
     const float ndotl = saturate(dot(normal, light_dir));
     const float3 ambient = 0.1;
     
-    float3 color = !consts.wireframe_pass ? height_to_color(input.height) : input.debug_color;
-    color *= ambient + ndotl;
+    float3 color = consts.wireframe_pass ? input.debug_color : height_to_color(input.height);
+
+    if (!consts.wireframe_pass) {
+        color *= ambient + ndotl;
+    }
 
     return float4(color, 1.0);
 }

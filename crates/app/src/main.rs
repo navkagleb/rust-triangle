@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use glam::Vec2;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Direct3D::*;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -20,7 +21,7 @@ use windows::core::{BOOL, Interface, PCSTR, s};
 
 use d3d12_utils::*;
 use imgui_sys::*;
-use terrain::{GpuTerrainConsts, MapGeneratorParams, StitchMask, TerrainData};
+use terrain::{GpuTerrainConsts, MapGeneratorParams, StitchMask, TILE_WORLD_SIZE, TerrainData};
 
 const WINDOW_REGISTRY_NAME: PCSTR = s!("rust-window");
 const WIDTH: u32 = 1920;
@@ -41,7 +42,7 @@ enum GpuResource {
     TerrainHeightMap,
     TerrainNormalMap,
     TerrainNodeBuffer,
-    TerrainChunkIndexBuffer,
+    TerrainCellIndexBuffer,
     Count,
 }
 
@@ -424,26 +425,29 @@ fn main() -> Result<()> {
             });
         }
 
+        let mut render_distance = 4096.0;
+        let mut freeze_camera = false;
+        let mut mesh_pipeline_enabled = true;
+        let mut wireframe_enabled = true;
+        let mut stitching_enabled = true;
+        let mut draw_tiles = false;
+
+        let mut camera_position: glam::Vec3 = *camera.position();
+
         let mut terrain = TerrainData::new(
             &device,
             &root_signature,
+            render_distance,
             resource_heap.get_cpu_handle(&device, GpuResource::TerrainNodeBuffer as u32),
-            resource_heap.get_cpu_handle(&device, GpuResource::TerrainChunkIndexBuffer as u32),
+            resource_heap.get_cpu_handle(&device, GpuResource::TerrainCellIndexBuffer as u32),
         )?;
 
-        let mut terrain_map_generator = MapGeneratorParams::new(terrain.size as usize * 2);
+        let mut terrain_map_generator = MapGeneratorParams::new(terrain.height_map_size as usize * 2);
 
         let mut cpu_frame_index = 0;
         let mut frame_timer = FrameTimer::new();
 
         let mut deferred_release = Vec::new();
-
-        let mut freeze_camera = false;
-        let mut mesh_pipeline_enabled = true;
-        let mut wireframe_enabled = true;
-        let mut stitching_enabled = true;
-
-        let mut camera_position: glam::Vec3 = *camera.position();
 
         loop {
             {
@@ -479,7 +483,7 @@ fn main() -> Result<()> {
                 camera_position = *camera.position();
             }
 
-            let terrain_nodes = terrain.collect_nodes(&camera_position);
+            let terrain_nodes = terrain.collect_nodes(&camera_position, render_distance);
 
             let active_frame_index = swap_chain.GetCurrentBackBufferIndex();
             let cmd_allocator = &cmd_allocators[active_frame_index as usize];
@@ -524,7 +528,7 @@ fn main() -> Result<()> {
 
                 let mut consts = GpuTerrainConsts {
                     world_to_clip: camera.world_to_clip(),
-                    terrain_size: terrain.size,
+                    terrain_size: render_distance * 2.0,
                     world_scale: 1.0,
                     height_scale: terrain.height_scale,
                     wireframe_pass: false.into(),
@@ -543,10 +547,10 @@ fn main() -> Result<()> {
                     } else {
                         cmd_list.SetPipelineState(vertex_pso);
                         cmd_list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-                        cmd_list.IASetIndexBuffer(Some(&terrain.chunk_ibv));
+                        cmd_list.IASetIndexBuffer(Some(&terrain.cell_ibv));
 
                         cmd_list.DrawIndexedInstanced(
-                            terrain.chunk_index_count as u32,
+                            terrain.cell_index_count as u32,
                             terrain_nodes.len() as u32,
                             0,
                             0,
@@ -596,19 +600,23 @@ fn main() -> Result<()> {
 
                 ImGui_Begin(c"HeightMap".as_ptr(), std::ptr::null_mut(), 0);
                 {
+                    imgui_text!("Active nodes (leafs) {}", terrain_nodes.len());
+                    ImGui_NewLine();
+
+                    ImGui_InputFloat(c"Render distance".as_ptr(), &mut render_distance);
+                    ImGui_Checkbox(c"Freeze camera".as_ptr(), &mut freeze_camera);
+                    ImGui_Checkbox(c"Mesh pipeline".as_ptr(), &mut mesh_pipeline_enabled);
+                    ImGui_Checkbox(c"Wireframe".as_ptr(), &mut wireframe_enabled);
+                    ImGui_Checkbox(c"Stitching".as_ptr(), &mut stitching_enabled);
+                    ImGui_Checkbox(c"Draw tiles".as_ptr(), &mut draw_tiles);
+                    ImGui_NewLine();
+
                     imgui_text!("Camera position: {}", camera.position());
                     ImGui_DragFloat(c"Camera speed".as_ptr(), &mut camera_controller.speed);
                     ImGui_NewLine();
 
                     ImGui_InputFloat(c"Height scale".as_ptr(), &mut terrain.height_scale);
                     ImGui_InputFloat(c"LOD factor".as_ptr(), &mut terrain.lod_factor);
-                    ImGui_InputFloat(c"Terrain size".as_ptr(), &mut terrain.size);
-                    ImGui_NewLine();
-
-                    ImGui_Checkbox(c"Freeze camera".as_ptr(), &mut freeze_camera);
-                    ImGui_Checkbox(c"Mesh pipeline".as_ptr(), &mut mesh_pipeline_enabled);
-                    ImGui_Checkbox(c"Wireframe".as_ptr(), &mut wireframe_enabled);
-                    ImGui_Checkbox(c"Stitching".as_ptr(), &mut stitching_enabled);
                     ImGui_NewLine();
 
                     ImGui_InputInt(
@@ -618,7 +626,7 @@ fn main() -> Result<()> {
                     ImGui_InputFloat(c"Height map scale".as_ptr(), &mut terrain_map_generator.scale);
 
                     if ImGui_Button(c"Generate height map".as_ptr()) {
-                        let map_data = terrain_map_generator.generate(terrain.size as usize);
+                        let map_data = terrain_map_generator.generate(256); // TODO
 
                         let height_format = DXGI_FORMAT_R32_FLOAT;
                         let normal_format = DXGI_FORMAT_R32G32B32_FLOAT;
@@ -713,23 +721,67 @@ fn main() -> Result<()> {
                         );
                     }
 
+                    let minimap_scale = image_size / (render_distance * 2.0);
+
+                    let node_minimap_pos = |node_pos: Vec2| -> Vec2 {
+                        let window_center =
+                            Vec2::new(image_position.x + image_size / 2.0, image_position.y + image_size / 2.0);
+
+                        let root_center = Vec2::new(
+                            (camera_position.x / TILE_WORLD_SIZE).round() * TILE_WORLD_SIZE,
+                            (camera_position.z / TILE_WORLD_SIZE).round() * TILE_WORLD_SIZE,
+                        );
+
+                        let relative = node_pos - root_center;
+
+                        window_center + relative * minimap_scale
+                    };
+
                     let draw_list = ImGui_GetWindowDrawList();
 
+                    if draw_tiles {
+                        let tile_count = (render_distance * 2.0 / TILE_WORLD_SIZE) as i32;
+                        for i in 0..tile_count {
+                            for j in 0..tile_count {
+                                let half_size = TILE_WORLD_SIZE / 2.0 * minimap_scale;
+                                let center = Vec2::new(
+                                    image_position.x + (i as f32 * TILE_WORLD_SIZE * minimap_scale) + half_size,
+                                    image_position.y + (j as f32 * TILE_WORLD_SIZE * minimap_scale) + half_size,
+                                );
+
+                                ImDrawList_AddRectEx(
+                                    draw_list,
+                                    ImVec2 {
+                                        x: center.x - half_size,
+                                        y: center.y - half_size,
+                                    },
+                                    ImVec2 {
+                                        x: center.x + half_size,
+                                        y: center.y + half_size,
+                                    },
+                                    0xB3FF00FF,
+                                    0.0,
+                                    ImDrawFlags_None,
+                                    0.5,
+                                );
+                            }
+                        }
+                    }
+
                     for node in terrain_nodes {
-                        let center_x = image_position.x + (node.center.x / terrain.size) * image_size;
-                        let center_y = image_position.y + (node.center.y / terrain.size) * image_size;
-                        let half_size = (node.half_size / terrain.size) * image_size;
+                        let center = node_minimap_pos(node.center);
+                        let half_size = node.half_size * minimap_scale;
                         let cell_size = half_size * 2.0;
 
                         ImDrawList_AddRectEx(
                             draw_list,
                             ImVec2 {
-                                x: center_x - half_size,
-                                y: center_y - half_size,
+                                x: center.x - half_size,
+                                y: center.y - half_size,
                             },
                             ImVec2 {
-                                x: center_x + half_size,
-                                y: center_y + half_size,
+                                x: center.x + half_size,
+                                y: center.y + half_size,
                             },
                             0xB3FFFFFF,
                             0.0,
@@ -747,8 +799,8 @@ fn main() -> Result<()> {
                         ImDrawList_AddText(
                             draw_list,
                             ImVec2 {
-                                x: center_x - center_label_size.x / 2.0,
-                                y: center_y - center_label_size.y / 2.0,
+                                x: center.x - center_label_size.x / 2.0,
+                                y: center.y - center_label_size.y / 2.0,
                             },
                             0xFFFFFFFF,
                             center_label.as_ptr(),
@@ -769,57 +821,57 @@ fn main() -> Result<()> {
                             (
                                 StitchMask::TOP,
                                 ImVec2 {
-                                    x: center_x - star_size.x / 2.0,
-                                    y: center_y - half_size + padding_y,
+                                    x: center.x - star_size.x / 2.0,
+                                    y: center.y - half_size + padding_y,
                                 },
                             ),
                             (
                                 StitchMask::BOTTOM,
                                 ImVec2 {
-                                    x: center_x - star_size.x / 2.0,
-                                    y: center_y + half_size - star_size.y - padding_y,
+                                    x: center.x - star_size.x / 2.0,
+                                    y: center.y + half_size - star_size.y - padding_y,
                                 },
                             ),
                             (
                                 StitchMask::LEFT,
                                 ImVec2 {
-                                    x: center_x - half_size + padding_x,
-                                    y: center_y - star_size.y / 2.0,
+                                    x: center.x - half_size + padding_x,
+                                    y: center.y - star_size.y / 2.0,
                                 },
                             ),
                             (
                                 StitchMask::RIGHT,
                                 ImVec2 {
-                                    x: center_x + half_size - star_size.x - padding_x,
-                                    y: center_y - star_size.y / 2.0,
+                                    x: center.x + half_size - star_size.x - padding_x,
+                                    y: center.y - star_size.y / 2.0,
                                 },
                             ),
                             (
                                 StitchMask::TOP_LEFT,
                                 ImVec2 {
-                                    x: center_x - half_size + padding_x,
-                                    y: center_y - half_size + padding_y,
+                                    x: center.x - half_size + padding_x,
+                                    y: center.y - half_size + padding_y,
                                 },
                             ),
                             (
                                 StitchMask::TOP_RIGHT,
                                 ImVec2 {
-                                    x: center_x + half_size - star_size.x - padding_x,
-                                    y: center_y - half_size + padding_y,
+                                    x: center.x + half_size - star_size.x - padding_x,
+                                    y: center.y - half_size + padding_y,
                                 },
                             ),
                             (
                                 StitchMask::BOTTOM_LEFT,
                                 ImVec2 {
-                                    x: center_x - half_size + padding_x,
-                                    y: center_y + half_size - star_size.y - padding_y,
+                                    x: center.x - half_size + padding_x,
+                                    y: center.y + half_size - star_size.y - padding_y,
                                 },
                             ),
                             (
                                 StitchMask::BOTTOM_RIGHT,
                                 ImVec2 {
-                                    x: center_x + half_size - star_size.x - padding_x,
-                                    y: center_y + half_size - star_size.y - padding_y,
+                                    x: center.x + half_size - star_size.x - padding_x,
+                                    y: center.y + half_size - star_size.y - padding_y,
                                 },
                             ),
                         ];
@@ -882,7 +934,7 @@ fn main() -> Result<()> {
         drop(terrain.solid_const_buffer);
         drop(terrain.wireframe_const_buffer);
         drop(terrain.node_buffer);
-        drop(terrain.chunk_index_buffer);
+        drop(terrain.cell_index_buffer);
         drop(terrain.height_map);
         drop(terrain.normal_map);
         drop(terrain.solid_vertex_pso);
