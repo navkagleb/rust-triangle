@@ -1,9 +1,10 @@
 use glam::{Mat4, Vec3};
-use windows::Win32::UI::Input::KeyboardAndMouse::VK_SPACE;
+use windows::Win32::UI::Input::KeyboardAndMouse::{VK_SHIFT, VK_SPACE};
 
 use crate::{HEIGHT, InputState, WIDTH};
 
-const MOUSE_SENSITIVITY: f32 = 100.0;
+const MOUSE_SENSITIVITY: f32 = 0.5;
+const SPEED_MULTIPLIER: f32 = 10.0;
 
 pub struct Camera {
     position: Vec3,
@@ -43,10 +44,8 @@ pub struct CameraController {
 impl CameraController {
     pub fn control(&mut self, dt: f32, input: &InputState, camera: &mut Camera) {
         if input.right_mouse_down {
-            let sensitivity = MOUSE_SENSITIVITY * dt;
-
-            self.yaw += input.mouse_dx as f32 * sensitivity;
-            self.pitch += input.mouse_dy as f32 * sensitivity;
+            self.yaw += input.mouse_dx as f32 * MOUSE_SENSITIVITY;
+            self.pitch += input.mouse_dy as f32 * MOUSE_SENSITIVITY;
             self.pitch = self.pitch.clamp(-89.0, 89.0);
         }
 
@@ -60,7 +59,10 @@ impl CameraController {
         )
         .normalize();
 
-        let speed = self.speed * dt;
+        let mut speed = self.speed * dt;
+        if input.keys[VK_SHIFT.0 as usize] {
+            speed *= SPEED_MULTIPLIER;
+        }
 
         if input.keys[b'W' as usize] {
             camera.position += front_dir * speed;
