@@ -21,7 +21,7 @@ use windows::core::{BOOL, Interface, PCSTR, s};
 
 use d3d12_utils::*;
 use imgui_sys::*;
-use terrain::{GpuTerrainConsts, MapGeneratorParams, StitchMask, TILE_WORLD_SIZE, TerrainData};
+use terrain::*;
 
 const WINDOW_REGISTRY_NAME: PCSTR = s!("rust-window");
 const WIDTH: u32 = 1920;
@@ -39,8 +39,9 @@ macro_rules! imgui_text {
 #[repr(u32)]
 enum GpuResource {
     ImGuiFont,
-    TerrainHeightMap,
-    TerrainNormalMap,
+    TerrainHeightAtlas,
+    #[allow(unused)]
+    TerrainNormalAtlas,
     TerrainNodeBuffer,
     TerrainCellIndexBuffer,
     Count,
@@ -425,29 +426,20 @@ fn main() -> Result<()> {
             });
         }
 
-        let mut render_distance = 4096.0;
         let mut freeze_camera = false;
         let mut mesh_pipeline_enabled = true;
         let mut wireframe_enabled = true;
         let mut stitching_enabled = true;
         let mut draw_tiles = false;
+        let mut draw_quad_tree = true;
 
         let mut camera_position: glam::Vec3 = *camera.position();
 
-        let mut terrain = TerrainData::new(
-            &device,
-            &root_signature,
-            render_distance,
-            resource_heap.get_cpu_handle(&device, GpuResource::TerrainNodeBuffer as u32),
-            resource_heap.get_cpu_handle(&device, GpuResource::TerrainCellIndexBuffer as u32),
-        )?;
-
-        let mut terrain_map_generator = MapGeneratorParams::new(terrain.height_map_size as usize * 2);
+        let mut terrain = TerrainData::new(&device, &resource_heap, &root_signature)?;
 
         let mut cpu_frame_index = 0;
+        let mut gpu_frame_index = 0;
         let mut frame_timer = FrameTimer::new();
-
-        let mut deferred_release = Vec::new();
 
         loop {
             {
@@ -470,6 +462,7 @@ fn main() -> Result<()> {
 
             cpu_frame_index += 1;
 
+            // Update
             let (dt, fps) = frame_timer.tick();
 
             {
@@ -483,8 +476,9 @@ fn main() -> Result<()> {
                 camera_position = *camera.position();
             }
 
-            let terrain_nodes = terrain.collect_nodes(&camera_position, render_distance);
+            let terrain_nodes = terrain.collect_nodes(&camera_position)?;
 
+            // Render
             let active_frame_index = swap_chain.GetCurrentBackBufferIndex();
             let cmd_allocator = &cmd_allocators[active_frame_index as usize];
 
@@ -523,13 +517,12 @@ fn main() -> Result<()> {
             cmd_list.SetGraphicsRootSignature(&root_signature);
 
             {
-                // TODO: Should be used storage per frame"
-                terrain.node_buffer.map_and_write(terrain_nodes.as_slice())?;
+                terrain.upload_tiles_to_gpu(&device, &cmd_list, cpu_frame_index, gpu_frame_index)?;
 
                 let mut consts = GpuTerrainConsts {
                     world_to_clip: camera.world_to_clip(),
-                    terrain_size: render_distance * 2.0,
-                    world_scale: 1.0,
+                    world_center_tile: terrain.world_center_tile.as_vec2(),
+                    world_scale: terrain.world_scale,
                     height_scale: terrain.height_scale,
                     wireframe_pass: false.into(),
                     stitching_enabled: stitching_enabled.into(),
@@ -600,105 +593,30 @@ fn main() -> Result<()> {
 
                 ImGui_Begin(c"HeightMap".as_ptr(), std::ptr::null_mut(), 0);
                 {
-                    imgui_text!("Active nodes (leafs) {}", terrain_nodes.len());
+                    imgui_text!("Render distance: {}", RENDER_DISTANCE);
+                    imgui_text!("Active nodes (leafs): {}", terrain_nodes.len());
+                    imgui_text!("Requested tiles: {}", terrain.requested_count);
+                    imgui_text!("Generated tiles: {}", terrain.generated_count);
+                    imgui_text!("Uploading tiles: {}", terrain.uploading_count);
+                    imgui_text!("Resident tiles: {}", terrain.resident_count);
                     ImGui_NewLine();
 
-                    ImGui_InputFloat(c"Render distance".as_ptr(), &mut render_distance);
                     ImGui_Checkbox(c"Freeze camera".as_ptr(), &mut freeze_camera);
                     ImGui_Checkbox(c"Mesh pipeline".as_ptr(), &mut mesh_pipeline_enabled);
                     ImGui_Checkbox(c"Wireframe".as_ptr(), &mut wireframe_enabled);
                     ImGui_Checkbox(c"Stitching".as_ptr(), &mut stitching_enabled);
                     ImGui_Checkbox(c"Draw tiles".as_ptr(), &mut draw_tiles);
+                    ImGui_Checkbox(c"Draw quad tree".as_ptr(), &mut draw_quad_tree);
                     ImGui_NewLine();
 
                     imgui_text!("Camera position: {}", camera.position());
                     ImGui_DragFloat(c"Camera speed".as_ptr(), &mut camera_controller.speed);
                     ImGui_NewLine();
 
-                    ImGui_InputFloat(c"Height scale".as_ptr(), &mut terrain.height_scale);
                     ImGui_InputFloat(c"LOD factor".as_ptr(), &mut terrain.lod_factor);
+                    ImGui_InputFloat(c"Height scale".as_ptr(), &mut terrain.height_scale);
+                    ImGui_InputFloat(c"World scale".as_ptr(), &mut terrain.world_scale);
                     ImGui_NewLine();
-
-                    ImGui_InputInt(
-                        c"Height map size".as_ptr(),
-                        &mut terrain_map_generator.size as *mut usize as _,
-                    );
-                    ImGui_InputFloat(c"Height map scale".as_ptr(), &mut terrain_map_generator.scale);
-
-                    if ImGui_Button(c"Generate height map".as_ptr()) {
-                        let map_data = terrain_map_generator.generate(256); // TODO
-
-                        let height_format = DXGI_FORMAT_R32_FLOAT;
-                        let normal_format = DXGI_FORMAT_R32G32B32_FLOAT;
-
-                        let height_map = ID3D12Resource::new_texture(
-                            &device,
-                            height_format,
-                            terrain_map_generator.size as u32,
-                            terrain_map_generator.size as u32,
-                            map_data.height_mips.len() as u32,
-                        )?;
-
-                        let normal_map = ID3D12Resource::new_texture(
-                            &device,
-                            normal_format,
-                            terrain_map_generator.size as u32,
-                            terrain_map_generator.size as u32,
-                            map_data.normal_mips.len() as u32,
-                        )?;
-
-                        device.CreateShaderResourceView(
-                            &height_map,
-                            Some(&D3D12_SHADER_RESOURCE_VIEW_DESC {
-                                Format: height_format,
-                                ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
-                                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
-                                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
-                                    Texture2D: D3D12_TEX2D_SRV {
-                                        MostDetailedMip: 0,
-                                        MipLevels: map_data.height_mips.len() as u32,
-                                        PlaneSlice: 0,
-                                        ResourceMinLODClamp: 0.0,
-                                    },
-                                },
-                            }),
-                            resource_heap.get_cpu_handle(&device, GpuResource::TerrainHeightMap as u32),
-                        );
-
-                        device.CreateShaderResourceView(
-                            &normal_map,
-                            Some(&D3D12_SHADER_RESOURCE_VIEW_DESC {
-                                Format: normal_format,
-                                ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
-                                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
-                                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
-                                    Texture2D: D3D12_TEX2D_SRV {
-                                        MostDetailedMip: 0,
-                                        MipLevels: map_data.normal_mips.len() as u32,
-                                        PlaneSlice: 0,
-                                        ResourceMinLODClamp: 0.0,
-                                    },
-                                },
-                            }),
-                            resource_heap.get_cpu_handle(&device, GpuResource::TerrainNormalMap as u32),
-                        );
-
-                        let height_upload_buffer =
-                            cmd_list.upload_mips(&device, map_data.height_mips.as_slice(), &height_map)?;
-                        let normal_upload_buffer =
-                            cmd_list.upload_mips(&device, map_data.normal_mips.as_slice(), &normal_map)?;
-
-                        deferred_release.push((cpu_frame_index, height_upload_buffer.cast::<ID3D12Object>()?));
-                        deferred_release.push((cpu_frame_index, normal_upload_buffer.cast::<ID3D12Object>()?));
-
-                        if let Some(prev) = terrain.height_map.replace(height_map) {
-                            deferred_release.push((cpu_frame_index, prev.cast::<ID3D12Object>()?));
-                        }
-
-                        if let Some(prev) = terrain.normal_map.replace(normal_map) {
-                            deferred_release.push((cpu_frame_index, prev.cast::<ID3D12Object>()?));
-                        }
-                    }
 
                     let image_position = ImGui_GetCursorScreenPos();
                     let image_size = {
@@ -706,22 +624,20 @@ fn main() -> Result<()> {
                         size.x.min(size.y)
                     };
 
-                    if terrain.height_map.is_some() {
-                        ImGui_Image(
-                            ImTextureRef {
-                                _TexData: std::ptr::null_mut(),
-                                _TexID: resource_heap
-                                    .get_gpu_handle(&device, GpuResource::TerrainHeightMap as u32)
-                                    .ptr,
-                            },
-                            ImVec2 {
-                                x: image_size,
-                                y: image_size,
-                            },
-                        );
-                    }
+                    ImGui_Image(
+                        ImTextureRef {
+                            _TexData: std::ptr::null_mut(),
+                            _TexID: resource_heap
+                                .get_gpu_handle(&device, GpuResource::TerrainHeightAtlas as u32)
+                                .ptr,
+                        },
+                        ImVec2 {
+                            x: image_size,
+                            y: image_size,
+                        },
+                    );
 
-                    let minimap_scale = image_size / (render_distance * 2.0);
+                    let minimap_scale = image_size / (RENDER_DISTANCE * 2.0);
 
                     let node_minimap_pos = |node_pos: Vec2| -> Vec2 {
                         let window_center =
@@ -740,9 +656,8 @@ fn main() -> Result<()> {
                     let draw_list = ImGui_GetWindowDrawList();
 
                     if draw_tiles {
-                        let tile_count = (render_distance * 2.0 / TILE_WORLD_SIZE) as i32;
-                        for i in 0..tile_count {
-                            for j in 0..tile_count {
+                        for i in 0..MAX_TILE_COUNT {
+                            for j in 0..MAX_TILE_COUNT {
                                 let half_size = TILE_WORLD_SIZE / 2.0 * minimap_scale;
                                 let center = Vec2::new(
                                     image_position.x + (i as f32 * TILE_WORLD_SIZE * minimap_scale) + half_size,
@@ -768,117 +683,119 @@ fn main() -> Result<()> {
                         }
                     }
 
-                    for node in terrain_nodes {
-                        let center = node_minimap_pos(node.center);
-                        let half_size = node.half_size * minimap_scale;
-                        let cell_size = half_size * 2.0;
+                    if draw_quad_tree {
+                        for node in terrain_nodes {
+                            let center = node_minimap_pos(node.center);
+                            let half_size = node.half_size * minimap_scale;
+                            let cell_size = half_size * 2.0;
 
-                        ImDrawList_AddRectEx(
-                            draw_list,
-                            ImVec2 {
-                                x: center.x - half_size,
-                                y: center.y - half_size,
-                            },
-                            ImVec2 {
-                                x: center.x + half_size,
-                                y: center.y + half_size,
-                            },
-                            0xB3FFFFFF,
-                            0.0,
-                            ImDrawFlags_None,
-                            0.5,
-                        );
+                            ImDrawList_AddRectEx(
+                                draw_list,
+                                ImVec2 {
+                                    x: center.x - half_size,
+                                    y: center.y - half_size,
+                                },
+                                ImVec2 {
+                                    x: center.x + half_size,
+                                    y: center.y + half_size,
+                                },
+                                0xB3FFFFFF,
+                                0.0,
+                                ImDrawFlags_None,
+                                0.5,
+                            );
 
-                        let center_label = CString::new(node.lod_index.to_string()).unwrap();
-                        let center_label_size = ImGui_CalcTextSize(center_label.as_ptr());
+                            let center_label = CString::new(node.lod_index.to_string()).unwrap();
+                            let center_label_size = ImGui_CalcTextSize(center_label.as_ptr());
 
-                        if center_label_size.x >= cell_size || center_label_size.y >= cell_size {
-                            continue;
-                        }
+                            if center_label_size.x >= cell_size || center_label_size.y >= cell_size {
+                                continue;
+                            }
 
-                        ImDrawList_AddText(
-                            draw_list,
-                            ImVec2 {
-                                x: center.x - center_label_size.x / 2.0,
-                                y: center.y - center_label_size.y / 2.0,
-                            },
-                            0xFFFFFFFF,
-                            center_label.as_ptr(),
-                        );
+                            ImDrawList_AddText(
+                                draw_list,
+                                ImVec2 {
+                                    x: center.x - center_label_size.x / 2.0,
+                                    y: center.y - center_label_size.y / 2.0,
+                                },
+                                0xFFFFFFFF,
+                                center_label.as_ptr(),
+                            );
 
-                        let style = *ImGui_GetStyle();
-                        let padding_x = style.WindowPadding.x / 4.0;
-                        let padding_y = style.WindowPadding.y / 4.0;
-                        let star_size = ImGui_CalcTextSize(c"*".as_ptr());
-                        let required_x = padding_x * 2.0 + star_size.x + star_size.x + center_label_size.x;
-                        let required_y = padding_y * 2.0 + star_size.y + star_size.y + center_label_size.y;
+                            let style = *ImGui_GetStyle();
+                            let padding_x = style.WindowPadding.x / 4.0;
+                            let padding_y = style.WindowPadding.y / 4.0;
+                            let star_size = ImGui_CalcTextSize(c"*".as_ptr());
+                            let required_x = padding_x * 2.0 + star_size.x + star_size.x + center_label_size.x;
+                            let required_y = padding_y * 2.0 + star_size.y + star_size.y + center_label_size.y;
 
-                        if required_x > cell_size || required_y > cell_size {
-                            continue;
-                        }
+                            if required_x > cell_size || required_y > cell_size {
+                                continue;
+                            }
 
-                        let stitch_labels = [
-                            (
-                                StitchMask::TOP,
-                                ImVec2 {
-                                    x: center.x - star_size.x / 2.0,
-                                    y: center.y - half_size + padding_y,
-                                },
-                            ),
-                            (
-                                StitchMask::BOTTOM,
-                                ImVec2 {
-                                    x: center.x - star_size.x / 2.0,
-                                    y: center.y + half_size - star_size.y - padding_y,
-                                },
-                            ),
-                            (
-                                StitchMask::LEFT,
-                                ImVec2 {
-                                    x: center.x - half_size + padding_x,
-                                    y: center.y - star_size.y / 2.0,
-                                },
-                            ),
-                            (
-                                StitchMask::RIGHT,
-                                ImVec2 {
-                                    x: center.x + half_size - star_size.x - padding_x,
-                                    y: center.y - star_size.y / 2.0,
-                                },
-                            ),
-                            (
-                                StitchMask::TOP_LEFT,
-                                ImVec2 {
-                                    x: center.x - half_size + padding_x,
-                                    y: center.y - half_size + padding_y,
-                                },
-                            ),
-                            (
-                                StitchMask::TOP_RIGHT,
-                                ImVec2 {
-                                    x: center.x + half_size - star_size.x - padding_x,
-                                    y: center.y - half_size + padding_y,
-                                },
-                            ),
-                            (
-                                StitchMask::BOTTOM_LEFT,
-                                ImVec2 {
-                                    x: center.x - half_size + padding_x,
-                                    y: center.y + half_size - star_size.y - padding_y,
-                                },
-                            ),
-                            (
-                                StitchMask::BOTTOM_RIGHT,
-                                ImVec2 {
-                                    x: center.x + half_size - star_size.x - padding_x,
-                                    y: center.y + half_size - star_size.y - padding_y,
-                                },
-                            ),
-                        ];
+                            let stitch_labels = [
+                                (
+                                    StitchMask::TOP,
+                                    ImVec2 {
+                                        x: center.x - star_size.x / 2.0,
+                                        y: center.y - half_size + padding_y,
+                                    },
+                                ),
+                                (
+                                    StitchMask::BOTTOM,
+                                    ImVec2 {
+                                        x: center.x - star_size.x / 2.0,
+                                        y: center.y + half_size - star_size.y - padding_y,
+                                    },
+                                ),
+                                (
+                                    StitchMask::LEFT,
+                                    ImVec2 {
+                                        x: center.x - half_size + padding_x,
+                                        y: center.y - star_size.y / 2.0,
+                                    },
+                                ),
+                                (
+                                    StitchMask::RIGHT,
+                                    ImVec2 {
+                                        x: center.x + half_size - star_size.x - padding_x,
+                                        y: center.y - star_size.y / 2.0,
+                                    },
+                                ),
+                                (
+                                    StitchMask::TOP_LEFT,
+                                    ImVec2 {
+                                        x: center.x - half_size + padding_x,
+                                        y: center.y - half_size + padding_y,
+                                    },
+                                ),
+                                (
+                                    StitchMask::TOP_RIGHT,
+                                    ImVec2 {
+                                        x: center.x + half_size - star_size.x - padding_x,
+                                        y: center.y - half_size + padding_y,
+                                    },
+                                ),
+                                (
+                                    StitchMask::BOTTOM_LEFT,
+                                    ImVec2 {
+                                        x: center.x - half_size + padding_x,
+                                        y: center.y + half_size - star_size.y - padding_y,
+                                    },
+                                ),
+                                (
+                                    StitchMask::BOTTOM_RIGHT,
+                                    ImVec2 {
+                                        x: center.x + half_size - star_size.x - padding_x,
+                                        y: center.y + half_size - star_size.y - padding_y,
+                                    },
+                                ),
+                            ];
 
-                        for (flag, pos) in &stitch_labels {
-                            if node.stitch_mask.contains(*flag) {
-                                ImDrawList_AddText(draw_list, *pos, 0xFFFFFFFF, c"*".as_ptr());
+                            for (flag, pos) in &stitch_labels {
+                                if node.stitch_mask.contains(*flag) {
+                                    ImDrawList_AddText(draw_list, *pos, 0xFFFFFFFF, c"*".as_ptr());
+                                }
                             }
                         }
                     }
@@ -910,15 +827,13 @@ fn main() -> Result<()> {
             swap_chain.Present(0, DXGI_PRESENT_ALLOW_TEARING).ok()?;
             cmd_queue.Signal(&fence, cpu_frame_index)?;
 
-            let mut gpu_frame_index = fence.GetCompletedValue();
+            gpu_frame_index = fence.GetCompletedValue();
             if cpu_frame_index - gpu_frame_index >= FRAME_COUNT as u64 {
                 let gpu_frame_index_to_wait = cpu_frame_index - FRAME_COUNT as u64 + 1;
                 wait_for_gpu(&fence, fence_event, gpu_frame_index_to_wait)?;
 
                 gpu_frame_index = fence.GetCompletedValue();
             }
-
-            deferred_release.retain(|&(frame_index, _)| frame_index > gpu_frame_index);
         }
 
         wait_for_gpu(&fence, fence_event, cpu_frame_index)?;
@@ -929,18 +844,7 @@ fn main() -> Result<()> {
             ImGui_DestroyContext(std::ptr::null_mut());
         }
 
-        assert!(deferred_release.is_empty());
-
-        drop(terrain.solid_const_buffer);
-        drop(terrain.wireframe_const_buffer);
-        drop(terrain.node_buffer);
-        drop(terrain.cell_index_buffer);
-        drop(terrain.height_map);
-        drop(terrain.normal_map);
-        drop(terrain.solid_vertex_pso);
-        drop(terrain.solid_mesh_pso);
-        drop(terrain.wireframe_vertex_pso);
-        drop(terrain.wireframe_mesh_pso);
+        drop(terrain);
         drop(root_signature);
         drop(cmd_list);
         drop(cmd_allocators);

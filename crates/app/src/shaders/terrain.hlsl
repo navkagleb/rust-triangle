@@ -13,7 +13,7 @@ struct VsOutput {
 
 struct TerrainConsts {
     float4x4 world_to_clip;
-    float terrain_size;
+    float2 world_center_tile;
     float world_scale;
     float height_scale;
     uint wireframe_pass;
@@ -125,8 +125,8 @@ VsOutput ProcessVertex(uint vertex_id, uint instance_id) {
 
     const TerrainNode node = nodes[instance_id];
 
-    int vx = vertex_id % (CELL_QUAD_COUNT + 1);
-    int vz = vertex_id / (CELL_QUAD_COUNT + 1);
+    uint vx = vertex_id % (CELL_QUAD_COUNT + 1);
+    uint vz = vertex_id / (CELL_QUAD_COUNT + 1);
     uint height_mip_index = node.lod_index;
 
     if (consts.stitching_enabled)
@@ -154,14 +154,22 @@ VsOutput ProcessVertex(uint vertex_id, uint instance_id) {
     }
 
     const float2 local = float2(vx, vz) / (float)CELL_QUAD_COUNT; // 0..1
-    const float2 world_xz = node.center + (local - 0.5) * node.half_size * 2.0;
+    const float2 world_xz = node.center + (local - 0.5) * 2.0 * node.half_size;
 
-    const float2 uv = world_xz / consts.terrain_size;
-    const float height = height_map.SampleLevel(point_clamp_sampler, uv, height_mip_index).r;
+    const float TILE_WORLD_SIZE = 64.0;
+    const float MAX_TILE_COUNT = 32.0;
+    const float ATLAS_CENTER_TILE = MAX_TILE_COUNT / 2;
+
+    const float2 world_tile = floor(world_xz / TILE_WORLD_SIZE);
+    const float2 atlas_tile = float2(ATLAS_CENTER_TILE, ATLAS_CENTER_TILE) + world_tile - consts.world_center_tile;
+    const float2 local_uv = frac(world_xz / TILE_WORLD_SIZE);
+    const float2 atlas_uv = (atlas_tile + local_uv) / float(MAX_TILE_COUNT);
+
+    const float height = height_map.SampleLevel(point_clamp_sampler, atlas_uv, 0).r;
 
     const float3 world_position = float3(
         world_xz.x * consts.world_scale,
-        height * consts.height_scale,
+        height * 100,// consts.height_scale,
         world_xz.y * consts.world_scale
     );
 
@@ -169,7 +177,7 @@ VsOutput ProcessVertex(uint vertex_id, uint instance_id) {
     output.clip_position = mul(consts.world_to_clip, float4(world_position, 1.0));
     output.debug_color = node_color(node);
     output.lod_index = node.lod_index;
-    output.uv = uv;
+    output.uv = atlas_uv;
     output.height = height;
 
     return output;
