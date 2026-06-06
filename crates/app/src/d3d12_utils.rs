@@ -167,22 +167,28 @@ impl D3D12BufferExt for ID3D12Resource {
 }
 
 pub trait D3D12TextureExt {
-    fn new_texture(
+    fn new_texture_2d(device: &ID3D12Device, format: DXGI_FORMAT, width: u32, height: u32) -> Result<ID3D12Resource>;
+
+    fn new_texture_3d(
         device: &ID3D12Device,
         format: DXGI_FORMAT,
         width: u32,
         height: u32,
-        mip_count: u32,
+        depth: u32,
     ) -> Result<ID3D12Resource>;
 }
 
 impl D3D12TextureExt for ID3D12Resource {
-    fn new_texture(
+    fn new_texture_2d(device: &ID3D12Device, format: DXGI_FORMAT, width: u32, height: u32) -> Result<ID3D12Resource> {
+        Self::new_texture_3d(device, format, width, height, 1)
+    }
+
+    fn new_texture_3d(
         device: &ID3D12Device,
         format: DXGI_FORMAT,
         width: u32,
         height: u32,
-        mip_count: u32,
+        depth: u32,
     ) -> Result<ID3D12Resource> {
         assert_ne!(format, DXGI_FORMAT_UNKNOWN);
 
@@ -196,8 +202,8 @@ impl D3D12TextureExt for ID3D12Resource {
                     Alignment: 0,
                     Width: width as u64,
                     Height: height,
-                    DepthOrArraySize: 1,
-                    MipLevels: mip_count as u16,
+                    DepthOrArraySize: depth as u16,
+                    MipLevels: 1,
                     Format: format,
                     SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
                     Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,

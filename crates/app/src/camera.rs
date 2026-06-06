@@ -13,13 +13,13 @@ pub struct Camera {
 }
 
 impl Camera {
-    pub fn new() -> Self {
+    pub fn new(position: Vec3) -> Self {
         let fov_y = 90_f32.to_radians();
         let aspect_ratio = WIDTH as f32 / HEIGHT as f32;
         let near_z = 0.1;
 
         Self {
-            position: Vec3::ZERO,
+            position,
             world_to_view: Mat4::IDENTITY,
             view_to_clip: Mat4::perspective_infinite_reverse_lh(fov_y, aspect_ratio, near_z),
         }
@@ -96,7 +96,7 @@ impl Default for CameraController {
     fn default() -> Self {
         Self {
             speed: 50.0,
-            yaw: 0.0,
+            yaw: 180.0,
             pitch: 0.0,
         }
     }

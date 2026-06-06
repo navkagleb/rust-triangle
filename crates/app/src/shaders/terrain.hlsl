@@ -6,6 +6,7 @@ struct VsInput {
 struct VsOutput {
     float4 clip_position : SV_Position;
     float3 debug_color: Color;
+    float3 debug_color2: Color2;
     nointerpolation uint lod_index : LodIndex;
     float2 uv : Uv;
     float height : Height;
@@ -101,14 +102,15 @@ float3 node_color(TerrainNode node) {
     return hsv_to_rgb(hue, 0.75 + 0.25 * frac((float)(hash >> 16) / 65535.0), 0.9);
 }
 
-static const uint HEIGHT_MAP_INDEX = 1;
-static const uint NORMAL_MAP_INDEX = 2;
-static const uint TERRAIN_NODE_BUFFER_INDEX = 3;
-static const uint CELL_INDEX_BUFFER_INDEX = 4;
+static const uint INDIRECTION_TEXTURE_INDEX = 1;
+static const uint HEIGHT_ATLAS_INDEX = 2;
+static const uint NORMAL_ATLAS_INDEX = 3;
+static const uint TERRAIN_NODE_BUFFER_INDEX = 4;
+static const uint TILE_INDEX_BUFFER_INDEX = 5;
 
-static const uint CELL_QUAD_COUNT = 8;
-static const uint CELL_VERTEX_COUNT = (CELL_QUAD_COUNT + 1) * (CELL_QUAD_COUNT + 1);
-static const uint CELL_TRIANGLE_COUNT = CELL_QUAD_COUNT * CELL_QUAD_COUNT * 2;
+static const uint TILE_QUAD_COUNT = 8;
+static const uint TILE_VERTEX_COUNT = (TILE_QUAD_COUNT + 1) * (TILE_QUAD_COUNT + 1);
+static const uint TILE_TRIANGLE_COUNT = TILE_QUAD_COUNT * TILE_QUAD_COUNT * 2;
 
 static const uint TOP_STITCH_BIT = 1 << 0;
 static const uint BOTTOM_STITCH_BIT = 1 << 1;
@@ -119,20 +121,24 @@ static const uint TOP_RIGHT_STITCH_BIT = 1 << 5;
 static const uint BOTTOM_LEFT_STITCH_BIT = 1 << 6;
 static const uint BOTTOM_RIGHT_STITCH_BIT = 1 << 7;
 
+static const float TILE_WORLD_SIZE = 64.0;
+static const uint MAX_TILE_COUNT = 32;
+
 VsOutput ProcessVertex(uint vertex_id, uint instance_id) {
-    const Texture2D<float> height_map = ResourceDescriptorHeap[HEIGHT_MAP_INDEX];
+    const Texture2DArray<uint2> indirection_texture = ResourceDescriptorHeap[INDIRECTION_TEXTURE_INDEX];
+    const Texture2D<float> height_atlas = ResourceDescriptorHeap[HEIGHT_ATLAS_INDEX];
     const StructuredBuffer<TerrainNode> nodes = ResourceDescriptorHeap[TERRAIN_NODE_BUFFER_INDEX];
 
     const TerrainNode node = nodes[instance_id];
 
-    uint vx = vertex_id % (CELL_QUAD_COUNT + 1);
-    uint vz = vertex_id / (CELL_QUAD_COUNT + 1);
-    uint height_mip_index = node.lod_index;
+    uint vx = vertex_id % (TILE_QUAD_COUNT + 1);
+    uint vz = vertex_id / (TILE_QUAD_COUNT + 1);
+    uint lod_index = node.lod_index;
 
     if (consts.stitching_enabled)
     {
-        const bool stitch_x = (vz == 0 && node.stitch_mask & TOP_STITCH_BIT) || (vz == CELL_QUAD_COUNT && node.stitch_mask & BOTTOM_STITCH_BIT);
-        const bool stitch_z = (vx == 0 && node.stitch_mask & LEFT_STITCH_BIT) || (vx == CELL_QUAD_COUNT && node.stitch_mask & RIGHT_STITCH_BIT);
+        const bool stitch_x = (vz == 0 && node.stitch_mask & TOP_STITCH_BIT) || (vz == TILE_QUAD_COUNT && node.stitch_mask & BOTTOM_STITCH_BIT);
+        const bool stitch_z = (vx == 0 && node.stitch_mask & LEFT_STITCH_BIT) || (vx == TILE_QUAD_COUNT && node.stitch_mask & RIGHT_STITCH_BIT);
 
         if (stitch_x) {
             vx = (vx / 2) * 2;
@@ -144,38 +150,61 @@ VsOutput ProcessVertex(uint vertex_id, uint instance_id) {
 
         const bool stitch_corner =
             (vx == 0 && vz == 0 && node.stitch_mask & TOP_LEFT_STITCH_BIT) ||
-            (vx == CELL_QUAD_COUNT && vz == 0 && node.stitch_mask & TOP_RIGHT_STITCH_BIT)||
-            (vx == 0 && vz == CELL_QUAD_COUNT && node.stitch_mask & BOTTOM_LEFT_STITCH_BIT) ||
-            (vx == CELL_QUAD_COUNT && vz == CELL_QUAD_COUNT && node.stitch_mask & BOTTOM_RIGHT_STITCH_BIT);
+            (vx == TILE_QUAD_COUNT && vz == 0 && node.stitch_mask & TOP_RIGHT_STITCH_BIT)||
+            (vx == 0 && vz == TILE_QUAD_COUNT && node.stitch_mask & BOTTOM_LEFT_STITCH_BIT) ||
+            (vx == TILE_QUAD_COUNT && vz == TILE_QUAD_COUNT && node.stitch_mask & BOTTOM_RIGHT_STITCH_BIT);
 
         if (stitch_x || stitch_z || stitch_corner) {
-            height_mip_index += 1;
+            lod_index += 1;
         }
     }
 
-    const float2 local = float2(vx, vz) / (float)CELL_QUAD_COUNT; // 0..1
-    const float2 world_xz = node.center + (local - 0.5) * 2.0 * node.half_size;
+    const float2 tile_uv_bad = float2(vx, vz) / (float)TILE_QUAD_COUNT; // 0..1
+    const float2 world_xz = node.center + node.half_size * (tile_uv_bad - 0.5) * 2.0;
 
-    const float TILE_WORLD_SIZE = 64.0;
-    const float MAX_TILE_COUNT = 32.0;
-    const float ATLAS_CENTER_TILE = MAX_TILE_COUNT / 2;
+#if 0
+    const float2 tile_uv = float2(vx, vz) / ((float)TILE_QUAD_COUNT + 0.0001);
 
-    const float2 world_tile = floor(world_xz / TILE_WORLD_SIZE);
-    const float2 atlas_tile = float2(ATLAS_CENTER_TILE, ATLAS_CENTER_TILE) + world_tile - consts.world_center_tile;
-    const float2 local_uv = frac(world_xz / TILE_WORLD_SIZE);
-    const float2 atlas_uv = (atlas_tile + local_uv) / float(MAX_TILE_COUNT);
+    const int2 world_tile = (node.center - node.half_size) / TILE_WORLD_SIZE;
+    const int2 relative_tile = world_tile - consts.world_center_tile;
+    const int2 indirection_coord = relative_tile + MAX_TILE_COUNT / 2;
+    const float2 atlas_tile = indirection_texture[uint3(indirection_coord.x, indirection_coord.y, node.lod_index)];
 
-    const float height = height_map.SampleLevel(point_clamp_sampler, atlas_uv, 0).r;
+    const float2 atlas_uv = (atlas_tile + tile_uv) / float(MAX_TILE_COUNT);
+#else
+    int2 world_tile = (node.center - node.half_size) / TILE_WORLD_SIZE;
+    float2 tile_uv = tile_uv_bad;
+
+    if (vx == TILE_QUAD_COUNT) {
+        world_tile.x += 1;
+        tile_uv.x = 0.0;
+    }
+
+    if (vz == TILE_QUAD_COUNT) {
+        world_tile.y += 1;
+        tile_uv.y = 0.0;
+    }
+
+    const int2 relative_tile = world_tile - int2(consts.world_center_tile);
+    const int2 indirection_coord = relative_tile + MAX_TILE_COUNT / 2;
+    const float2 atlas_tile = indirection_texture[uint3(indirection_coord.x, indirection_coord.y, node.lod_index)];
+
+    const float2 atlas_uv = (atlas_tile + tile_uv) / float(MAX_TILE_COUNT);
+#endif
+    const float height = height_atlas.SampleLevel(point_clamp_sampler, atlas_uv, 0).r;
 
     const float3 world_position = float3(
         world_xz.x * consts.world_scale,
-        height * 100,// consts.height_scale,
+        height * 100.0,
         world_xz.y * consts.world_scale
     );
 
     VsOutput output = (VsOutput)0;
     output.clip_position = mul(consts.world_to_clip, float4(world_position, 1.0));
     output.debug_color = node_color(node);
+    output.debug_color2 = float3(tile_uv, 0.0);
+    output.debug_color2 = float3(height * 0.5 + 0.5, 0.0, 0.0);
+    // output.debug_color2 = float3(float2(world_tile) / 24.0, 0.0);
     output.lod_index = node.lod_index;
     output.uv = atlas_uv;
     output.height = height;
@@ -192,18 +221,18 @@ VsOutput vs_main(VsInput input) {
 void ms_main(
     uint gtid : SV_GroupThreadID,
     uint gid : SV_GroupID,
-    out vertices VsOutput vertices[CELL_VERTEX_COUNT],
-    out indices uint3 triangles[CELL_TRIANGLE_COUNT]
+    out vertices VsOutput vertices[TILE_VERTEX_COUNT],
+    out indices uint3 triangles[TILE_TRIANGLE_COUNT]
 ) {
-    SetMeshOutputCounts(CELL_VERTEX_COUNT, CELL_TRIANGLE_COUNT);
+    SetMeshOutputCounts(TILE_VERTEX_COUNT, TILE_TRIANGLE_COUNT);
 
-    if (gtid < CELL_VERTEX_COUNT) {
+    if (gtid < TILE_VERTEX_COUNT) {
         vertices[gtid] = ProcessVertex(gtid, gid);
     }
 
-    const Buffer<uint> index_buffer = ResourceDescriptorHeap[CELL_INDEX_BUFFER_INDEX];
+    const Buffer<uint> index_buffer = ResourceDescriptorHeap[TILE_INDEX_BUFFER_INDEX];
 
-    if (gtid < CELL_TRIANGLE_COUNT) { 
+    if (gtid < TILE_TRIANGLE_COUNT) { 
         triangles[gtid] = uint3(
             index_buffer[gtid * 3 + 0],
             index_buffer[gtid * 3 + 1],
@@ -213,18 +242,20 @@ void ms_main(
 }
 
 float4 ps_main(VsOutput input) : SV_Target {
+#if 0
     const Texture2D<float3> normal_map = ResourceDescriptorHeap[NORMAL_MAP_INDEX];
     const float3 normal = normal_map.Sample(linear_clamp_sampler, input.uv);
 
     const float3 light_dir = normalize(float3(1.0, 2.0, 1.0));
     const float ndotl = saturate(dot(normal, light_dir));
     const float3 ambient = 0.1;
+#endif
     
     float3 color = consts.wireframe_pass ? input.debug_color : height_to_color(input.height);
 
-    if (!consts.wireframe_pass) {
-        color *= ambient + ndotl;
-    }
+    // if (!consts.wireframe_pass) {
+    //     color *= ambient + ndotl;
+    // }
 
     return float4(color, 1.0);
 }

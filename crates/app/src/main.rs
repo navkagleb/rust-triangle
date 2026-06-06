@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use glam::Vec2;
+use glam::{Vec2, Vec3};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Direct3D::*;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -39,11 +39,12 @@ macro_rules! imgui_text {
 #[repr(u32)]
 enum GpuResource {
     ImGuiFont,
+    TerrainIndirectionTexture,
     TerrainHeightAtlas,
     #[allow(unused)]
     TerrainNormalAtlas,
     TerrainNodeBuffer,
-    TerrainCellIndexBuffer,
+    TerrainTileIndexBuffer,
     Count,
 }
 
@@ -57,7 +58,7 @@ struct InputState {
 }
 
 fn main() -> Result<()> {
-    let mut camera = camera::Camera::new();
+    let mut camera = camera::Camera::new(Vec3::new(0.0, 100.0, 0.0));
     let mut camera_controller = camera::CameraController::default();
 
     let mut input = InputState {
@@ -426,10 +427,10 @@ fn main() -> Result<()> {
             });
         }
 
-        let mut freeze_camera = false;
+        let mut freeze_camera = true;
         let mut mesh_pipeline_enabled = true;
         let mut wireframe_enabled = true;
-        let mut stitching_enabled = true;
+        let mut stitching_enabled = false;
         let mut draw_tiles = false;
         let mut draw_quad_tree = true;
 
@@ -518,6 +519,7 @@ fn main() -> Result<()> {
 
             {
                 terrain.upload_tiles_to_gpu(&device, &cmd_list, cpu_frame_index, gpu_frame_index)?;
+                terrain.update_indirection_texture(&device, &cmd_list)?;
 
                 let mut consts = GpuTerrainConsts {
                     world_to_clip: camera.world_to_clip(),
@@ -540,10 +542,10 @@ fn main() -> Result<()> {
                     } else {
                         cmd_list.SetPipelineState(vertex_pso);
                         cmd_list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-                        cmd_list.IASetIndexBuffer(Some(&terrain.cell_ibv));
+                        cmd_list.IASetIndexBuffer(Some(&terrain.tile_ibv));
 
                         cmd_list.DrawIndexedInstanced(
-                            terrain.cell_index_count as u32,
+                            terrain.tile_index_count as u32,
                             terrain_nodes.len() as u32,
                             0,
                             0,
@@ -705,12 +707,28 @@ fn main() -> Result<()> {
                                 0.5,
                             );
 
+                            let world_tile = ((node.center - node.half_size) / (TILE_WORLD_SIZE)).as_ivec2();
+                            let relative_tile = world_tile - terrain.world_center_tile;
+                            let indirection_tile = relative_tile + glam::IVec2::splat(MAX_TILE_COUNT as i32 / 2);
+
                             let center_label = CString::new(node.lod_index.to_string()).unwrap();
+                            let center_label =
+                                CString::new(format!("{},{}", indirection_tile.x, indirection_tile.y)).unwrap();
                             let center_label_size = ImGui_CalcTextSize(center_label.as_ptr());
 
-                            if center_label_size.x >= cell_size || center_label_size.y >= cell_size {
-                                continue;
-                            }
+                            // if center_label_size.x >= cell_size || center_label_size.y >= cell_size {
+                            //     continue;
+                            // }
+
+                            ImDrawList_AddCircle(
+                                draw_list,
+                                ImVec2 {
+                                    x: node_minimap_pos(world_tile.as_vec2() * TILE_WORLD_SIZE).x,
+                                    y: node_minimap_pos(world_tile.as_vec2() * TILE_WORLD_SIZE).y,
+                                },
+                                5.0,
+                                0xFFFFFFFF,
+                            );
 
                             ImDrawList_AddText(
                                 draw_list,

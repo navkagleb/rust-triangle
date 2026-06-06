@@ -1,17 +1,21 @@
+// TerrainPatch
+//  - lod
+//
+
 use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use bitflags::bitflags;
-use glam::{IVec2, Mat4, Vec2, Vec3, f32};
+use glam::{IVec2, Mat4, UVec2, Vec2, Vec3, f32};
 use noise::utils::{NoiseMapBuilder, PlaneMapBuilder};
 use noise::{Fbm, MultiFractal, Perlin};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
 use crate::d3d12_utils::*;
-use crate::terrain::TileState::Uploading;
+use crate::terrain::TileState::{Resident, Uploading};
 use crate::{BACK_BUFFER_FORMAT, DEPTH_BUFFER_FORMAT, GpuResource};
 
 pub const RENDER_DISTANCE: f32 = 1024.0;
@@ -19,9 +23,10 @@ pub const TILE_PIXEL_SIZE: f32 = 128.0;
 pub const TILE_PIXEL_TO_WORLD_SCALE: f32 = 0.5;
 pub const TILE_WORLD_SIZE: f32 = TILE_PIXEL_SIZE * TILE_PIXEL_TO_WORLD_SCALE;
 pub const MAX_TILE_COUNT: u32 = (RENDER_DISTANCE * 2.0 / TILE_WORLD_SIZE) as u32;
+pub const TILE_LOD_COUNT: u32 = (RENDER_DISTANCE as u32 * 2 / TILE_WORLD_SIZE as u32).ilog2() + 1;
 pub const ATLAS_MAP_SIZE: u32 = (RENDER_DISTANCE * 2.0 / TILE_PIXEL_TO_WORLD_SCALE) as u32;
 
-const CELL_QUAD_COUNT: usize = 8;
+const TILE_QUAD_COUNT: usize = 8;
 const TILE_GENERATOR_WORKER_COUNT: usize = 16;
 
 bitflags! {
@@ -62,26 +67,31 @@ pub struct TerrainData {
     pub height_scale: f32,
     pub world_scale: f32,
 
-    pub cell_ibv: D3D12_INDEX_BUFFER_VIEW,
-    pub cell_index_count: usize,
+    pub tile_ibv: D3D12_INDEX_BUFFER_VIEW,
+    pub tile_index_count: usize,
 
     pub solid_const_buffer: ConstBuffer<GpuTerrainConsts>,
     pub wireframe_const_buffer: ConstBuffer<GpuTerrainConsts>,
 
     node_buffer: ID3D12Resource,
-    _cell_index_buffer: ID3D12Resource,
+    _tile_index_buffer: ID3D12Resource,
 
     height_atlas: ID3D12Resource,
     height_upload_buffer: ID3D12Resource,
     height_mapped_ptr: *mut u8,
+
+    indirection_texture: ID3D12Resource,
+    indirection_upload_buffer: ID3D12Resource,
+    indirection_mapped_ptr: *mut u8,
 
     pub solid_vertex_pso: ID3D12PipelineState,
     pub solid_mesh_pso: ID3D12PipelineState,
     pub wireframe_vertex_pso: ID3D12PipelineState,
     pub wireframe_mesh_pso: ID3D12PipelineState,
 
-    tile_cache: HashMap<IVec2, TileState>,
+    tile_cache: HashMap<TileWorldKey, TileState>,
     tile_gen_pool: TileGenPool,
+    atlas_tile_free_slots: Vec<UVec2>,
 
     pub world_center_tile: IVec2,
 
@@ -97,14 +107,14 @@ impl TerrainData {
         resource_heap: &ID3D12DescriptorHeap,
         root_signature: &ID3D12RootSignature,
     ) -> Result<Self> {
-        let cell_indices = {
-            let mut indices = Vec::with_capacity(CELL_QUAD_COUNT * CELL_QUAD_COUNT * 6);
+        let tile_indices = {
+            let mut indices = Vec::with_capacity(TILE_QUAD_COUNT * TILE_QUAD_COUNT * 6);
 
-            for z in 0..CELL_QUAD_COUNT {
-                for x in 0..CELL_QUAD_COUNT {
-                    let tl = (z * (CELL_QUAD_COUNT + 1) + x) as u32;
+            for z in 0..TILE_QUAD_COUNT {
+                for x in 0..TILE_QUAD_COUNT {
+                    let tl = (z * (TILE_QUAD_COUNT + 1) + x) as u32;
                     let tr = tl + 1;
-                    let bl = tl + (CELL_QUAD_COUNT + 1) as u32;
+                    let bl = tl + (TILE_QUAD_COUNT + 1) as u32;
                     let br = bl + 1;
 
                     indices.push(tl);
@@ -119,10 +129,10 @@ impl TerrainData {
 
             indices
         };
-        let cell_index_buffer =
-            ID3D12Resource::new_buffer(device, D3D12_HEAP_TYPE_UPLOAD, size_of_val(cell_indices.as_slice()))?;
+        let tile_index_buffer =
+            ID3D12Resource::new_buffer(device, D3D12_HEAP_TYPE_UPLOAD, size_of_val(tile_indices.as_slice()))?;
 
-        cell_index_buffer.map_and_write(cell_indices.as_slice())?;
+        tile_index_buffer.map_and_write(tile_indices.as_slice())?;
 
         let max_node_count = (RENDER_DISTANCE * 2.0 / TILE_WORLD_SIZE).powi(2) as usize;
         let node_buffer = ID3D12Resource::new_buffer(
@@ -151,7 +161,7 @@ impl TerrainData {
             );
 
             device.CreateShaderResourceView(
-                &cell_index_buffer,
+                &tile_index_buffer,
                 Some(&D3D12_SHADER_RESOURCE_VIEW_DESC {
                     Format: DXGI_FORMAT_R32_UINT,
                     ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
@@ -159,13 +169,13 @@ impl TerrainData {
                     Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
                         Buffer: D3D12_BUFFER_SRV {
                             FirstElement: 0,
-                            NumElements: cell_indices.len() as u32,
+                            NumElements: tile_indices.len() as u32,
                             StructureByteStride: 0,
                             Flags: D3D12_BUFFER_SRV_FLAG_NONE,
                         },
                     },
                 }),
-                resource_heap.get_cpu_handle(device, GpuResource::TerrainCellIndexBuffer as u32),
+                resource_heap.get_cpu_handle(device, GpuResource::TerrainTileIndexBuffer as u32),
             );
         }
 
@@ -261,14 +271,23 @@ impl TerrainData {
             let mut size = 0;
 
             unsafe {
-                device.GetCopyableFootprints(&desc, 0, desc.MipLevels as u32, 0, None, None, None, Some(&mut size));
+                device.GetCopyableFootprints(
+                    &desc,
+                    0,
+                    (desc.MipLevels * desc.DepthOrArraySize) as u32,
+                    0,
+                    None,
+                    None,
+                    None,
+                    Some(&mut size),
+                );
             }
 
             size as usize
         };
 
         let height_format = DXGI_FORMAT_R32_FLOAT;
-        let height_atlas = ID3D12Resource::new_texture(device, height_format, ATLAS_MAP_SIZE, ATLAS_MAP_SIZE, 1)?;
+        let height_atlas = ID3D12Resource::new_texture_2d(device, height_format, ATLAS_MAP_SIZE, ATLAS_MAP_SIZE)?;
         let height_upload_buffer =
             ID3D12Resource::new_buffer(device, D3D12_HEAP_TYPE_UPLOAD, get_texture_size(&height_atlas))?;
 
@@ -292,24 +311,68 @@ impl TerrainData {
             );
         }
 
+        let indirection_format = DXGI_FORMAT_R32G32_UINT;
+        let indirection_texture = ID3D12Resource::new_texture_3d(
+            device,
+            indirection_format,
+            MAX_TILE_COUNT,
+            MAX_TILE_COUNT,
+            TILE_LOD_COUNT,
+        )?;
+        let indirection_upload_buffer =
+            ID3D12Resource::new_buffer(device, D3D12_HEAP_TYPE_UPLOAD, get_texture_size(&indirection_texture))?;
+
+        unsafe {
+            device.CreateShaderResourceView(
+                &indirection_texture,
+                Some(&D3D12_SHADER_RESOURCE_VIEW_DESC {
+                    Format: indirection_format,
+                    ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
+                    Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                    Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                        Texture2DArray: D3D12_TEX2D_ARRAY_SRV {
+                            MostDetailedMip: 0,
+                            MipLevels: 1,
+                            FirstArraySlice: 0,
+                            ArraySize: TILE_LOD_COUNT,
+                            PlaneSlice: 0,
+                            ResourceMinLODClamp: 0.0,
+                        },
+                    },
+                }),
+                resource_heap.get_cpu_handle(device, GpuResource::TerrainIndirectionTexture as u32),
+            );
+        }
+
+        let mut free_slots = Vec::with_capacity((MAX_TILE_COUNT * MAX_TILE_COUNT) as usize);
+        for y in (0..MAX_TILE_COUNT).rev() {
+            for x in (0..MAX_TILE_COUNT).rev() {
+                free_slots.push(UVec2::new(x, y));
+            }
+        }
+
         Ok(Self {
             lod_factor: 4.0,
             height_scale: 15.0,
             world_scale: 1.0,
             solid_const_buffer: ConstBuffer::new(device)?,
             wireframe_const_buffer: ConstBuffer::new(device)?,
-            cell_ibv: D3D12_INDEX_BUFFER_VIEW {
-                BufferLocation: unsafe { cell_index_buffer.GetGPUVirtualAddress() },
-                SizeInBytes: size_of_val(cell_indices.as_slice()) as u32,
+            tile_ibv: D3D12_INDEX_BUFFER_VIEW {
+                BufferLocation: unsafe { tile_index_buffer.GetGPUVirtualAddress() },
+                SizeInBytes: size_of_val(tile_indices.as_slice()) as u32,
                 Format: DXGI_FORMAT_R32_UINT,
             },
-            cell_index_count: cell_indices.len(),
+            tile_index_count: tile_indices.len(),
             node_buffer,
-            _cell_index_buffer: cell_index_buffer,
+            _tile_index_buffer: tile_index_buffer,
 
             height_mapped_ptr: height_upload_buffer.map::<u8>()?,
             height_upload_buffer,
             height_atlas,
+
+            indirection_mapped_ptr: indirection_upload_buffer.map::<u8>()?,
+            indirection_upload_buffer,
+            indirection_texture,
 
             solid_vertex_pso: create_vertex_pso(solid_state)?,
             wireframe_vertex_pso: create_vertex_pso(wireframe_state)?,
@@ -318,6 +381,7 @@ impl TerrainData {
 
             tile_cache: HashMap::new(),
             tile_gen_pool: TileGenPool::new(),
+            atlas_tile_free_slots: free_slots,
 
             world_center_tile: IVec2::ZERO,
             requested_count: 0,
@@ -337,8 +401,8 @@ impl TerrainData {
             match state {
                 TileState::Requested => self.requested_count += 1,
                 TileState::Generated(_) => self.generated_count += 1,
-                TileState::Uploading(_) => self.uploading_count += 1,
-                TileState::Resident => self.resident_count += 1,
+                TileState::Uploading(_, _) => self.uploading_count += 1,
+                TileState::Resident(_) => self.resident_count += 1,
             }
         }
 
@@ -356,40 +420,39 @@ impl TerrainData {
 
         let leafs = qtree.collect_leafs();
 
-        let mut missing_tiles: Vec<IVec2> = leafs
+        let mut missing_tiles = leafs
             .iter()
-            .flat_map(|leaf| {
-                let tile_count = (leaf.size() / TILE_WORLD_SIZE) as u32;
+            .map(|leaf| {
+                assert!((leaf.center - leaf.half_size).as_ivec2() % TILE_WORLD_SIZE as i32 == IVec2::ZERO);
 
-                assert!((leaf.center.x - leaf.half_size) as i32 % TILE_WORLD_SIZE as i32 == 0);
-                assert!((leaf.center.y - leaf.half_size) as i32 % TILE_WORLD_SIZE as i32 == 0);
-
-                let leaf_start_tile = IVec2::new(
-                    ((leaf.center.x - leaf.half_size) / TILE_WORLD_SIZE) as i32,
-                    ((leaf.center.y - leaf.half_size) / TILE_WORLD_SIZE) as i32,
-                );
-
-                (0..tile_count)
-                    .flat_map(move |x| (0..tile_count).map(move |y| leaf_start_tile + IVec2::new(x as i32, y as i32)))
+                TileWorldKey {
+                    world_tile: ((leaf.center - leaf.half_size) / TILE_WORLD_SIZE).as_ivec2(),
+                    lod_index: leaf.lod_index,
+                }
             })
             .filter(|world_tile| !self.tile_cache.contains_key(world_tile))
-            .collect();
+            .collect::<Vec<_>>();
 
         missing_tiles.sort_unstable_by(|a, b| {
-            let distance_a = (camera_position - Vec3::new(a.x as f32, 0.0, a.y as f32)).length_squared();
-            let distance_b = (camera_position - Vec3::new(b.x as f32, 0.0, b.y as f32)).length_squared();
+            let center_a = Vec3::new(a.world_tile.x as f32, 0.0, a.world_tile.y as f32) * TILE_WORLD_SIZE
+                + TILE_WORLD_SIZE * a.lod_index as f32 * 0.5;
+            let center_b = Vec3::new(b.world_tile.x as f32, 0.0, b.world_tile.y as f32) * TILE_WORLD_SIZE
+                + TILE_WORLD_SIZE * b.lod_index as f32 * 0.5;
+
+            let distance_a = (camera_position - center_a).length_squared();
+            let distance_b = (camera_position - center_b).length_squared();
 
             distance_a.total_cmp(&distance_b)
         });
 
         for result in self.tile_gen_pool.drain_results() {
             self.tile_cache
-                .insert(result.world_tile, TileState::Generated(result.height_map));
+                .insert(result.request, TileState::Generated(result.height_map));
         }
 
-        for tile in missing_tiles {
-            self.tile_gen_pool.submit_task(tile);
-            self.tile_cache.insert(tile, TileState::Requested);
+        for tile_key in missing_tiles {
+            self.tile_gen_pool.requst_tile_generation(tile_key);
+            self.tile_cache.insert(tile_key, TileState::Requested);
         }
 
         let is_neighbor_coarser = |node: &QuadTreeNode, direction: Vec2| -> bool {
@@ -461,14 +524,13 @@ impl TerrainData {
             );
         }
 
-        let atlas_center_tile = IVec2::splat((MAX_TILE_COUNT / 2) as i32);
         let mut updated_tiles = Vec::new();
 
-        for (world_tile, state) in &self.tile_cache {
-            if let Uploading(frame_index) = state
+        for (key, state) in &self.tile_cache {
+            if let Uploading(atlas_pos, frame_index) = state
                 && *frame_index <= gpu_frame_index
             {
-                updated_tiles.push((*world_tile, TileState::Resident));
+                updated_tiles.push((*key, TileState::Resident(*atlas_pos)));
                 continue;
             }
 
@@ -476,20 +538,11 @@ impl TerrainData {
                 continue;
             };
 
-            let atlas_tile = atlas_center_tile + world_tile - self.world_center_tile;
-
-            if atlas_tile.x < 0
-                || atlas_tile.y < 0
-                || atlas_tile.x >= MAX_TILE_COUNT as i32
-                || atlas_tile.y >= MAX_TILE_COUNT as i32
-            {
-                continue;
-            }
-
+            let atlas_pos = self.atlas_tile_free_slots.pop().unwrap();
             let atlas_row_pitch = atlas_layout.Footprint.RowPitch as u64;
 
-            let tile_offset_bytes = atlas_tile.y as u64 * TILE_PIXEL_SIZE as u64 * atlas_row_pitch
-                + atlas_tile.x as u64 * TILE_PIXEL_SIZE as u64 * size_of::<f32>() as u64;
+            let tile_offset_bytes = atlas_pos.y as u64 * TILE_PIXEL_SIZE as u64 * atlas_row_pitch
+                + atlas_pos.x as u64 * TILE_PIXEL_SIZE as u64 * size_of::<f32>() as u64;
 
             for row in 0..TILE_PIXEL_SIZE as u32 {
                 let src_offset = row * TILE_PIXEL_SIZE as u32;
@@ -511,8 +564,8 @@ impl TerrainData {
                         Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
                         Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
                     },
-                    atlas_tile.x as u32 * TILE_PIXEL_SIZE as u32,
-                    atlas_tile.y as u32 * TILE_PIXEL_SIZE as u32,
+                    atlas_pos.x * TILE_PIXEL_SIZE as u32,
+                    atlas_pos.y * TILE_PIXEL_SIZE as u32,
                     0,
                     &D3D12_TEXTURE_COPY_LOCATION {
                         pResource: std::mem::transmute_copy(&self.height_upload_buffer),
@@ -534,11 +587,105 @@ impl TerrainData {
                 );
             }
 
-            updated_tiles.push((*world_tile, TileState::Uploading(cpu_frame_index)));
+            updated_tiles.push((*key, TileState::Uploading(atlas_pos, cpu_frame_index)));
         }
 
-        for (world_tile, state) in updated_tiles {
-            self.tile_cache.insert(world_tile, state);
+        for (key, state) in updated_tiles {
+            self.tile_cache.insert(key, state);
+        }
+
+        Ok(())
+    }
+
+    pub fn update_indirection_texture(
+        &self,
+        device: &ID3D12Device,
+        cmd_list: &ID3D12GraphicsCommandList,
+    ) -> Result<()> {
+        let mut resident_tiles = [[UVec2::ZERO; (MAX_TILE_COUNT * MAX_TILE_COUNT) as usize]; TILE_LOD_COUNT as usize];
+
+        for (key, state) in &self.tile_cache {
+            let Resident(atlas_pos) = state else {
+                continue;
+            };
+
+            let relative_tile = key.world_tile - self.world_center_tile + IVec2::splat(MAX_TILE_COUNT as i32 / 2);
+
+            if relative_tile.x < 0
+                || relative_tile.y < 0
+                || relative_tile.x >= MAX_TILE_COUNT as i32
+                || relative_tile.y >= MAX_TILE_COUNT as i32
+            {
+                continue;
+            }
+
+            // println!(
+            //     "world={} -> relative={} -> atlas={}",
+            //     key.world_tile, relative_tile, atlas_pos
+            // );
+
+            let relative_tile = relative_tile.as_uvec2();
+
+            resident_tiles[key.lod_index as usize][(relative_tile.y * MAX_TILE_COUNT + relative_tile.x) as usize] =
+                *atlas_pos;
+        }
+
+        let desc = unsafe { self.indirection_texture.GetDesc() };
+        let mut layouts = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); TILE_LOD_COUNT as usize];
+
+        unsafe {
+            device.GetCopyableFootprints(
+                &desc,
+                0,
+                TILE_LOD_COUNT,
+                0,
+                Some(layouts.as_mut_ptr()),
+                None,
+                None,
+                None,
+            );
+        }
+
+        for lod in 0..TILE_LOD_COUNT as usize {
+            let gpu_layout = layouts[lod];
+            let gpu_row_pitch = gpu_layout.Footprint.RowPitch as usize;
+            let gpu_lod_offset = gpu_layout.Offset as usize;
+
+            for row in 0..MAX_TILE_COUNT as usize {
+                let cpu_offset = row * MAX_TILE_COUNT as usize;
+                let gpu_offset = gpu_lod_offset + row * gpu_row_pitch;
+
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        resident_tiles[lod].as_ptr().add(cpu_offset),
+                        (self.indirection_mapped_ptr as *mut UVec2).byte_add(gpu_offset),
+                        MAX_TILE_COUNT as usize,
+                    );
+                }
+            }
+
+            unsafe {
+                cmd_list.CopyTextureRegion(
+                    &D3D12_TEXTURE_COPY_LOCATION {
+                        pResource: std::mem::transmute_copy(&self.indirection_texture),
+                        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                            SubresourceIndex: lod as u32,
+                        },
+                    },
+                    0,
+                    0,
+                    0,
+                    &D3D12_TEXTURE_COPY_LOCATION {
+                        pResource: std::mem::transmute_copy(&self.indirection_upload_buffer),
+                        Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                            PlacedFootprint: gpu_layout,
+                        },
+                    },
+                    None,
+                );
+            }
         }
 
         Ok(())
@@ -548,29 +695,32 @@ impl TerrainData {
 enum TileState {
     Requested,
     Generated(Vec<f32>),
-    Uploading(u64),
-    Resident,
+    Uploading(UVec2, u64),
+    Resident(UVec2),
 }
 
-struct TileGenResult {
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct TileWorldKey {
     world_tile: IVec2,
+    lod_index: u32,
+}
+
+type TileGenRequest = TileWorldKey;
+
+struct TileGenResult {
+    request: TileGenRequest,
     height_map: Vec<f32>,
 }
 
-type TileGenTask = Box<dyn FnOnce() + Send + 'static>;
-
 struct TileGenPool {
     workers: Vec<std::thread::JoinHandle<()>>,
-    task_sender: Option<Sender<TileGenTask>>,
-    result_sender: Sender<TileGenResult>,
+    request_sender: Option<Sender<TileGenRequest>>,
     result_receiver: Receiver<TileGenResult>,
-
-    fbm: Arc<Fbm<Perlin>>,
 }
 
 impl Drop for TileGenPool {
     fn drop(&mut self) {
-        drop(self.task_sender.take());
+        drop(self.request_sender.take());
 
         for worker in self.workers.drain(..) {
             worker.join().unwrap();
@@ -580,30 +730,10 @@ impl Drop for TileGenPool {
 
 impl TileGenPool {
     fn new() -> Self {
-        let (task_sender, task_receiver) = std::sync::mpsc::channel::<TileGenTask>();
-        let task_receiver = Arc::new(Mutex::new(task_receiver));
-
-        let workers = (0..TILE_GENERATOR_WORKER_COUNT)
-            .map(|i| {
-                let task_receiver = Arc::clone(&task_receiver);
-
-                std::thread::Builder::new()
-                    .name(format!("tile-generator-{}", i))
-                    .spawn(move || {
-                        loop {
-                            let task = task_receiver.lock().unwrap().recv();
-
-                            match task {
-                                Ok(task) => task(),
-                                Err(_) => break,
-                            };
-                        }
-                    })
-                    .unwrap()
-            })
-            .collect();
-
+        let (request_sender, request_receiver) = std::sync::mpsc::channel::<TileGenRequest>();
         let (result_sender, result_receiver) = std::sync::mpsc::channel::<TileGenResult>();
+
+        let request_receiver = Arc::new(Mutex::new(request_receiver));
 
         let fbm = Fbm::<Perlin>::new(123)
             .set_octaves(6)
@@ -611,43 +741,57 @@ impl TileGenPool {
             .set_lacunarity(2.0)
             .set_persistence(0.5);
 
+        let workers = (0..TILE_GENERATOR_WORKER_COUNT)
+            .map(|i| {
+                let request_receiver = Arc::clone(&request_receiver);
+                let result_sender = result_sender.clone();
+                let fbm = fbm.clone();
+
+                std::thread::Builder::new()
+                    .name(format!("tile-generator-{}", i))
+                    .spawn(move || {
+                        loop {
+                            let request = request_receiver.lock().unwrap().recv();
+                            let Ok(request) = request else {
+                                break;
+                            };
+
+                            let noise_scale = 4.0_f64;
+                            let world_scale = 2048.0_f64;
+
+                            let world_x = request.world_tile.x as f64 * TILE_WORLD_SIZE as f64;
+                            let world_y = request.world_tile.y as f64 * TILE_WORLD_SIZE as f64;
+
+                            let x_norm = world_x / world_scale * noise_scale;
+                            let y_norm = world_y / world_scale * noise_scale;
+                            let tile_norm =
+                                (request.lod_index + 1) as f64 * TILE_WORLD_SIZE as f64 / world_scale * noise_scale;
+
+                            let height_map = PlaneMapBuilder::new(&fbm)
+                                .set_size(TILE_PIXEL_SIZE as usize, TILE_PIXEL_SIZE as usize)
+                                .set_x_bounds(x_norm, x_norm + tile_norm)
+                                .set_y_bounds(y_norm, y_norm + tile_norm)
+                                .build()
+                                .into_iter()
+                                .map(|n| n as f32)
+                                .collect::<Vec<_>>();
+
+                            result_sender.send(TileGenResult { request, height_map }).unwrap();
+                        }
+                    })
+                    .unwrap()
+            })
+            .collect();
+
         Self {
             workers,
-            task_sender: Some(task_sender),
-            result_sender,
+            request_sender: Some(request_sender),
             result_receiver,
-            fbm: Arc::new(fbm),
         }
     }
 
-    fn submit_task(&self, world_tile: IVec2) {
-        let fbm = Arc::clone(&self.fbm);
-        let result_sender = self.result_sender.clone();
-
-        let task = move || {
-            let noise_scale = 4.0_f64;
-            let world_scale = 2048.0_f64;
-
-            let world_x = world_tile.x as f64 * TILE_WORLD_SIZE as f64;
-            let world_y = world_tile.y as f64 * TILE_WORLD_SIZE as f64;
-
-            let x_norm = world_x / world_scale * noise_scale;
-            let y_norm = world_y / world_scale * noise_scale;
-            let tile_norm = TILE_WORLD_SIZE as f64 / world_scale * noise_scale;
-
-            let height_map = PlaneMapBuilder::new(&*fbm)
-                .set_size(TILE_PIXEL_SIZE as usize, TILE_PIXEL_SIZE as usize)
-                .set_x_bounds(x_norm, x_norm + tile_norm)
-                .set_y_bounds(y_norm, y_norm + tile_norm)
-                .build()
-                .into_iter()
-                .map(|n| n as f32)
-                .collect::<Vec<_>>();
-
-            result_sender.send(TileGenResult { world_tile, height_map }).unwrap();
-        };
-
-        self.task_sender.as_ref().unwrap().send(Box::new(task)).unwrap();
+    fn requst_tile_generation(&self, request: TileGenRequest) {
+        self.request_sender.as_ref().unwrap().send(request).unwrap()
     }
 
     fn drain_results(&self) -> impl Iterator<Item = TileGenResult> + '_ {
@@ -671,10 +815,6 @@ impl QuadTreeNode {
             children: None,
         }
     }
-
-    fn size(&self) -> f32 {
-        self.half_size * 2.0
-    }
 }
 
 struct QuadTree {
@@ -683,8 +823,7 @@ struct QuadTree {
 
 impl QuadTree {
     fn new(root_center: Vec2, root_half_size: f32, camera_position: &Vec3, lod_factor: f32) -> Self {
-        let root_lod_index = (root_half_size * 2.0 / TILE_WORLD_SIZE).log2() as u32;
-        let mut root = QuadTreeNode::new(root_center, root_half_size, root_lod_index);
+        let mut root = QuadTreeNode::new(root_center, root_half_size, TILE_LOD_COUNT - 1);
 
         Self::split_recursive(&mut root, camera_position, lod_factor);
 
