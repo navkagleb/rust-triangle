@@ -19,6 +19,7 @@ struct TerrainConsts {
     float height_scale;
     uint wireframe_pass;
     uint stitching_enabled;
+    uint active_patch_buffer_index;
 };
 
 struct TerrainPatch {
@@ -103,9 +104,7 @@ float3 patch_color(TerrainPatch patch) {
 
 static const uint INDIRECTION_TEXTURE_INDEX = 1;
 static const uint HEIGHT_ATLAS_INDEX = 2;
-static const uint NORMAL_ATLAS_INDEX = 3;
-static const uint TERRAIN_PATCH_BUFFER_INDEX = 4;
-static const uint PATCH_INDEX_BUFFER_INDEX = 5;
+static const uint PATCH_INDEX_BUFFER_INDEX = 3;
 
 static const uint PATCH_PIXEL_SIZE = 128;
 static const uint PATCH_WORLD_SIZE = 64;
@@ -123,7 +122,7 @@ static const uint LEFT_STITCH_BIT = 1 << 2;
 static const uint RIGHT_STITCH_BIT = 1 << 3;
 
 VsOutput ProcessVertex(uint vertex_id, uint instance_id) {
-    const StructuredBuffer<TerrainPatch> patches = ResourceDescriptorHeap[TERRAIN_PATCH_BUFFER_INDEX];
+    const StructuredBuffer<TerrainPatch> patches = ResourceDescriptorHeap[consts.active_patch_buffer_index];
     const Texture2D<uint2> indirection_texture = ResourceDescriptorHeap[INDIRECTION_TEXTURE_INDEX];
     const Texture2D<float> height_atlas = ResourceDescriptorHeap[HEIGHT_ATLAS_INDEX];
 

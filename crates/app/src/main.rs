@@ -41,10 +41,10 @@ enum GpuResource {
     ImGuiFont,
     TerrainIndirectionTexture,
     TerrainHeightAtlas,
-    #[allow(unused)]
-    TerrainNormalAtlas,
-    TerrainPatchBuffer,
     TerrainPatchIndexBuffer,
+    TerrainPatchBufferFirst,
+    #[allow(unused)]
+    TerrainPatchBufferLast = GpuResource::TerrainPatchBufferFirst as u32 + FRAME_COUNT,
     Count,
 }
 
@@ -476,8 +476,6 @@ fn main() -> Result<()> {
                 camera_position = *camera.position();
             }
 
-            terrain.collect_leaf_patches(&camera_position)?;
-
             // Render
             let active_frame_index = swap_chain.GetCurrentBackBufferIndex();
             let cmd_allocator = &cmd_allocators[active_frame_index as usize];
@@ -517,6 +515,7 @@ fn main() -> Result<()> {
             cmd_list.SetGraphicsRootSignature(&root_signature);
 
             {
+                terrain.collect_leaf_patches(&camera_position, active_frame_index)?;
                 terrain.upload_atlas_data(&device, &cmd_list, cpu_frame_index, gpu_frame_index)?;
                 terrain.upload_indirection_data(&device, &cmd_list)?;
                 terrain.render(&cmd_list, &camera, active_frame_index);

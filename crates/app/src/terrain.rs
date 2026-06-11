@@ -13,7 +13,7 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 
 use crate::camera::Camera;
 use crate::d3d12_utils::*;
-use crate::{BACK_BUFFER_FORMAT, DEPTH_BUFFER_FORMAT, GpuResource};
+use crate::{BACK_BUFFER_FORMAT, DEPTH_BUFFER_FORMAT, FRAME_COUNT, GpuResource};
 
 const PATCH_GEN_WORKER_COUNT: usize = 16;
 
@@ -43,20 +43,21 @@ bitflags! {
 }
 
 #[repr(C)]
-pub struct GpuTerrainPatch {
+struct GpuTerrainPatch {
     pub world_index: IVec2,
     pub lod_index: u32,
     pub stitch_mask: StitchMask,
 }
 
 #[repr(C)]
-pub struct GpuTerrainConsts {
+struct GpuTerrainConsts {
     pub world_to_clip: Mat4,
     pub cam_world_index: IVec2,
     pub world_scale: f32,
     pub height_scale: f32,
     pub wireframe_pass: u32,
     pub stitching_enabled: u32,
+    pub active_patch_buffer_index: u32,
 }
 
 pub struct TerrainPatchStats {
@@ -108,6 +109,8 @@ pub struct TerrainData {
 
     patch_index_buffer: ID3D12Resource,
     patch_buffer: ID3D12Resource,
+    patch_buffer_item_count: u32,
+    patch_buffer_ptr: *mut GpuTerrainPatch,
 
     solid_const_buffer: ConstBuffer<GpuTerrainConsts>,
     wireframe_const_buffer: ConstBuffer<GpuTerrainConsts>,
@@ -180,27 +183,29 @@ impl TerrainData {
         let patch_buffer = ID3D12Resource::new_buffer(
             device,
             D3D12_HEAP_TYPE_UPLOAD,
-            max_patch_count as usize * size_of::<GpuTerrainPatch>(),
+            (max_patch_count * FRAME_COUNT) as usize * size_of::<GpuTerrainPatch>(),
         )?;
 
         unsafe {
-            device.CreateShaderResourceView(
-                &patch_buffer,
-                Some(&D3D12_SHADER_RESOURCE_VIEW_DESC {
-                    Format: DXGI_FORMAT_UNKNOWN,
-                    ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
-                    Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
-                    Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
-                        Buffer: D3D12_BUFFER_SRV {
-                            FirstElement: 0,
-                            NumElements: max_patch_count,
-                            StructureByteStride: size_of::<GpuTerrainPatch>() as u32,
-                            Flags: D3D12_BUFFER_SRV_FLAG_NONE,
+            for i in 0..FRAME_COUNT {
+                device.CreateShaderResourceView(
+                    &patch_buffer,
+                    Some(&D3D12_SHADER_RESOURCE_VIEW_DESC {
+                        Format: DXGI_FORMAT_UNKNOWN,
+                        ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                        Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                            Buffer: D3D12_BUFFER_SRV {
+                                FirstElement: (i * max_patch_count) as u64,
+                                NumElements: max_patch_count,
+                                StructureByteStride: size_of::<GpuTerrainPatch>() as u32,
+                                Flags: D3D12_BUFFER_SRV_FLAG_NONE,
+                            },
                         },
-                    },
-                }),
-                resource_heap.get_cpu_handle(device, GpuResource::TerrainPatchBuffer as u32),
-            );
+                    }),
+                    resource_heap.get_cpu_handle(device, GpuResource::TerrainPatchBufferFirst as u32 + i),
+                );
+            }
 
             device.CreateShaderResourceView(
                 &patch_index_buffer,
@@ -406,6 +411,8 @@ impl TerrainData {
             leaf_patches: Vec::new(),
 
             patch_index_buffer,
+            patch_buffer_item_count: max_patch_count,
+            patch_buffer_ptr: patch_buffer.map::<GpuTerrainPatch>()?,
             patch_buffer,
 
             solid_const_buffer: ConstBuffer::new(device)?,
@@ -433,7 +440,7 @@ impl TerrainData {
         &self.leaf_patches
     }
 
-    pub fn collect_leaf_patches(&mut self, cam_pos: &Vec3) -> Result<()> {
+    pub fn collect_leaf_patches(&mut self, cam_pos: &Vec3, active_frame_index: u32) -> Result<()> {
         let qtree = PatchQuadTree::new(cam_pos, self.render_distance, self.lod_factor);
 
         self.leaf_patches = qtree.collect_leafs();
@@ -507,8 +514,14 @@ impl TerrainData {
             })
             .collect::<Vec<_>>();
 
-        // TODO: Should be used storage per frame"
-        self.patch_buffer.map_and_write(gpu_patches.as_slice())?;
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                gpu_patches.as_ptr(),
+                self.patch_buffer_ptr
+                    .add((active_frame_index * self.patch_buffer_item_count) as usize),
+                gpu_patches.len(),
+            );
+        }
 
         Ok(())
     }
@@ -708,6 +721,7 @@ impl TerrainData {
             height_scale: self.height_scale,
             wireframe_pass: false.into(),
             stitching_enabled: self.stitching_enabled.into(),
+            active_patch_buffer_index: GpuResource::TerrainPatchBufferFirst as u32 + active_frame_index,
         };
 
         let render_terrain = |vertex_pso: &ID3D12PipelineState| {
