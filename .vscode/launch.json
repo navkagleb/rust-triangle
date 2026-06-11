@@ -8,7 +8,13 @@
             "program": "${workspaceFolder}/target/debug/app.exe",
             "preLaunchTask": "cargo build debug",
             "console": "internalConsole",
-            "cwd": "${workspaceFolder}"
+            "cwd": "${workspaceFolder}",
+            "environment": [
+                {
+                    "name": "RUST_BACKTRACE",
+                    "value": "1"
+                }
+            ]
         },
         {
             "type": "cppvsdbg",
@@ -17,7 +23,13 @@
             "program": "${workspaceFolder}/target/release/app.exe",
             "preLaunchTask": "cargo build release",
             "console": "internalConsole",
-            "cwd": "${workspaceFolder}"
+            "cwd": "${workspaceFolder}",
+            "environment": [
+                {
+                    "name": "RUST_BACKTRACE",
+                    "value": "1"
+                }
+            ]
         }
     ]
 }
