@@ -17,15 +17,15 @@ use crate::{BACK_BUFFER_FORMAT, DEPTH_BUFFER_FORMAT, FRAME_COUNT, GpuResource};
 
 const PATCH_GEN_WORKER_COUNT: usize = 16;
 
-pub const PATCH_LOD_COUNT: u32 = 4;
-pub const PATCH_PIXEL_SIZE: u32 = 128;
+const PATCH_LOD_COUNT: u32 = 5;
+const PATCH_PIXEL_SIZE: u32 = 128;
 pub const PATCH_WORLD_SIZE: u32 = PATCH_PIXEL_SIZE / 2;
 
 const ATLAS_PATCH_PIXEL_SIZE: u32 = PATCH_PIXEL_SIZE + 1; // for pixel overlap
-const ATLAS_PATCH_COUNT: u32 = 16;
+const ATLAS_PATCH_COUNT: u32 = 32;
 const ATLAS_SIZE: u32 = ATLAS_PATCH_PIXEL_SIZE * ATLAS_PATCH_COUNT;
 const HEIGHT_ATLAS_FORMAT: DXGI_FORMAT = DXGI_FORMAT_R32_FLOAT;
-const INDIRECTION_SLOT_COUNT: u32 = 64;
+const INDIRECTION_SLOT_COUNT: u32 = 128;
 
 const PATCH_SIDE_QUAD_COUNT: u32 = PATCH_PIXEL_SIZE;
 const PATCH_SIDE_VERTEX_COUNT: u32 = PATCH_PIXEL_SIZE + 1;
@@ -107,29 +107,31 @@ pub struct TerrainData {
     cam_world_index: IVec2,
     leaf_patches: Vec<PatchKey>,
 
+    patch_cache: HashMap<PatchKey, PatchState>,
+    patch_gen_pool: PatchGenPool,
+    atlas_free_slots: Vec<UVec2>,
+
     patch_index_buffer: ID3D12Resource,
+    #[allow(unused)]
     patch_buffer: ID3D12Resource,
     patch_buffer_item_count: u32,
     patch_buffer_ptr: *mut GpuTerrainPatch,
 
+    indirection_texture: ID3D12Resource,
+    indirection_texture_upload: ID3D12Resource,
+    indirection_texture_ptr: *mut UVec2,
+    indirection_texture_size: usize,
+
+    height_atlas: ID3D12Resource,
+    height_atlas_upload: ID3D12Resource,
+    height_atlas_ptr: *mut f32,
+    height_atlas_size: usize,
+
     solid_const_buffer: ConstBuffer<GpuTerrainConsts>,
     wireframe_const_buffer: ConstBuffer<GpuTerrainConsts>,
 
-    height_atlas: ID3D12Resource,
-    height_upload_buffer: ID3D12Resource,
-    height_mapped_ptr: *mut u8,
-
-    indirection_texture: ID3D12Resource,
-    indirection_upload_buffer: ID3D12Resource,
-    indirection_mapped_ptr: *mut u8,
-
     solid_vertex_pso: ID3D12PipelineState,
     wireframe_vertex_pso: ID3D12PipelineState,
-    // pub solid_mesh_pso: ID3D12PipelineState,
-    // pub wireframe_mesh_pso: ID3D12PipelineState,
-    patch_cache: HashMap<PatchKey, PatchState>,
-    patch_gen_pool: PatchGenPool,
-    atlas_free_slots: Vec<UVec2>,
 }
 
 impl TerrainData {
@@ -177,7 +179,7 @@ impl TerrainData {
 
         patch_index_buffer.map_and_write(patch_indices.as_slice())?;
 
-        let render_distance = 1024;
+        let render_distance = 2048;
 
         let max_patch_count = ((render_distance * 2) / PATCH_WORLD_SIZE).pow(2); // should be somehow recalculated
         let patch_buffer = ID3D12Resource::new_buffer(
@@ -226,8 +228,87 @@ impl TerrainData {
             );
         }
 
+        let get_texture_size = |texture: &ID3D12Resource| -> usize {
+            let desc = unsafe { texture.GetDesc() };
+            let mut size = 0;
+
+            unsafe {
+                device.GetCopyableFootprints(
+                    &desc,
+                    0,
+                    (desc.MipLevels * desc.DepthOrArraySize) as u32,
+                    0,
+                    None,
+                    None,
+                    None,
+                    Some(&mut size),
+                );
+            }
+
+            size as usize
+        };
+
+        let indirection_format = DXGI_FORMAT_R32G32_UINT;
+        let indirection_texture = ID3D12Resource::new_texture_2d(
+            device,
+            indirection_format,
+            INDIRECTION_SLOT_COUNT,
+            INDIRECTION_SLOT_COUNT,
+            PATCH_LOD_COUNT,
+        )?;
+        let indirection_texture_size = get_texture_size(&indirection_texture);
+        let indirection_texture_upload = ID3D12Resource::new_buffer(
+            device,
+            D3D12_HEAP_TYPE_UPLOAD,
+            indirection_texture_size * FRAME_COUNT as usize,
+        )?;
+
+        unsafe {
+            device.CreateShaderResourceView(
+                &indirection_texture,
+                Some(&D3D12_SHADER_RESOURCE_VIEW_DESC {
+                    Format: indirection_format,
+                    ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+                    Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                    Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                        Texture2D: D3D12_TEX2D_SRV {
+                            MostDetailedMip: 0,
+                            MipLevels: PATCH_LOD_COUNT,
+                            PlaneSlice: 0,
+                            ResourceMinLODClamp: 0.0,
+                        },
+                    },
+                }),
+                resource_heap.get_cpu_handle(device, GpuResource::TerrainIndirectionTexture as u32),
+            );
+        }
+
+        let height_atlas = ID3D12Resource::new_texture_2d(device, HEIGHT_ATLAS_FORMAT, ATLAS_SIZE, ATLAS_SIZE, 1)?;
+        let height_atlas_size = get_texture_size(&height_atlas);
+        let height_atlas_upload =
+            ID3D12Resource::new_buffer(device, D3D12_HEAP_TYPE_UPLOAD, height_atlas_size * FRAME_COUNT as usize)?;
+
+        unsafe {
+            device.CreateShaderResourceView(
+                &height_atlas,
+                Some(&D3D12_SHADER_RESOURCE_VIEW_DESC {
+                    Format: HEIGHT_ATLAS_FORMAT,
+                    ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+                    Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                    Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                        Texture2D: D3D12_TEX2D_SRV {
+                            MostDetailedMip: 0,
+                            MipLevels: 1,
+                            PlaneSlice: 0,
+                            ResourceMinLODClamp: 0.0,
+                        },
+                    },
+                }),
+                resource_heap.get_cpu_handle(device, GpuResource::TerrainHeightAtlas as u32),
+            );
+        }
+
         let vs_blob = std::fs::read(std::path::Path::new("target/dxil/terrain.vs.dxil"))?;
-        // let ms_blob = std::fs::read(std::path::Path::new("target/dxil/terrain.ms.dxil"))?;
         let ps_blob = std::fs::read(std::path::Path::new("target/dxil/terrain.ps.dxil"))?;
 
         let depth_stencil_state = D3D12_DEPTH_STENCIL_DESC {
@@ -287,115 +368,6 @@ impl TerrainData {
                 }
             };
 
-        #[cfg(false)]
-        let create_mesh_pso = |rasterizer_state: D3D12_RASTERIZER_DESC| -> windows::core::Result<ID3D12PipelineState> {
-            let mut stream = MeshPipelineStream {
-                root_signature: PsoSubobject::new(unsafe { std::mem::transmute_copy(root_signature) }),
-                ms: PsoSubobject::new(D3D12_SHADER_BYTECODE::from_slice(&ms_blob)),
-                ps: PsoSubobject::new(D3D12_SHADER_BYTECODE::from_slice(&ps_blob)),
-                rasterizer: PsoSubobject::new(rasterizer_state),
-                depth_stencil: PsoSubobject::new(depth_stencil_state),
-                rtv_formats: PsoSubobject::new(D3D12_RT_FORMAT_ARRAY {
-                    RTFormats: rtv_fmts,
-                    NumRenderTargets: 1,
-                }),
-                dsv_format: PsoSubobject::new(DEPTH_BUFFER_FORMAT),
-                sample_desc: PsoSubobject::new(DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }),
-            };
-
-            unsafe {
-                device.CreatePipelineState::<ID3D12PipelineState>(&D3D12_PIPELINE_STATE_STREAM_DESC {
-                    SizeInBytes: size_of::<MeshPipelineStream>(),
-                    pPipelineStateSubobjectStream: &mut stream as *mut _ as *mut _,
-                })
-            }
-        };
-
-        let solid_state = create_rasterizer_state(D3D12_FILL_MODE_SOLID);
-        let wireframe_state = create_rasterizer_state(D3D12_FILL_MODE_WIREFRAME);
-
-        let get_texture_size = |texture: &ID3D12Resource| -> usize {
-            let desc = unsafe { texture.GetDesc() };
-            let mut size = 0;
-
-            unsafe {
-                device.GetCopyableFootprints(
-                    &desc,
-                    0,
-                    (desc.MipLevels * desc.DepthOrArraySize) as u32,
-                    0,
-                    None,
-                    None,
-                    None,
-                    Some(&mut size),
-                );
-            }
-
-            size as usize
-        };
-
-        let height_atlas = ID3D12Resource::new_texture_2d(device, HEIGHT_ATLAS_FORMAT, ATLAS_SIZE, ATLAS_SIZE, 1)?;
-        let height_upload_buffer =
-            ID3D12Resource::new_buffer(device, D3D12_HEAP_TYPE_UPLOAD, get_texture_size(&height_atlas))?;
-
-        unsafe {
-            device.CreateShaderResourceView(
-                &height_atlas,
-                Some(&D3D12_SHADER_RESOURCE_VIEW_DESC {
-                    Format: HEIGHT_ATLAS_FORMAT,
-                    ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
-                    Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
-                    Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
-                        Texture2D: D3D12_TEX2D_SRV {
-                            MostDetailedMip: 0,
-                            MipLevels: 1,
-                            PlaneSlice: 0,
-                            ResourceMinLODClamp: 0.0,
-                        },
-                    },
-                }),
-                resource_heap.get_cpu_handle(device, GpuResource::TerrainHeightAtlas as u32),
-            );
-        }
-
-        let indirection_format = DXGI_FORMAT_R32G32_UINT;
-        let indirection_texture = ID3D12Resource::new_texture_2d(
-            device,
-            indirection_format,
-            INDIRECTION_SLOT_COUNT,
-            INDIRECTION_SLOT_COUNT,
-            PATCH_LOD_COUNT,
-        )?;
-        let indirection_upload_buffer =
-            ID3D12Resource::new_buffer(device, D3D12_HEAP_TYPE_UPLOAD, get_texture_size(&indirection_texture))?;
-
-        unsafe {
-            device.CreateShaderResourceView(
-                &indirection_texture,
-                Some(&D3D12_SHADER_RESOURCE_VIEW_DESC {
-                    Format: indirection_format,
-                    ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
-                    Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
-                    Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
-                        Texture2D: D3D12_TEX2D_SRV {
-                            MostDetailedMip: 0,
-                            MipLevels: PATCH_LOD_COUNT,
-                            PlaneSlice: 0,
-                            ResourceMinLODClamp: 0.0,
-                        },
-                    },
-                }),
-                resource_heap.get_cpu_handle(device, GpuResource::TerrainIndirectionTexture as u32),
-            );
-        }
-
-        let mut free_slots = Vec::with_capacity((ATLAS_PATCH_COUNT * ATLAS_PATCH_COUNT) as usize);
-        for y in (0..ATLAS_PATCH_COUNT).rev() {
-            for x in (0..ATLAS_PATCH_COUNT).rev() {
-                free_slots.push(UVec2::new(x, y));
-            }
-        }
-
         Ok(Self {
             render_distance,
             lod_factor: 3.0,
@@ -410,29 +382,39 @@ impl TerrainData {
             cam_world_index: IVec2::ZERO,
             leaf_patches: Vec::new(),
 
+            patch_cache: HashMap::new(),
+            patch_gen_pool: PatchGenPool::new(),
+            atlas_free_slots: {
+                let mut free_slots = Vec::with_capacity((ATLAS_PATCH_COUNT * ATLAS_PATCH_COUNT) as usize);
+                for y in (0..ATLAS_PATCH_COUNT).rev() {
+                    for x in (0..ATLAS_PATCH_COUNT).rev() {
+                        free_slots.push(UVec2::new(x, y));
+                    }
+                }
+
+                free_slots
+            },
+
             patch_index_buffer,
             patch_buffer_item_count: max_patch_count,
             patch_buffer_ptr: patch_buffer.map::<GpuTerrainPatch>()?,
             patch_buffer,
 
+            indirection_texture_ptr: indirection_texture_upload.map::<UVec2>()?,
+            indirection_texture_upload,
+            indirection_texture,
+            indirection_texture_size,
+
+            height_atlas_ptr: height_atlas_upload.map::<f32>()?,
+            height_atlas_upload,
+            height_atlas,
+            height_atlas_size,
+
             solid_const_buffer: ConstBuffer::new(device)?,
             wireframe_const_buffer: ConstBuffer::new(device)?,
 
-            height_mapped_ptr: height_upload_buffer.map::<u8>()?,
-            height_upload_buffer,
-            height_atlas,
-
-            indirection_mapped_ptr: indirection_upload_buffer.map::<u8>()?,
-            indirection_upload_buffer,
-            indirection_texture,
-
-            solid_vertex_pso: create_vertex_pso(solid_state)?,
-            wireframe_vertex_pso: create_vertex_pso(wireframe_state)?,
-            // solid_mesh_pso: create_mesh_pso(solid_state)?,
-            // wireframe_mesh_pso: create_mesh_pso(wireframe_state)?,
-            patch_cache: HashMap::new(),
-            patch_gen_pool: PatchGenPool::new(),
-            atlas_free_slots: free_slots,
+            solid_vertex_pso: create_vertex_pso(create_rasterizer_state(D3D12_FILL_MODE_SOLID))?,
+            wireframe_vertex_pso: create_vertex_pso(create_rasterizer_state(D3D12_FILL_MODE_WIREFRAME))?,
         })
     }
 
@@ -532,6 +514,7 @@ impl TerrainData {
         cmd_list: &ID3D12GraphicsCommandList,
         cpu_frame_index: u64,
         gpu_frame_index: u64,
+        active_frame_index: u32,
     ) -> Result<()> {
         let mut atlas_layout = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
         unsafe {
@@ -546,6 +529,8 @@ impl TerrainData {
                 None,
             );
         }
+
+        let upload_byte_offset = active_frame_index as usize * self.height_atlas_size;
 
         let mut patches_to_update = Vec::new();
 
@@ -574,7 +559,7 @@ impl TerrainData {
                 unsafe {
                     std::ptr::copy_nonoverlapping(
                         height_data.as_ptr().add(src_offset as usize),
-                        (self.height_mapped_ptr as *mut f32).byte_add(dst_offset as usize),
+                        self.height_atlas_ptr.byte_add(upload_byte_offset + dst_offset as usize),
                         ATLAS_PATCH_PIXEL_SIZE as usize,
                     );
                 }
@@ -591,11 +576,11 @@ impl TerrainData {
                     atlas_index.y * ATLAS_PATCH_PIXEL_SIZE,
                     0,
                     &D3D12_TEXTURE_COPY_LOCATION {
-                        pResource: std::mem::transmute_copy(&self.height_upload_buffer),
+                        pResource: std::mem::transmute_copy(&self.height_atlas_upload),
                         Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
                         Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
                             PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
-                                Offset: patch_offset_bytes as u64,
+                                Offset: upload_byte_offset as u64 + patch_offset_bytes as u64,
                                 Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
                                     Format: HEIGHT_ATLAS_FORMAT,
                                     Width: ATLAS_PATCH_PIXEL_SIZE,
@@ -620,7 +605,12 @@ impl TerrainData {
         Ok(())
     }
 
-    pub fn upload_indirection_data(&self, device: &ID3D12Device, cmd_list: &ID3D12GraphicsCommandList) -> Result<()> {
+    pub fn upload_indirection_data(
+        &self,
+        device: &ID3D12Device,
+        cmd_list: &ID3D12GraphicsCommandList,
+        active_frame_index: u32,
+    ) -> Result<()> {
         let empty_patch = UVec2::splat(ATLAS_PATCH_COUNT);
 
         let mut resident_patch_lods: [Vec<UVec2>; PATCH_LOD_COUNT as usize] = std::array::from_fn(|i| {
@@ -664,6 +654,8 @@ impl TerrainData {
             );
         }
 
+        let upload_byte_offset = active_frame_index as usize * self.indirection_texture_size;
+
         for lod_index in 0..PATCH_LOD_COUNT {
             let slot_count = INDIRECTION_SLOT_COUNT >> lod_index;
 
@@ -680,7 +672,8 @@ impl TerrainData {
                         resident_patch_lods[lod_index as usize]
                             .as_ptr()
                             .add(cpu_offset as usize),
-                        (self.indirection_mapped_ptr as *mut UVec2).byte_add(gpu_offset as usize),
+                        self.indirection_texture_ptr
+                            .byte_add(upload_byte_offset + gpu_offset as usize),
                         slot_count as usize,
                     );
                 }
@@ -699,10 +692,13 @@ impl TerrainData {
                     0,
                     0,
                     &D3D12_TEXTURE_COPY_LOCATION {
-                        pResource: std::mem::transmute_copy(&self.indirection_upload_buffer),
+                        pResource: std::mem::transmute_copy(&self.indirection_texture_upload),
                         Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
                         Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                            PlacedFootprint: gpu_layout,
+                            PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                                Offset: upload_byte_offset as u64 + gpu_lod_offset,
+                                Footprint: layouts[lod_index as usize].Footprint,
+                            },
                         },
                     },
                     None,
@@ -738,7 +734,7 @@ impl TerrainData {
                     Format: DXGI_FORMAT_R32_UINT,
                 }));
 
-                cmd_list.DrawIndexedInstanced(PATCH_INDEX_COUNT, 1024, 0, 0, 0);
+                cmd_list.DrawIndexedInstanced(PATCH_INDEX_COUNT, self.leaf_patches.len() as u32, 0, 0, 0);
             }
         };
 
@@ -830,7 +826,7 @@ impl PatchGenPool {
         let request_receiver = Arc::new(Mutex::new(request_receiver));
 
         let fbm = Fbm::<Perlin>::new(123)
-            .set_octaves(6)
+            .set_octaves(8)
             .set_frequency(1.0)
             .set_lacunarity(2.0)
             .set_persistence(0.5);
@@ -864,7 +860,7 @@ impl PatchGenPool {
                                 .set_y_bounds(fbm_pos.y, fbm_pos.y + fbm_size + fbm_pixel_size) // pixel overlap
                                 .build()
                                 .into_iter()
-                                .map(|n| n as f32)
+                                .map(|n| (n as f32 * 1.5 + 0.3).clamp(0.0, 1.0))
                                 .collect::<Vec<_>>();
 
                             result_sender.send(PatchGenResult { request, height_map }).unwrap();

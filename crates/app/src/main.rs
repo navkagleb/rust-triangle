@@ -516,8 +516,8 @@ fn main() -> Result<()> {
 
             {
                 terrain.collect_leaf_patches(&camera_position, active_frame_index)?;
-                terrain.upload_atlas_data(&device, &cmd_list, cpu_frame_index, gpu_frame_index)?;
-                terrain.upload_indirection_data(&device, &cmd_list)?;
+                terrain.upload_atlas_data(&device, &cmd_list, cpu_frame_index, gpu_frame_index, active_frame_index)?;
+                terrain.upload_indirection_data(&device, &cmd_list, active_frame_index)?;
                 terrain.render(&cmd_list, &camera, active_frame_index);
             }
 

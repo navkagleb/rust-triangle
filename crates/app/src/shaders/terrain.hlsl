@@ -5,9 +5,7 @@ struct VsInput {
 
 struct VsOutput {
     float4 clip_position : SV_Position;
-    float3 debug_color: Color;
-    float3 debug_color2: Color2;
-    nointerpolation uint lod_index : LodIndex;
+    float3 debug_color: DebugColor;
     float2 uv : Uv;
     float height : Height;
 };
@@ -63,20 +61,6 @@ float3 height_to_color(float h) {
     return snow;
 }
 
-float3 lod_to_color(uint lod) {
-    switch (lod) {
-        case 0: return float3(1.0, 0.0, 0.0); // red
-        case 1: return float3(1.0, 0.5, 0.0); // orange
-        case 2: return float3(1.0, 1.0, 0.0); // yellow
-        case 3: return float3(0.0, 1.0, 0.0); // green
-        case 4: return float3(0.0, 1.0, 1.0); // cyan
-        case 5: return float3(0.0, 0.0, 1.0); // blue
-        case 6: return float3(0.5, 0.0, 1.0); // purple
-    }
-
-    return float3(1.0, 1.0, 1.0); // white
-}
-
 float3 hsv_to_rgb(float h, float s, float v) {
     const float4 K = float4(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);
     const float3 p = abs(frac(h + K.xyz) * 6.0 - K.www);
@@ -108,13 +92,13 @@ static const uint PATCH_INDEX_BUFFER_INDEX = 3;
 
 static const uint PATCH_PIXEL_SIZE = 128;
 static const uint PATCH_WORLD_SIZE = 64;
-static const uint PATCH_LOD_COUNT = 4;
+static const uint PATCH_LOD_COUNT = 5;
 static const uint PATCH_QUAD_COUNT = PATCH_PIXEL_SIZE;
 static const uint PATCH_VERTEX_COUNT = (PATCH_QUAD_COUNT + 1) * (PATCH_QUAD_COUNT + 1);
 static const uint PATCH_TRIANGLE_COUNT = PATCH_QUAD_COUNT * PATCH_QUAD_COUNT * 2;
 
 static const uint ATLAS_PATCH_PIXEL_SIZE = PATCH_PIXEL_SIZE + 1; // for pixel overlap
-static const uint INDIRECTION_SLOT_COUNT = 64;
+static const uint INDIRECTION_SLOT_COUNT = 128;
 
 static const uint TOP_STITCH_BIT = 1 << 0;
 static const uint BOTTOM_STITCH_BIT = 1 << 1;
@@ -165,7 +149,6 @@ VsOutput ProcessVertex(uint vertex_id, uint instance_id) {
     VsOutput output = (VsOutput)0;
     output.clip_position = mul(consts.world_to_clip, float4(world_position, 1.0));
     output.debug_color = patch_color(patch);
-    output.lod_index = patch.lod_index;
     output.uv = uv;
     output.height = height;
 
@@ -211,11 +194,7 @@ float4 ps_main(VsOutput input) : SV_Target {
     const float3 ambient = 0.1;
 #endif
     
-    float3 color = input.debug_color;
-
-    // if (!consts.wireframe_pass) {
-    //     color *= ambient + ndotl;
-    // }
+    float3 color = consts.wireframe_pass ? input.debug_color : height_to_color(input.height);
 
     return float4(color, 1.0);
 }
