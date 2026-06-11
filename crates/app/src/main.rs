@@ -428,10 +428,6 @@ fn main() -> Result<()> {
         }
 
         let mut freeze_camera = false;
-        let mut mesh_pipeline_enabled = false;
-        let mut solid_mode = false;
-        let mut wireframe_mode = true;
-        let mut stitching_enabled = true;
         let mut draw_patches = false;
         let mut draw_quad_tree = true;
         let mut display_lod = true;
@@ -480,7 +476,7 @@ fn main() -> Result<()> {
                 camera_position = *camera.position();
             }
 
-            let terrain_patches = terrain.collect_leafs(&camera_position)?;
+            terrain.collect_leaf_patches(&camera_position)?;
 
             // Render
             let active_frame_index = swap_chain.GetCurrentBackBufferIndex();
@@ -523,47 +519,7 @@ fn main() -> Result<()> {
             {
                 terrain.upload_atlas_data(&device, &cmd_list, cpu_frame_index, gpu_frame_index)?;
                 terrain.upload_indirection_data(&device, &cmd_list)?;
-
-                let mut consts = GpuTerrainConsts {
-                    world_to_clip: camera.world_to_clip(),
-                    cam_world_index: terrain.cam_world_index,
-                    world_scale: terrain.world_scale,
-                    height_scale: terrain.height_scale,
-                    wireframe_pass: false.into(),
-                    stitching_enabled: stitching_enabled.into(),
-                };
-
-                let render_terrain = |vertex_pso: &ID3D12PipelineState| {
-                    if terrain_patches.is_empty() {
-                        return;
-                    }
-
-                    cmd_list.SetPipelineState(vertex_pso);
-                    cmd_list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-                    cmd_list.IASetIndexBuffer(Some(&terrain.patch_ibv));
-
-                    cmd_list.DrawIndexedInstanced(terrain.patch_index_count, 1024, 0, 0, 0);
-                };
-
-                if solid_mode {
-                    cmd_list.SetGraphicsRootConstantBufferView(
-                        1,
-                        terrain.solid_const_buffer.write(active_frame_index, &consts),
-                    );
-
-                    render_terrain(&terrain.solid_vertex_pso);
-                }
-
-                if wireframe_mode {
-                    consts.wireframe_pass = true.into();
-
-                    cmd_list.SetGraphicsRootConstantBufferView(
-                        1,
-                        terrain.wireframe_const_buffer.write(active_frame_index, &consts),
-                    );
-
-                    render_terrain(&terrain.wireframe_vertex_pso);
-                }
+                terrain.render(&cmd_list, &camera, active_frame_index);
             }
 
             {
@@ -598,7 +554,7 @@ fn main() -> Result<()> {
                     imgui_text!("Render distance: {}", terrain.render_distance);
                     imgui_text!("Render patch count: {}", stats.render_count);
                     imgui_text!("Render patch count ^2: {}", stats.render_count.pow(2));
-                    imgui_text!("Terrain patches (leafs): {}", terrain_patches.len());
+                    imgui_text!("Terrain patches (leafs): {}", terrain.leaf_patches().len());
                     imgui_text!("Cached: {}", stats.cached_count);
                     imgui_text!("Requested: {}", stats.requested_count);
                     imgui_text!("Generated: {}", stats.generated_count);
@@ -607,10 +563,9 @@ fn main() -> Result<()> {
                     ImGui_NewLine();
 
                     ImGui_Checkbox(c"Freeze camera".as_ptr(), &mut freeze_camera);
-                    ImGui_Checkbox(c"Mesh pipeline".as_ptr(), &mut mesh_pipeline_enabled);
-                    ImGui_Checkbox(c"Solid mode".as_ptr(), &mut solid_mode);
-                    ImGui_Checkbox(c"Wireframe mode".as_ptr(), &mut wireframe_mode);
-                    ImGui_Checkbox(c"Stitching".as_ptr(), &mut stitching_enabled);
+                    ImGui_Checkbox(c"Solid mode".as_ptr(), &mut terrain.solid_mode);
+                    ImGui_Checkbox(c"Wireframe mode".as_ptr(), &mut terrain.wireframe_mode);
+                    ImGui_Checkbox(c"Stitching".as_ptr(), &mut terrain.stitching_enabled);
                     ImGui_Checkbox(c"Draw patches".as_ptr(), &mut draw_patches);
                     ImGui_Checkbox(c"Draw quad tree".as_ptr(), &mut draw_quad_tree);
 
@@ -702,7 +657,7 @@ fn main() -> Result<()> {
                     );
 
                     if draw_quad_tree {
-                        for leaf in &terrain_patches {
+                        for leaf in terrain.leaf_patches() {
                             let minimap_leaf_pos = window_center + leaf.world_xy().as_vec2() * minimap_scale;
                             let minimap_leaf_size = leaf.world_size() as f32 * minimap_scale;
 

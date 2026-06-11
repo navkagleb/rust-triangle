@@ -7,9 +7,11 @@ use bitflags::bitflags;
 use glam::{IVec2, Mat4, UVec2, Vec3, Vec3Swizzles, f32};
 use noise::utils::{NoiseMapBuilder, PlaneMapBuilder};
 use noise::{Fbm, MultiFractal, Perlin};
+use windows::Win32::Graphics::Direct3D::*;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
+use crate::camera::Camera;
 use crate::d3d12_utils::*;
 use crate::{BACK_BUFFER_FORMAT, DEPTH_BUFFER_FORMAT, GpuResource};
 
@@ -24,6 +26,10 @@ const ATLAS_PATCH_COUNT: u32 = 16;
 const ATLAS_SIZE: u32 = ATLAS_PATCH_PIXEL_SIZE * ATLAS_PATCH_COUNT;
 const HEIGHT_ATLAS_FORMAT: DXGI_FORMAT = DXGI_FORMAT_R32_FLOAT;
 const INDIRECTION_SLOT_COUNT: u32 = 64;
+
+const PATCH_SIDE_QUAD_COUNT: u32 = PATCH_PIXEL_SIZE;
+const PATCH_SIDE_VERTEX_COUNT: u32 = PATCH_PIXEL_SIZE + 1;
+const PATCH_INDEX_COUNT: u32 = PATCH_SIDE_QUAD_COUNT.pow(2) * 6;
 
 bitflags! {
     #[repr(transparent)]
@@ -93,14 +99,18 @@ pub struct TerrainData {
     pub height_scale: f32,
     pub world_scale: f32,
 
-    pub patch_index_count: u32,
-    pub patch_ibv: D3D12_INDEX_BUFFER_VIEW,
-    #[allow(unused)]
+    pub solid_mode: bool,
+    pub wireframe_mode: bool,
+    pub stitching_enabled: bool,
+
+    cam_world_index: IVec2,
+    leaf_patches: Vec<PatchKey>,
+
     patch_index_buffer: ID3D12Resource,
     patch_buffer: ID3D12Resource,
 
-    pub solid_const_buffer: ConstBuffer<GpuTerrainConsts>,
-    pub wireframe_const_buffer: ConstBuffer<GpuTerrainConsts>,
+    solid_const_buffer: ConstBuffer<GpuTerrainConsts>,
+    wireframe_const_buffer: ConstBuffer<GpuTerrainConsts>,
 
     height_atlas: ID3D12Resource,
     height_upload_buffer: ID3D12Resource,
@@ -110,15 +120,13 @@ pub struct TerrainData {
     indirection_upload_buffer: ID3D12Resource,
     indirection_mapped_ptr: *mut u8,
 
-    pub solid_vertex_pso: ID3D12PipelineState,
-    pub wireframe_vertex_pso: ID3D12PipelineState,
+    solid_vertex_pso: ID3D12PipelineState,
+    wireframe_vertex_pso: ID3D12PipelineState,
     // pub solid_mesh_pso: ID3D12PipelineState,
     // pub wireframe_mesh_pso: ID3D12PipelineState,
     patch_cache: HashMap<PatchKey, PatchState>,
     patch_gen_pool: PatchGenPool,
     atlas_free_slots: Vec<UVec2>,
-
-    pub cam_world_index: IVec2,
 }
 
 impl TerrainData {
@@ -128,16 +136,13 @@ impl TerrainData {
         root_signature: &ID3D12RootSignature,
     ) -> Result<Self> {
         let patch_indices = {
-            let quad_count = PATCH_PIXEL_SIZE;
-            let vertex_count = PATCH_PIXEL_SIZE + 1;
+            let mut indices = Vec::with_capacity(PATCH_INDEX_COUNT as usize);
 
-            let mut indices = Vec::with_capacity((quad_count * quad_count * 6) as usize);
-
-            for z in 0..quad_count {
-                for x in 0..quad_count {
-                    let top_left = z * vertex_count + x;
+            for z in 0..PATCH_SIDE_QUAD_COUNT {
+                for x in 0..PATCH_SIDE_QUAD_COUNT {
+                    let top_left = z * PATCH_SIDE_VERTEX_COUNT + x;
                     let top_right = top_left + 1;
-                    let bottom_left = top_left + vertex_count;
+                    let bottom_left = top_left + PATCH_SIDE_VERTEX_COUNT;
                     let bottom_right = bottom_left + 1;
 
                     if (x + z) % 2 == 0 {
@@ -393,17 +398,18 @@ impl TerrainData {
             height_scale: 15.0,
             world_scale: 1.0,
 
-            solid_const_buffer: ConstBuffer::new(device)?,
-            wireframe_const_buffer: ConstBuffer::new(device)?,
+            solid_mode: false,
+            wireframe_mode: true,
+            stitching_enabled: true,
 
-            patch_index_count: patch_indices.len() as u32,
-            patch_ibv: D3D12_INDEX_BUFFER_VIEW {
-                BufferLocation: unsafe { patch_index_buffer.GetGPUVirtualAddress() },
-                SizeInBytes: size_of_val(patch_indices.as_slice()) as u32,
-                Format: DXGI_FORMAT_R32_UINT,
-            },
+            cam_world_index: IVec2::ZERO,
+            leaf_patches: Vec::new(),
+
             patch_index_buffer,
             patch_buffer,
+
+            solid_const_buffer: ConstBuffer::new(device)?,
+            wireframe_const_buffer: ConstBuffer::new(device)?,
 
             height_mapped_ptr: height_upload_buffer.map::<u8>()?,
             height_upload_buffer,
@@ -420,18 +426,21 @@ impl TerrainData {
             patch_cache: HashMap::new(),
             patch_gen_pool: PatchGenPool::new(),
             atlas_free_slots: free_slots,
-
-            cam_world_index: IVec2::ZERO,
         })
     }
 
-    pub fn collect_leafs(&mut self, cam_pos: &Vec3) -> Result<Vec<PatchKey>> {
-        let qtree = PatchQuadTree::new(cam_pos, self.render_distance, self.lod_factor);
-        let leafs = qtree.collect_leafs();
+    pub fn leaf_patches(&self) -> &[PatchKey] {
+        &self.leaf_patches
+    }
 
+    pub fn collect_leaf_patches(&mut self, cam_pos: &Vec3) -> Result<()> {
+        let qtree = PatchQuadTree::new(cam_pos, self.render_distance, self.lod_factor);
+
+        self.leaf_patches = qtree.collect_leafs();
         self.cam_world_index = cam_pos.xz().as_ivec2() / PATCH_WORLD_SIZE as i32;
 
-        let mut missing_patches = leafs
+        let mut missing_patches = self
+            .leaf_patches
             .iter()
             .filter(|l| !self.patch_cache.contains_key(l))
             .collect::<Vec<_>>();
@@ -456,7 +465,8 @@ impl TerrainData {
         let is_neighbor_coarser = |node: &PatchKey, direction: IVec2| -> bool {
             let probe = node.world_center() + direction * node.world_size() as i32;
 
-            let neighbor_lod_index = leafs
+            let neighbor_lod_index = self
+                .leaf_patches
                 .iter()
                 .find(|l| (l.world_center() - probe).length_squared() < node.world_size().pow(2) as i32)
                 .map(|l| l.lod_index)
@@ -465,7 +475,8 @@ impl TerrainData {
             neighbor_lod_index > node.lod_index
         };
 
-        let gpu_patches = leafs
+        let gpu_patches = self
+            .leaf_patches
             .iter()
             .filter(|l| {
                 self.patch_cache
@@ -499,7 +510,7 @@ impl TerrainData {
         // TODO: Should be used storage per frame"
         self.patch_buffer.map_and_write(gpu_patches.as_slice())?;
 
-        Ok(leafs)
+        Ok(())
     }
 
     pub fn upload_atlas_data(
@@ -687,6 +698,55 @@ impl TerrainData {
         }
 
         Ok(())
+    }
+
+    pub fn render(&self, cmd_list: &ID3D12GraphicsCommandList, cam: &Camera, active_frame_index: u32) {
+        let mut consts = GpuTerrainConsts {
+            world_to_clip: cam.world_to_clip(),
+            cam_world_index: self.cam_world_index,
+            world_scale: self.world_scale,
+            height_scale: self.height_scale,
+            wireframe_pass: false.into(),
+            stitching_enabled: self.stitching_enabled.into(),
+        };
+
+        let render_terrain = |vertex_pso: &ID3D12PipelineState| {
+            if self.leaf_patches.is_empty() {
+                return;
+            }
+
+            unsafe {
+                cmd_list.SetPipelineState(vertex_pso);
+                cmd_list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                cmd_list.IASetIndexBuffer(Some(&D3D12_INDEX_BUFFER_VIEW {
+                    BufferLocation: self.patch_index_buffer.GetGPUVirtualAddress(),
+                    SizeInBytes: PATCH_INDEX_COUNT * size_of::<f32>() as u32,
+                    Format: DXGI_FORMAT_R32_UINT,
+                }));
+
+                cmd_list.DrawIndexedInstanced(PATCH_INDEX_COUNT, 1024, 0, 0, 0);
+            }
+        };
+
+        if self.solid_mode {
+            unsafe {
+                cmd_list
+                    .SetGraphicsRootConstantBufferView(1, self.solid_const_buffer.write(active_frame_index, &consts));
+            }
+            render_terrain(&self.solid_vertex_pso);
+        }
+
+        if self.wireframe_mode {
+            consts.wireframe_pass = true.into();
+
+            unsafe {
+                cmd_list.SetGraphicsRootConstantBufferView(
+                    1,
+                    self.wireframe_const_buffer.write(active_frame_index, &consts),
+                );
+            }
+            render_terrain(&self.wireframe_vertex_pso);
+        }
     }
 }
 
