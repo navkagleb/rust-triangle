@@ -14,16 +14,15 @@ struct VsOutput {
 
 struct TerrainConsts {
     float4x4 world_to_clip;
-    float2 world_center_tile;
+    int2 cam_world_index;
     float world_scale;
     float height_scale;
     uint wireframe_pass;
     uint stitching_enabled;
 };
 
-struct TerrainNode {
-    float2 center;
-    float half_size;
+struct TerrainPatch {
+    int2 world_index;
     uint lod_index;
     uint stitch_mask;
 };
@@ -84,10 +83,10 @@ float3 hsv_to_rgb(float h, float s, float v) {
     return v * lerp(K.xxx, saturate(p - K.xxx), s);
 }
 
-float3 node_color(TerrainNode node) {
-    const int x = (int)(node.center.x / node.half_size);
-    const int z = (int)(node.center.y / node.half_size);
-    const uint lod = node.lod_index;
+float3 patch_color(TerrainPatch patch) {
+    const int x = patch.world_index.x;
+    const int z = patch.world_index.y;
+    const uint lod = patch.lod_index;
 
     uint hash = x * 73856093u;
     hash = hash ^ (z * 19349663u);
@@ -105,93 +104,58 @@ float3 node_color(TerrainNode node) {
 static const uint INDIRECTION_TEXTURE_INDEX = 1;
 static const uint HEIGHT_ATLAS_INDEX = 2;
 static const uint NORMAL_ATLAS_INDEX = 3;
-static const uint TERRAIN_NODE_BUFFER_INDEX = 4;
-static const uint TILE_INDEX_BUFFER_INDEX = 5;
+static const uint TERRAIN_PATCH_BUFFER_INDEX = 4;
+static const uint PATCH_INDEX_BUFFER_INDEX = 5;
 
-static const uint TILE_QUAD_COUNT = 8;
-static const uint TILE_VERTEX_COUNT = (TILE_QUAD_COUNT + 1) * (TILE_QUAD_COUNT + 1);
-static const uint TILE_TRIANGLE_COUNT = TILE_QUAD_COUNT * TILE_QUAD_COUNT * 2;
+static const uint PATCH_PIXEL_SIZE = 128;
+static const uint PATCH_WORLD_SIZE = 64;
+static const uint PATCH_LOD_COUNT = 4;
+static const uint PATCH_QUAD_COUNT = PATCH_PIXEL_SIZE;
+static const uint PATCH_VERTEX_COUNT = (PATCH_QUAD_COUNT + 1) * (PATCH_QUAD_COUNT + 1);
+static const uint PATCH_TRIANGLE_COUNT = PATCH_QUAD_COUNT * PATCH_QUAD_COUNT * 2;
+
+static const uint ATLAS_PATCH_PIXEL_SIZE = PATCH_PIXEL_SIZE + 1; // for pixel overlap
+static const uint INDIRECTION_SLOT_COUNT = 64;
 
 static const uint TOP_STITCH_BIT = 1 << 0;
 static const uint BOTTOM_STITCH_BIT = 1 << 1;
 static const uint LEFT_STITCH_BIT = 1 << 2;
 static const uint RIGHT_STITCH_BIT = 1 << 3;
-static const uint TOP_LEFT_STITCH_BIT = 1 << 4;
-static const uint TOP_RIGHT_STITCH_BIT = 1 << 5;
-static const uint BOTTOM_LEFT_STITCH_BIT = 1 << 6;
-static const uint BOTTOM_RIGHT_STITCH_BIT = 1 << 7;
-
-static const float TILE_WORLD_SIZE = 64.0;
-static const uint MAX_TILE_COUNT = 32;
 
 VsOutput ProcessVertex(uint vertex_id, uint instance_id) {
-    const Texture2DArray<uint2> indirection_texture = ResourceDescriptorHeap[INDIRECTION_TEXTURE_INDEX];
+    const StructuredBuffer<TerrainPatch> patches = ResourceDescriptorHeap[TERRAIN_PATCH_BUFFER_INDEX];
+    const Texture2D<uint2> indirection_texture = ResourceDescriptorHeap[INDIRECTION_TEXTURE_INDEX];
     const Texture2D<float> height_atlas = ResourceDescriptorHeap[HEIGHT_ATLAS_INDEX];
-    const StructuredBuffer<TerrainNode> nodes = ResourceDescriptorHeap[TERRAIN_NODE_BUFFER_INDEX];
 
-    const TerrainNode node = nodes[instance_id];
+    const TerrainPatch patch = patches[instance_id];
 
-    uint vx = vertex_id % (TILE_QUAD_COUNT + 1);
-    uint vz = vertex_id / (TILE_QUAD_COUNT + 1);
-    uint lod_index = node.lod_index;
+    uint ix = vertex_id % (PATCH_QUAD_COUNT + 1);
+    uint iz = vertex_id / (PATCH_QUAD_COUNT + 1);
 
-    if (consts.stitching_enabled)
-    {
-        const bool stitch_x = (vz == 0 && node.stitch_mask & TOP_STITCH_BIT) || (vz == TILE_QUAD_COUNT && node.stitch_mask & BOTTOM_STITCH_BIT);
-        const bool stitch_z = (vx == 0 && node.stitch_mask & LEFT_STITCH_BIT) || (vx == TILE_QUAD_COUNT && node.stitch_mask & RIGHT_STITCH_BIT);
+    if (consts.stitching_enabled) {
+        const uint mask = patch.stitch_mask;
+        const bool stitch_x = (iz == 0 && mask & TOP_STITCH_BIT) || (iz == PATCH_QUAD_COUNT && mask & BOTTOM_STITCH_BIT);
+        const bool stitch_z = (ix == 0 && mask & LEFT_STITCH_BIT) || (ix == PATCH_QUAD_COUNT && mask & RIGHT_STITCH_BIT);
 
         if (stitch_x) {
-            vx = (vx / 2) * 2;
+            ix = (ix / 2) * 2;
         }
 
         if (stitch_z) {
-            vz = (vz / 2) * 2;
-        }
-
-        const bool stitch_corner =
-            (vx == 0 && vz == 0 && node.stitch_mask & TOP_LEFT_STITCH_BIT) ||
-            (vx == TILE_QUAD_COUNT && vz == 0 && node.stitch_mask & TOP_RIGHT_STITCH_BIT)||
-            (vx == 0 && vz == TILE_QUAD_COUNT && node.stitch_mask & BOTTOM_LEFT_STITCH_BIT) ||
-            (vx == TILE_QUAD_COUNT && vz == TILE_QUAD_COUNT && node.stitch_mask & BOTTOM_RIGHT_STITCH_BIT);
-
-        if (stitch_x || stitch_z || stitch_corner) {
-            lod_index += 1;
+            iz = (iz / 2) * 2;
         }
     }
 
-    const float2 tile_uv_bad = float2(vx, vz) / (float)TILE_QUAD_COUNT; // 0..1
-    const float2 world_xz = node.center + node.half_size * (tile_uv_bad - 0.5) * 2.0;
+    const float2 uv = float2(ix, iz) / (float)PATCH_QUAD_COUNT; // 0..1
+    const float world_size = PATCH_WORLD_SIZE * 1 << patch.lod_index;
+    const float2 world_xz = patch.world_index * (int)PATCH_WORLD_SIZE + world_size * uv;
 
-#if 0
-    const float2 tile_uv = float2(vx, vz) / ((float)TILE_QUAD_COUNT + 0.0001);
+    const uint lod_index = patch.lod_index;
+    const int2 relative_index = (patch.world_index >> lod_index) - (consts.cam_world_index >> lod_index);
+    const int2 indirection_index = relative_index + (INDIRECTION_SLOT_COUNT >> lod_index) / 2;
+    const uint2 atlas_index = indirection_texture.mips[lod_index][indirection_index];
 
-    const int2 world_tile = (node.center - node.half_size) / TILE_WORLD_SIZE;
-    const int2 relative_tile = world_tile - consts.world_center_tile;
-    const int2 indirection_coord = relative_tile + MAX_TILE_COUNT / 2;
-    const float2 atlas_tile = indirection_texture[uint3(indirection_coord.x, indirection_coord.y, node.lod_index)];
-
-    const float2 atlas_uv = (atlas_tile + tile_uv) / float(MAX_TILE_COUNT);
-#else
-    int2 world_tile = (node.center - node.half_size) / TILE_WORLD_SIZE;
-    float2 tile_uv = tile_uv_bad;
-
-    if (vx == TILE_QUAD_COUNT) {
-        world_tile.x += 1;
-        tile_uv.x = 0.0;
-    }
-
-    if (vz == TILE_QUAD_COUNT) {
-        world_tile.y += 1;
-        tile_uv.y = 0.0;
-    }
-
-    const int2 relative_tile = world_tile - int2(consts.world_center_tile);
-    const int2 indirection_coord = relative_tile + MAX_TILE_COUNT / 2;
-    const float2 atlas_tile = indirection_texture[uint3(indirection_coord.x, indirection_coord.y, node.lod_index)];
-
-    const float2 atlas_uv = (atlas_tile + tile_uv) / float(MAX_TILE_COUNT);
-#endif
-    const float height = height_atlas.SampleLevel(point_clamp_sampler, atlas_uv, 0).r;
+    const float height = height_atlas[atlas_index * ATLAS_PATCH_PIXEL_SIZE + uint2(ix, iz)];
 
     const float3 world_position = float3(
         world_xz.x * consts.world_scale,
@@ -201,12 +165,9 @@ VsOutput ProcessVertex(uint vertex_id, uint instance_id) {
 
     VsOutput output = (VsOutput)0;
     output.clip_position = mul(consts.world_to_clip, float4(world_position, 1.0));
-    output.debug_color = node_color(node);
-    output.debug_color2 = float3(tile_uv, 0.0);
-    output.debug_color2 = float3(height * 0.5 + 0.5, 0.0, 0.0);
-    // output.debug_color2 = float3(float2(world_tile) / 24.0, 0.0);
-    output.lod_index = node.lod_index;
-    output.uv = atlas_uv;
+    output.debug_color = patch_color(patch);
+    output.lod_index = patch.lod_index;
+    output.uv = uv;
     output.height = height;
 
     return output;
@@ -221,18 +182,18 @@ VsOutput vs_main(VsInput input) {
 void ms_main(
     uint gtid : SV_GroupThreadID,
     uint gid : SV_GroupID,
-    out vertices VsOutput vertices[TILE_VERTEX_COUNT],
-    out indices uint3 triangles[TILE_TRIANGLE_COUNT]
+    out vertices VsOutput vertices[PATCH_VERTEX_COUNT],
+    out indices uint3 triangles[PATCH_TRIANGLE_COUNT]
 ) {
-    SetMeshOutputCounts(TILE_VERTEX_COUNT, TILE_TRIANGLE_COUNT);
+    SetMeshOutputCounts(PATCH_VERTEX_COUNT, PATCH_TRIANGLE_COUNT);
 
-    if (gtid < TILE_VERTEX_COUNT) {
+    if (gtid < PATCH_VERTEX_COUNT) {
         vertices[gtid] = ProcessVertex(gtid, gid);
     }
 
-    const Buffer<uint> index_buffer = ResourceDescriptorHeap[TILE_INDEX_BUFFER_INDEX];
+    const Buffer<uint> index_buffer = ResourceDescriptorHeap[PATCH_INDEX_BUFFER_INDEX];
 
-    if (gtid < TILE_TRIANGLE_COUNT) { 
+    if (gtid < PATCH_TRIANGLE_COUNT) { 
         triangles[gtid] = uint3(
             index_buffer[gtid * 3 + 0],
             index_buffer[gtid * 3 + 1],
@@ -251,7 +212,7 @@ float4 ps_main(VsOutput input) : SV_Target {
     const float3 ambient = 0.1;
 #endif
     
-    float3 color = consts.wireframe_pass ? input.debug_color : height_to_color(input.height);
+    float3 color = input.debug_color;
 
     // if (!consts.wireframe_pass) {
     //     color *= ambient + ndotl;

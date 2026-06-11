@@ -1,7 +1,6 @@
 {
     "terrain.hlsl": [
         "vs",
-        "ms",
         "ps"
     ]
 }

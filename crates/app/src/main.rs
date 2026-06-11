@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use glam::{Vec2, Vec3};
+use glam::{Vec2, Vec3, Vec3Swizzles};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Direct3D::*;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -43,8 +43,8 @@ enum GpuResource {
     TerrainHeightAtlas,
     #[allow(unused)]
     TerrainNormalAtlas,
-    TerrainNodeBuffer,
-    TerrainTileIndexBuffer,
+    TerrainPatchBuffer,
+    TerrainPatchIndexBuffer,
     Count,
 }
 
@@ -427,12 +427,15 @@ fn main() -> Result<()> {
             });
         }
 
-        let mut freeze_camera = true;
-        let mut mesh_pipeline_enabled = true;
-        let mut wireframe_enabled = true;
-        let mut stitching_enabled = false;
-        let mut draw_tiles = false;
+        let mut freeze_camera = false;
+        let mut mesh_pipeline_enabled = false;
+        let mut solid_mode = false;
+        let mut wireframe_mode = true;
+        let mut stitching_enabled = true;
+        let mut draw_patches = false;
         let mut draw_quad_tree = true;
+        let mut display_lod = true;
+        let mut display_size = false;
 
         let mut camera_position: glam::Vec3 = *camera.position();
 
@@ -477,7 +480,7 @@ fn main() -> Result<()> {
                 camera_position = *camera.position();
             }
 
-            let terrain_nodes = terrain.collect_nodes(&camera_position)?;
+            let terrain_patches = terrain.collect_leafs(&camera_position)?;
 
             // Render
             let active_frame_index = swap_chain.GetCurrentBackBufferIndex();
@@ -518,45 +521,40 @@ fn main() -> Result<()> {
             cmd_list.SetGraphicsRootSignature(&root_signature);
 
             {
-                terrain.upload_tiles_to_gpu(&device, &cmd_list, cpu_frame_index, gpu_frame_index)?;
-                terrain.update_indirection_texture(&device, &cmd_list)?;
+                terrain.upload_atlas_data(&device, &cmd_list, cpu_frame_index, gpu_frame_index)?;
+                terrain.upload_indirection_data(&device, &cmd_list)?;
 
                 let mut consts = GpuTerrainConsts {
                     world_to_clip: camera.world_to_clip(),
-                    world_center_tile: terrain.world_center_tile.as_vec2(),
+                    cam_world_index: terrain.cam_world_index,
                     world_scale: terrain.world_scale,
                     height_scale: terrain.height_scale,
                     wireframe_pass: false.into(),
                     stitching_enabled: stitching_enabled.into(),
                 };
 
-                cmd_list.SetGraphicsRootConstantBufferView(
-                    1,
-                    terrain.solid_const_buffer.write(active_frame_index, &consts),
-                );
-
-                let render_terrain = |vertex_pso: &ID3D12PipelineState, mesh_pso: &ID3D12PipelineState| {
-                    if mesh_pipeline_enabled {
-                        cmd_list.SetPipelineState(mesh_pso);
-                        cmd_list.DispatchMesh(terrain_nodes.len() as u32, 1, 1);
-                    } else {
-                        cmd_list.SetPipelineState(vertex_pso);
-                        cmd_list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-                        cmd_list.IASetIndexBuffer(Some(&terrain.tile_ibv));
-
-                        cmd_list.DrawIndexedInstanced(
-                            terrain.tile_index_count as u32,
-                            terrain_nodes.len() as u32,
-                            0,
-                            0,
-                            0,
-                        );
+                let render_terrain = |vertex_pso: &ID3D12PipelineState| {
+                    if terrain_patches.is_empty() {
+                        return;
                     }
+
+                    cmd_list.SetPipelineState(vertex_pso);
+                    cmd_list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                    cmd_list.IASetIndexBuffer(Some(&terrain.patch_ibv));
+
+                    cmd_list.DrawIndexedInstanced(terrain.patch_index_count, 1024, 0, 0, 0);
                 };
 
-                render_terrain(&terrain.solid_vertex_pso, &terrain.solid_mesh_pso);
+                if solid_mode {
+                    cmd_list.SetGraphicsRootConstantBufferView(
+                        1,
+                        terrain.solid_const_buffer.write(active_frame_index, &consts),
+                    );
 
-                if wireframe_enabled {
+                    render_terrain(&terrain.solid_vertex_pso);
+                }
+
+                if wireframe_mode {
                     consts.wireframe_pass = true.into();
 
                     cmd_list.SetGraphicsRootConstantBufferView(
@@ -564,7 +562,7 @@ fn main() -> Result<()> {
                         terrain.wireframe_const_buffer.write(active_frame_index, &consts),
                     );
 
-                    render_terrain(&terrain.wireframe_vertex_pso, &terrain.wireframe_mesh_pso);
+                    render_terrain(&terrain.wireframe_vertex_pso);
                 }
             }
 
@@ -595,26 +593,45 @@ fn main() -> Result<()> {
 
                 ImGui_Begin(c"HeightMap".as_ptr(), std::ptr::null_mut(), 0);
                 {
-                    imgui_text!("Render distance: {}", RENDER_DISTANCE);
-                    imgui_text!("Active nodes (leafs): {}", terrain_nodes.len());
-                    imgui_text!("Requested tiles: {}", terrain.requested_count);
-                    imgui_text!("Generated tiles: {}", terrain.generated_count);
-                    imgui_text!("Uploading tiles: {}", terrain.uploading_count);
-                    imgui_text!("Resident tiles: {}", terrain.resident_count);
+                    let stats = TerrainPatchStats::gather(&terrain);
+
+                    imgui_text!("Render distance: {}", terrain.render_distance);
+                    imgui_text!("Render patch count: {}", stats.render_count);
+                    imgui_text!("Render patch count ^2: {}", stats.render_count.pow(2));
+                    imgui_text!("Terrain patches (leafs): {}", terrain_patches.len());
+                    imgui_text!("Cached: {}", stats.cached_count);
+                    imgui_text!("Requested: {}", stats.requested_count);
+                    imgui_text!("Generated: {}", stats.generated_count);
+                    imgui_text!("Uploading: {}", stats.uploading_count);
+                    imgui_text!("Resident: {}", stats.resident_count);
                     ImGui_NewLine();
 
                     ImGui_Checkbox(c"Freeze camera".as_ptr(), &mut freeze_camera);
                     ImGui_Checkbox(c"Mesh pipeline".as_ptr(), &mut mesh_pipeline_enabled);
-                    ImGui_Checkbox(c"Wireframe".as_ptr(), &mut wireframe_enabled);
+                    ImGui_Checkbox(c"Solid mode".as_ptr(), &mut solid_mode);
+                    ImGui_Checkbox(c"Wireframe mode".as_ptr(), &mut wireframe_mode);
                     ImGui_Checkbox(c"Stitching".as_ptr(), &mut stitching_enabled);
-                    ImGui_Checkbox(c"Draw tiles".as_ptr(), &mut draw_tiles);
+                    ImGui_Checkbox(c"Draw patches".as_ptr(), &mut draw_patches);
                     ImGui_Checkbox(c"Draw quad tree".as_ptr(), &mut draw_quad_tree);
+
+                    if ImGui_Checkbox(c"Display LOD".as_ptr(), &mut display_lod) && display_lod {
+                        display_size = false;
+                    }
+
+                    if ImGui_Checkbox(c"Display size".as_ptr(), &mut display_size) && display_size {
+                        display_lod = false;
+                    }
+
                     ImGui_NewLine();
 
                     imgui_text!("Camera position: {}", camera.position());
                     ImGui_DragFloat(c"Camera speed".as_ptr(), &mut camera_controller.speed);
                     ImGui_NewLine();
 
+                    ImGui_InputInt(
+                        c"Render distance".as_ptr(),
+                        &mut terrain.render_distance as *mut u32 as *mut i32,
+                    );
                     ImGui_InputFloat(c"LOD factor".as_ptr(), &mut terrain.lod_factor);
                     ImGui_InputFloat(c"Height scale".as_ptr(), &mut terrain.height_scale);
                     ImGui_InputFloat(c"World scale".as_ptr(), &mut terrain.world_scale);
@@ -639,42 +656,27 @@ fn main() -> Result<()> {
                         },
                     );
 
-                    let minimap_scale = image_size / (RENDER_DISTANCE * 2.0);
-
-                    let node_minimap_pos = |node_pos: Vec2| -> Vec2 {
-                        let window_center =
-                            Vec2::new(image_position.x + image_size / 2.0, image_position.y + image_size / 2.0);
-
-                        let root_center = Vec2::new(
-                            (camera_position.x / TILE_WORLD_SIZE).round() * TILE_WORLD_SIZE,
-                            (camera_position.z / TILE_WORLD_SIZE).round() * TILE_WORLD_SIZE,
-                        );
-
-                        let relative = node_pos - root_center;
-
-                        window_center + relative * minimap_scale
-                    };
+                    let minimap_scale = image_size / (terrain.render_distance as f32 * 2.0);
 
                     let draw_list = ImGui_GetWindowDrawList();
 
-                    if draw_tiles {
-                        for i in 0..MAX_TILE_COUNT {
-                            for j in 0..MAX_TILE_COUNT {
-                                let half_size = TILE_WORLD_SIZE / 2.0 * minimap_scale;
+                    if draw_patches {
+                        for patch_z in 0..stats.render_count {
+                            for patch_x in 0..stats.render_count {
                                 let center = Vec2::new(
-                                    image_position.x + (i as f32 * TILE_WORLD_SIZE * minimap_scale) + half_size,
-                                    image_position.y + (j as f32 * TILE_WORLD_SIZE * minimap_scale) + half_size,
+                                    image_position.x + ((patch_x * PATCH_WORLD_SIZE) as f32 * minimap_scale),
+                                    image_position.y + ((patch_z * PATCH_WORLD_SIZE) as f32 * minimap_scale),
                                 );
 
                                 ImDrawList_AddRectEx(
                                     draw_list,
                                     ImVec2 {
-                                        x: center.x - half_size,
-                                        y: center.y - half_size,
+                                        x: center.x,
+                                        y: center.y,
                                     },
                                     ImVec2 {
-                                        x: center.x + half_size,
-                                        y: center.y + half_size,
+                                        x: center.x + PATCH_WORLD_SIZE as f32 * minimap_scale,
+                                        y: center.y + PATCH_WORLD_SIZE as f32 * minimap_scale,
                                     },
                                     0xB3FF00FF,
                                     0.0,
@@ -685,21 +687,34 @@ fn main() -> Result<()> {
                         }
                     }
 
+                    let window_center = Vec2::new(image_position.x, image_position.y) + image_size / 2.0;
+
+                    let minimap_cam_pos = window_center + camera_position.xz() * minimap_scale;
+
+                    ImDrawList_AddCircle(
+                        draw_list,
+                        ImVec2 {
+                            x: minimap_cam_pos.x,
+                            y: minimap_cam_pos.y,
+                        },
+                        5.0,
+                        0xFF0000FF,
+                    );
+
                     if draw_quad_tree {
-                        for node in terrain_nodes {
-                            let center = node_minimap_pos(node.center);
-                            let half_size = node.half_size * minimap_scale;
-                            let cell_size = half_size * 2.0;
+                        for leaf in &terrain_patches {
+                            let minimap_leaf_pos = window_center + leaf.world_xy().as_vec2() * minimap_scale;
+                            let minimap_leaf_size = leaf.world_size() as f32 * minimap_scale;
 
                             ImDrawList_AddRectEx(
                                 draw_list,
                                 ImVec2 {
-                                    x: center.x - half_size,
-                                    y: center.y - half_size,
+                                    x: minimap_leaf_pos.x,
+                                    y: minimap_leaf_pos.y,
                                 },
                                 ImVec2 {
-                                    x: center.x + half_size,
-                                    y: center.y + half_size,
+                                    x: minimap_leaf_pos.x + minimap_leaf_size,
+                                    y: minimap_leaf_pos.y + minimap_leaf_size,
                                 },
                                 0xB3FFFFFF,
                                 0.0,
@@ -707,114 +722,27 @@ fn main() -> Result<()> {
                                 0.5,
                             );
 
-                            let world_tile = ((node.center - node.half_size) / (TILE_WORLD_SIZE)).as_ivec2();
-                            let relative_tile = world_tile - terrain.world_center_tile;
-                            let indirection_tile = relative_tile + glam::IVec2::splat(MAX_TILE_COUNT as i32 / 2);
+                            let label = CString::new(if display_lod {
+                                leaf.lod_index.to_string()
+                            } else {
+                                leaf.world_size().to_string()
+                            })
+                            .unwrap();
+                            let label_size = ImGui_CalcTextSize(label.as_ptr());
 
-                            let center_label = CString::new(node.lod_index.to_string()).unwrap();
-                            let center_label =
-                                CString::new(format!("{},{}", indirection_tile.x, indirection_tile.y)).unwrap();
-                            let center_label_size = ImGui_CalcTextSize(center_label.as_ptr());
-
-                            // if center_label_size.x >= cell_size || center_label_size.y >= cell_size {
-                            //     continue;
-                            // }
-
-                            ImDrawList_AddCircle(
-                                draw_list,
-                                ImVec2 {
-                                    x: node_minimap_pos(world_tile.as_vec2() * TILE_WORLD_SIZE).x,
-                                    y: node_minimap_pos(world_tile.as_vec2() * TILE_WORLD_SIZE).y,
-                                },
-                                5.0,
-                                0xFFFFFFFF,
-                            );
+                            if label_size.x >= minimap_leaf_size || label_size.y >= minimap_leaf_size {
+                                continue;
+                            }
 
                             ImDrawList_AddText(
                                 draw_list,
                                 ImVec2 {
-                                    x: center.x - center_label_size.x / 2.0,
-                                    y: center.y - center_label_size.y / 2.0,
+                                    x: minimap_leaf_pos.x + minimap_leaf_size * 0.5 - label_size.x * 0.5,
+                                    y: minimap_leaf_pos.y + minimap_leaf_size * 0.5 - label_size.y * 0.5,
                                 },
                                 0xFFFFFFFF,
-                                center_label.as_ptr(),
+                                label.as_ptr(),
                             );
-
-                            let style = *ImGui_GetStyle();
-                            let padding_x = style.WindowPadding.x / 4.0;
-                            let padding_y = style.WindowPadding.y / 4.0;
-                            let star_size = ImGui_CalcTextSize(c"*".as_ptr());
-                            let required_x = padding_x * 2.0 + star_size.x + star_size.x + center_label_size.x;
-                            let required_y = padding_y * 2.0 + star_size.y + star_size.y + center_label_size.y;
-
-                            if required_x > cell_size || required_y > cell_size {
-                                continue;
-                            }
-
-                            let stitch_labels = [
-                                (
-                                    StitchMask::TOP,
-                                    ImVec2 {
-                                        x: center.x - star_size.x / 2.0,
-                                        y: center.y - half_size + padding_y,
-                                    },
-                                ),
-                                (
-                                    StitchMask::BOTTOM,
-                                    ImVec2 {
-                                        x: center.x - star_size.x / 2.0,
-                                        y: center.y + half_size - star_size.y - padding_y,
-                                    },
-                                ),
-                                (
-                                    StitchMask::LEFT,
-                                    ImVec2 {
-                                        x: center.x - half_size + padding_x,
-                                        y: center.y - star_size.y / 2.0,
-                                    },
-                                ),
-                                (
-                                    StitchMask::RIGHT,
-                                    ImVec2 {
-                                        x: center.x + half_size - star_size.x - padding_x,
-                                        y: center.y - star_size.y / 2.0,
-                                    },
-                                ),
-                                (
-                                    StitchMask::TOP_LEFT,
-                                    ImVec2 {
-                                        x: center.x - half_size + padding_x,
-                                        y: center.y - half_size + padding_y,
-                                    },
-                                ),
-                                (
-                                    StitchMask::TOP_RIGHT,
-                                    ImVec2 {
-                                        x: center.x + half_size - star_size.x - padding_x,
-                                        y: center.y - half_size + padding_y,
-                                    },
-                                ),
-                                (
-                                    StitchMask::BOTTOM_LEFT,
-                                    ImVec2 {
-                                        x: center.x - half_size + padding_x,
-                                        y: center.y + half_size - star_size.y - padding_y,
-                                    },
-                                ),
-                                (
-                                    StitchMask::BOTTOM_RIGHT,
-                                    ImVec2 {
-                                        x: center.x + half_size - star_size.x - padding_x,
-                                        y: center.y + half_size - star_size.y - padding_y,
-                                    },
-                                ),
-                            ];
-
-                            for (flag, pos) in &stitch_labels {
-                                if node.stitch_mask.contains(*flag) {
-                                    ImDrawList_AddText(draw_list, *pos, 0xFFFFFFFF, c"*".as_ptr());
-                                }
-                            }
                         }
                     }
                 }
