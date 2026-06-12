@@ -2,12 +2,11 @@ mod camera;
 mod d3d12_utils;
 mod terrain;
 
-use std::ffi::CString;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use glam::{Vec2, Vec3, Vec3Swizzles};
+use glam::{Vec2, Vec3};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Direct3D::*;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -30,9 +29,10 @@ const FRAME_COUNT: u32 = 3;
 const BACK_BUFFER_FORMAT: DXGI_FORMAT = DXGI_FORMAT_R8G8B8A8_UNORM;
 const DEPTH_BUFFER_FORMAT: DXGI_FORMAT = DXGI_FORMAT_D32_FLOAT;
 
+#[macro_export]
 macro_rules! imgui_text {
     ($($arg:tt)*) => {
-        ImGui_Text(CString::new(format!($($arg)*)).unwrap().as_ptr())
+        ImGui_TextUnformatted(std::ffi::CString::new(format!($($arg)*)).unwrap().as_ptr())
     };
 }
 
@@ -416,7 +416,7 @@ fn main() -> Result<()> {
             ImGui_CreateContext(std::ptr::null_mut());
             ImGui_StyleColorsClassic(std::ptr::null_mut());
 
-            let io = &mut *ImGui_GetIO();
+            let io = ImGui_GetIO().as_mut().unwrap();
             io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
             io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
             io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;
@@ -561,6 +561,8 @@ fn main() -> Result<()> {
                 }
                 ImGui_End();
 
+                terrain.render_imgui_qtree(&camera_position);
+
                 ImGui_Begin(c"HeightMap".as_ptr(), std::ptr::null_mut(), 0);
                 {
                     imgui_text!("Collect patches: {:.2} ms", collect_patches_ms);
@@ -659,65 +661,6 @@ fn main() -> Result<()> {
                             }
                         }
                     }
-
-                    let window_center = Vec2::new(image_position.x, image_position.y) + image_size / 2.0;
-
-                    let minimap_cam_pos = window_center + camera_position.xz() * minimap_scale;
-
-                    ImDrawList_AddCircle(
-                        draw_list,
-                        ImVec2 {
-                            x: minimap_cam_pos.x,
-                            y: minimap_cam_pos.y,
-                        },
-                        5.0,
-                        0xFF0000FF,
-                    );
-
-                    if draw_quad_tree {
-                        for leaf in terrain.leaf_patches() {
-                            let minimap_leaf_pos = window_center + leaf.world_xy().as_vec2() * minimap_scale;
-                            let minimap_leaf_size = leaf.world_size() as f32 * minimap_scale;
-
-                            ImDrawList_AddRectEx(
-                                draw_list,
-                                ImVec2 {
-                                    x: minimap_leaf_pos.x,
-                                    y: minimap_leaf_pos.y,
-                                },
-                                ImVec2 {
-                                    x: minimap_leaf_pos.x + minimap_leaf_size,
-                                    y: minimap_leaf_pos.y + minimap_leaf_size,
-                                },
-                                0xB3FFFFFF,
-                                0.0,
-                                ImDrawFlags_None,
-                                0.5,
-                            );
-
-                            let label = CString::new(if display_lod {
-                                leaf.lod_index.to_string()
-                            } else {
-                                leaf.world_size().to_string()
-                            })
-                            .unwrap();
-                            let label_size = ImGui_CalcTextSize(label.as_ptr());
-
-                            if label_size.x >= minimap_leaf_size || label_size.y >= minimap_leaf_size {
-                                continue;
-                            }
-
-                            ImDrawList_AddText(
-                                draw_list,
-                                ImVec2 {
-                                    x: minimap_leaf_pos.x + minimap_leaf_size * 0.5 - label_size.x * 0.5,
-                                    y: minimap_leaf_pos.y + minimap_leaf_size * 0.5 - label_size.y * 0.5,
-                                },
-                                0xFFFFFFFF,
-                                label.as_ptr(),
-                            );
-                        }
-                    }
                 }
                 ImGui_End();
 
@@ -726,7 +669,7 @@ fn main() -> Result<()> {
 
                 cimgui_impldx12_render_draw_data(ImGui_GetDrawData(), cmd_list.as_raw() as *mut _);
 
-                let io = *ImGui_GetIO();
+                let io = ImGui_GetIO().as_ref().unwrap();
                 if io.ConfigFlags & ImGuiConfigFlags_ViewportsEnable != 0 {
                     ImGui_UpdatePlatformWindows();
                     ImGui_RenderPlatformWindowsDefault();
@@ -806,6 +749,9 @@ extern "system" fn handle_window_message(window_handle: HWND, message: u32, wpar
         &mut *input
     };
 
+    let imgui_mouse_capture =
+        unsafe { !ImGui_GetCurrentContext().is_null() && ImGui_GetIO().as_ref().unwrap().WantCaptureMouse };
+
     match message {
         WM_KEYDOWN => {
             input.keys[wparam.0] = true;
@@ -818,11 +764,19 @@ extern "system" fn handle_window_message(window_handle: HWND, message: u32, wpar
         WM_MOUSEMOVE => {
             let x = (lparam.0 & 0xFFFF) as i16 as i32;
             let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
+            let dx = x - input.mouse_x;
+            let dy = y - input.mouse_y;
 
-            input.mouse_dx = x - input.mouse_x;
-            input.mouse_dy = y - input.mouse_y;
             input.mouse_x = x;
             input.mouse_y = y;
+
+            if !imgui_mouse_capture {
+                input.mouse_dx = dx;
+                input.mouse_dy = dy;
+            } else {
+                input.mouse_dx = 0;
+                input.mouse_dy = 0;
+            }
 
             LRESULT::default()
         }

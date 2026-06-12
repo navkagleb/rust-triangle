@@ -96,7 +96,7 @@ impl Default for CameraController {
     fn default() -> Self {
         Self {
             speed: 50.0,
-            yaw: 180.0,
+            yaw: -90.0,
             pitch: 0.0,
         }
     }
