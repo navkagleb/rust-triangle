@@ -77,6 +77,7 @@ pub struct TerrainData {
 
     cam_world_index: IVec2,
     leaf_patches: Vec<PatchKey>,
+    gpu_patch_count: u32,
 
     patch_cache: HashMap<PatchKey, PatchState>,
     patch_gen_pool: PatchGenPool,
@@ -365,6 +366,7 @@ impl TerrainData {
 
             cam_world_index: IVec2::ZERO,
             leaf_patches: Vec::new(),
+            gpu_patch_count: 0,
 
             patch_cache: HashMap::new(),
             patch_gen_pool: PatchGenPool::new(),
@@ -451,7 +453,7 @@ impl TerrainData {
             neighbor_lod_index > node.lod_index
         };
 
-        let gpu_patches = self
+        let gpu_patches: Vec<_> = self
             .leaf_patches
             .iter()
             .filter(|l| {
@@ -481,7 +483,7 @@ impl TerrainData {
                     stitch_mask,
                 }
             })
-            .collect::<Vec<_>>();
+            .collect();
 
         unsafe {
             std::ptr::copy_nonoverlapping(
@@ -491,6 +493,8 @@ impl TerrainData {
                 gpu_patches.len(),
             );
         }
+
+        self.gpu_patch_count = gpu_patches.len() as u32;
 
         Ok(())
     }
@@ -721,7 +725,7 @@ impl TerrainData {
                     Format: DXGI_FORMAT_R32_UINT,
                 }));
 
-                cmd_list.DrawIndexedInstanced(PATCH_INDEX_COUNT, self.leaf_patches.len() as u32, 0, 0, 0);
+                cmd_list.DrawIndexedInstanced(PATCH_INDEX_COUNT, self.gpu_patch_count, 0, 0, 0);
             }
         };
 

@@ -499,7 +499,6 @@ fn main() -> Result<()> {
             cmd_list.SetDescriptorHeaps(&[Some(resource_heap.d3d12().clone())]);
             cmd_list.SetGraphicsRootSignature(&root_signature);
 
-            let collect_patches_ms = measure_ms!(terrain.collect_leaf_patches(camera.position(), active_frame_index));
             let upload_atlas_ms = measure_ms!(terrain.upload_atlas_data(
                 &device,
                 &cmd_list,
@@ -507,6 +506,7 @@ fn main() -> Result<()> {
                 gpu_frame_index,
                 active_frame_index
             ));
+            let collect_patches_ms = measure_ms!(terrain.collect_leaf_patches(camera.position(), active_frame_index));
             let upload_indirection_ms =
                 measure_ms!(terrain.upload_indirection_data(&device, &cmd_list, active_frame_index));
 
@@ -546,8 +546,8 @@ fn main() -> Result<()> {
 
                 ImGui_Begin(c"Profiler".as_ptr(), std::ptr::null_mut(), 0);
                 {
-                    imgui_text!("Collect patches: {:.2} ms", collect_patches_ms);
                     imgui_text!("Upload atlas: {:.2} ms", upload_atlas_ms);
+                    imgui_text!("Collect patches: {:.2} ms", collect_patches_ms);
                     imgui_text!("Upload indirection: {:.2} ms", upload_indirection_ms);
 
                     ImGui_NewLine();
