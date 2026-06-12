@@ -46,6 +46,8 @@ impl CameraController {
         if input.right_mouse_down {
             self.yaw += input.mouse_dx as f32 * MOUSE_SENSITIVITY;
             self.pitch += input.mouse_dy as f32 * MOUSE_SENSITIVITY;
+
+            self.yaw = self.yaw.rem_euclid(360.0);
             self.pitch = self.pitch.clamp(-89.0, 89.0);
         }
 
@@ -89,6 +91,14 @@ impl CameraController {
         }
 
         camera.world_to_view = Mat4::look_to_lh(camera.position, front_dir, Vec3::Y);
+    }
+
+    pub fn yaw(&self) -> f32 {
+        self.yaw
+    }
+
+    pub fn pitch(&self) -> f32 {
+        self.pitch
     }
 }
 

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::ptr::null_mut;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
@@ -20,7 +21,7 @@ const PATCH_GEN_WORKER_COUNT: usize = 16;
 
 const PATCH_LOD_COUNT: u32 = 5;
 const PATCH_PIXEL_SIZE: u32 = 128;
-pub const PATCH_WORLD_SIZE: u32 = PATCH_PIXEL_SIZE / 2;
+const PATCH_WORLD_SIZE: u32 = PATCH_PIXEL_SIZE / 2;
 
 const ATLAS_PATCH_PIXEL_SIZE: u32 = PATCH_PIXEL_SIZE + 1; // for pixel overlap
 const ATLAS_PATCH_COUNT: u32 = 32;
@@ -35,7 +36,7 @@ const PATCH_INDEX_COUNT: u32 = PATCH_SIDE_QUAD_COUNT.pow(2) * 6;
 bitflags! {
     #[repr(transparent)]
     #[derive(Clone, Copy, Debug)]
-    pub struct StitchMask: u32 {
+    struct StitchMask: u32 {
         const TOP = 1 << 0;
         const BOTTOM = 1 << 1;
         const LEFT = 1 << 2;
@@ -45,65 +46,34 @@ bitflags! {
 
 #[repr(C)]
 struct GpuTerrainPatch {
-    pub world_index: IVec2,
-    pub lod_index: u32,
-    pub stitch_mask: StitchMask,
+    world_index: IVec2,
+    lod_index: u32,
+    stitch_mask: StitchMask,
 }
 
 #[repr(C)]
 struct GpuTerrainConsts {
-    pub world_to_clip: Mat4,
-    pub cam_world_index: IVec2,
-    pub world_scale: f32,
-    pub height_scale: f32,
-    pub wireframe_pass: u32,
-    pub stitching_enabled: u32,
-    pub active_patch_buffer_index: u32,
-}
-
-pub struct TerrainPatchStats {
-    pub render_count: u32,
-    pub cached_count: u32,
-    pub requested_count: u32,
-    pub generated_count: u32,
-    pub uploading_count: u32,
-    pub resident_count: u32,
-}
-
-impl TerrainPatchStats {
-    pub fn gather(terrain: &TerrainData) -> Self {
-        let mut stats = Self {
-            render_count: (terrain.render_distance * 2) / PATCH_WORLD_SIZE,
-            cached_count: terrain.patch_cache.len() as u32,
-            requested_count: 0,
-            generated_count: 0,
-            uploading_count: 0,
-            resident_count: 0,
-        };
-
-        for state in terrain.patch_cache.values() {
-            match state {
-                PatchState::Requested => stats.requested_count += 1,
-                PatchState::Generated(_) => stats.generated_count += 1,
-                PatchState::Uploading(_, _) => stats.uploading_count += 1,
-                PatchState::Resident(_) => stats.resident_count += 1,
-            }
-        }
-
-        stats
-    }
+    world_to_clip: Mat4,
+    cam_world_index: IVec2,
+    world_scale: f32,
+    height_scale: f32,
+    wireframe_pass: u32,
+    stitching_enabled: u32,
+    active_patch_buffer_index: u32,
 }
 
 pub struct TerrainData {
-    pub render_distance: u32,
-    pub lod_factor: f32,
+    render_distance: u32,
+    lod_factor: f32,
 
-    pub height_scale: f32,
-    pub world_scale: f32,
+    height_scale: f32,
+    world_scale: f32,
 
-    pub solid_mode: bool,
-    pub wireframe_mode: bool,
-    pub stitching_enabled: bool,
+    solid_mode: bool,
+    wireframe_mode: bool,
+    stitching_enabled: bool,
+    freeze_camera: bool,
+    camera_pos: Vec3,
 
     cam_world_index: IVec2,
     leaf_patches: Vec<PatchKey>,
@@ -142,7 +112,7 @@ pub struct TerrainData {
 impl TerrainData {
     pub fn new(
         device: &ID3D12Device4,
-        resource_heap: &ID3D12DescriptorHeap,
+        resource_heap: &DescriptorHeap,
         root_signature: &ID3D12RootSignature,
     ) -> Result<Self> {
         let patch_indices = {
@@ -211,7 +181,7 @@ impl TerrainData {
                             },
                         },
                     }),
-                    resource_heap.get_cpu_handle(device, GpuResource::TerrainPatchBufferFirst as u32 + i),
+                    resource_heap.get_cpu_handle(GpuResource::TerrainPatchBufferFirst as u32 + i),
                 );
             }
 
@@ -230,7 +200,7 @@ impl TerrainData {
                         },
                     },
                 }),
-                resource_heap.get_cpu_handle(device, GpuResource::TerrainPatchIndexBuffer as u32),
+                resource_heap.get_cpu_handle(GpuResource::TerrainPatchIndexBuffer as u32),
             );
         }
 
@@ -269,6 +239,9 @@ impl TerrainData {
             indirection_texture_size * FRAME_COUNT as usize,
         )?;
 
+        indirection_texture.set_debug_name("TerrainIndirection")?;
+        indirection_texture_upload.set_debug_name("TerrainIndirectionUpload")?;
+
         unsafe {
             device.CreateShaderResourceView(
                 &indirection_texture,
@@ -285,7 +258,7 @@ impl TerrainData {
                         },
                     },
                 }),
-                resource_heap.get_cpu_handle(device, GpuResource::TerrainIndirectionTexture as u32),
+                resource_heap.get_cpu_handle(GpuResource::TerrainIndirectionTexture as u32),
             );
         }
 
@@ -293,6 +266,9 @@ impl TerrainData {
         let height_atlas_size = get_texture_size(&height_atlas);
         let height_atlas_upload =
             ID3D12Resource::new_buffer(device, D3D12_HEAP_TYPE_UPLOAD, height_atlas_size * FRAME_COUNT as usize)?;
+
+        height_atlas.set_debug_name("TerrainHeightAtlas")?;
+        height_atlas_upload.set_debug_name("TerrainHeightAtlasUpload")?;
 
         unsafe {
             device.CreateShaderResourceView(
@@ -310,7 +286,7 @@ impl TerrainData {
                         },
                     },
                 }),
-                resource_heap.get_cpu_handle(device, GpuResource::TerrainHeightAtlas as u32),
+                resource_heap.get_cpu_handle(GpuResource::TerrainHeightAtlas as u32),
             );
         }
 
@@ -384,6 +360,8 @@ impl TerrainData {
             solid_mode: false,
             wireframe_mode: true,
             stitching_enabled: true,
+            freeze_camera: false,
+            camera_pos: Vec3::ZERO,
 
             cam_world_index: IVec2::ZERO,
             leaf_patches: Vec::new(),
@@ -427,15 +405,15 @@ impl TerrainData {
         })
     }
 
-    pub fn leaf_patches(&self) -> &[PatchKey] {
-        &self.leaf_patches
-    }
+    pub fn collect_leaf_patches(&mut self, camera_pos: &Vec3, active_frame_index: u32) -> Result<()> {
+        if !self.freeze_camera {
+            self.camera_pos = *camera_pos;
+        }
 
-    pub fn collect_leaf_patches(&mut self, cam_pos: &Vec3, active_frame_index: u32) -> Result<()> {
-        let qtree = PatchQuadTree::new(cam_pos, self.render_distance, self.lod_factor);
+        let qtree = PatchQuadTree::new(&self.camera_pos, self.render_distance, self.lod_factor);
 
         self.leaf_patches = qtree.collect_leafs();
-        self.cam_world_index = cam_pos.xz().as_ivec2() / PATCH_WORLD_SIZE as i32;
+        self.cam_world_index = self.camera_pos.xz().as_ivec2() / PATCH_WORLD_SIZE as i32;
 
         let mut missing_patches = self
             .leaf_patches
@@ -444,8 +422,8 @@ impl TerrainData {
             .collect::<Vec<_>>();
 
         missing_patches.sort_unstable_by(|a, b| {
-            let distance_a = (cam_pos - a.world_center().extend(0).xzy().as_vec3()).length_squared();
-            let distance_b = (cam_pos - b.world_center().extend(0).xzy().as_vec3()).length_squared();
+            let distance_a = (self.camera_pos - a.world_center().extend(0).xzy().as_vec3()).length_squared();
+            let distance_b = (self.camera_pos - b.world_center().extend(0).xzy().as_vec3()).length_squared();
 
             distance_a.total_cmp(&distance_b)
         });
@@ -718,9 +696,9 @@ impl TerrainData {
         Ok(())
     }
 
-    pub fn render(&self, cmd_list: &ID3D12GraphicsCommandList, cam: &Camera, active_frame_index: u32) {
+    pub fn render(&self, cmd_list: &ID3D12GraphicsCommandList, camera: &Camera, active_frame_index: u32) {
         let mut consts = GpuTerrainConsts {
-            world_to_clip: cam.world_to_clip(),
+            world_to_clip: camera.world_to_clip(),
             cam_world_index: self.cam_world_index,
             world_scale: self.world_scale,
             height_scale: self.height_scale,
@@ -768,9 +746,53 @@ impl TerrainData {
         }
     }
 
-    pub fn render_imgui_qtree(&mut self, cam_pos: &Vec3) {
+    pub fn render_imgui(&mut self) {
         unsafe {
-            ImGui_Begin(c"TerrainQuadTree".as_ptr(), std::ptr::null_mut(), 0);
+            ImGui_Begin(c"Terrain".as_ptr(), null_mut(), 0);
+
+            ImGui_InputInt(c"Render distance".as_ptr(), &mut self.render_distance as *mut u32 as _);
+            ImGui_InputFloat(c"LOD factor".as_ptr(), &mut self.lod_factor);
+            ImGui_InputFloat(c"Height scale".as_ptr(), &mut self.height_scale);
+            ImGui_InputFloat(c"World scale".as_ptr(), &mut self.world_scale);
+
+            ImGui_NewLine();
+            ImGui_Checkbox(c"Solid mode".as_ptr(), &mut self.solid_mode);
+            ImGui_Checkbox(c"Wireframe mode".as_ptr(), &mut self.wireframe_mode);
+            ImGui_Checkbox(c"Stitching".as_ptr(), &mut self.stitching_enabled);
+
+            ImGui_NewLine();
+
+            let render_count = (self.render_distance * 2) / PATCH_WORLD_SIZE;
+            let mut requested_count = 0;
+            let mut generated_count = 0;
+            let mut uploading_count = 0;
+            let mut resident_count = 0;
+
+            for state in self.patch_cache.values() {
+                match state {
+                    PatchState::Requested => requested_count += 1,
+                    PatchState::Generated(_) => generated_count += 1,
+                    PatchState::Uploading(_, _) => uploading_count += 1,
+                    PatchState::Resident(_) => resident_count += 1,
+                }
+            }
+
+            imgui_text!("Render patch count: {}", render_count);
+            imgui_text!("Render patch count ^2: {}", render_count.pow(2));
+            imgui_text!("Terrain patches (leafs): {}", self.leaf_patches.len());
+            imgui_text!("Cached: {}", self.patch_cache.len());
+            imgui_text!("Requested: {}", requested_count);
+            imgui_text!("Generated: {}", generated_count);
+            imgui_text!("Uploading: {}", uploading_count);
+            imgui_text!("Resident: {}", resident_count);
+
+            ImGui_End();
+        }
+    }
+
+    pub fn render_imgui_qtree(&mut self) {
+        unsafe {
+            ImGui_Begin(c"TerrainQuadTree".as_ptr(), null_mut(), 0);
 
             if ImGui_Button(c"Reset view".as_ptr()) {
                 self.minimap_offset = Vec2::ZERO;
@@ -860,7 +882,7 @@ impl TerrainData {
                 );
             }
 
-            let minimap_cam_pos = minimap_center + cam_pos.xz() * minimap_scale;
+            let minimap_cam_pos = minimap_center + self.camera_pos.xz() * minimap_scale;
             ImDrawList_AddCircleFilled(
                 draw_list,
                 ImVec2 {
@@ -922,6 +944,30 @@ impl TerrainData {
             ImGui_End();
         }
     }
+
+    pub fn render_imgui_atlas(&self, resource_heap: &DescriptorHeap) {
+        unsafe {
+            ImGui_Begin(c"TerrainAtlas".as_ptr(), null_mut(), 0);
+
+            let image_size = {
+                let size = ImGui_GetContentRegionAvail();
+                size.x.min(size.y)
+            };
+
+            ImGui_Image(
+                ImTextureRef {
+                    _TexData: std::ptr::null_mut(),
+                    _TexID: resource_heap.get_gpu_handle(GpuResource::TerrainHeightAtlas as u32).ptr,
+                },
+                ImVec2 {
+                    x: image_size,
+                    y: image_size,
+                },
+            );
+
+            ImGui_End();
+        }
+    }
 }
 
 enum PatchState {
@@ -932,9 +978,9 @@ enum PatchState {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct PatchKey {
-    pub world_index: IVec2,
-    pub lod_index: u32,
+struct PatchKey {
+    world_index: IVec2,
+    lod_index: u32,
 }
 
 impl PatchKey {
@@ -1010,6 +1056,8 @@ impl PatchGenPool {
                             let fbm_pixel_size =
                                 request.world_size() as f64 / PATCH_PIXEL_SIZE as f64 / world_scale * noise_scale;
 
+                            let instant = std::time::Instant::now();
+
                             let height_map = PlaneMapBuilder::new(&fbm)
                                 .set_size(ATLAS_PATCH_PIXEL_SIZE as usize, ATLAS_PATCH_PIXEL_SIZE as usize)
                                 .set_x_bounds(fbm_pos.x, fbm_pos.x + fbm_size + fbm_pixel_size) // pixel overlap
@@ -1018,6 +1066,14 @@ impl PatchGenPool {
                                 .into_iter()
                                 .map(|n| (n as f32 * 1.5 + 0.3).clamp(0.0, 1.0))
                                 .collect::<Vec<_>>();
+
+                            {
+                                let ms = instant.elapsed().as_secs_f32() * 1000.0;
+                                let min = height_map.iter().cloned().fold(f32::INFINITY, f32::min);
+                                let max = height_map.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+
+                                println!("world={}, min={}, max={} ({:.2} ms)", request.world_index, min, max, ms);
+                            }
 
                             result_sender.send(PatchGenResult { request, height_map }).unwrap();
                         }

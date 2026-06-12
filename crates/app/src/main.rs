@@ -2,11 +2,10 @@ mod camera;
 mod d3d12_utils;
 mod terrain;
 
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use glam::{Vec2, Vec3};
+use glam::Vec3;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Direct3D::*;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -38,7 +37,7 @@ macro_rules! imgui_text {
 
 macro_rules! measure_ms {
     ($expression:expr) => {{
-        let start = std::time::Instant::now();
+        let start = Instant::now();
         $expression?;
         let elapsed_ms = start.elapsed().as_secs_f32() * 1000.0;
 
@@ -169,7 +168,7 @@ fn main() -> Result<()> {
             let device = device.unwrap();
             device.set_debug_name("MainDevice")?;
 
-            Arc::new(device.cast::<ID3D12Device4>()?)
+            device.cast::<ID3D12Device4>()?
         };
 
         {
@@ -288,36 +287,24 @@ fn main() -> Result<()> {
             resource.unwrap()
         };
 
-        let rtv_heap = device.CreateDescriptorHeap::<ID3D12DescriptorHeap>(&D3D12_DESCRIPTOR_HEAP_DESC {
-            NumDescriptors: FRAME_COUNT,
-            Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
-            Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
-            NodeMask: 0,
-        })?;
+        let rtv_heap = DescriptorHeap::new(&device, D3D12_DESCRIPTOR_HEAP_TYPE_RTV, FRAME_COUNT)?;
+        let dsv_heap = DescriptorHeap::new(&device, D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1)?;
 
-        let dsv_heap = device.CreateDescriptorHeap::<ID3D12DescriptorHeap>(&D3D12_DESCRIPTOR_HEAP_DESC {
-            NumDescriptors: 1,
-            Type: D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
-            Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
-            NodeMask: 0,
-        })?;
-
-        let resource_heap = device.CreateDescriptorHeap::<ID3D12DescriptorHeap>(&D3D12_DESCRIPTOR_HEAP_DESC {
-            NumDescriptors: GpuResource::Count as u32,
-            Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-            Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
-            NodeMask: 0,
-        })?;
+        let resource_heap = DescriptorHeap::new(
+            &device,
+            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+            GpuResource::Count as u32,
+        )?;
 
         let rtvs: [_; FRAME_COUNT as usize] = std::array::from_fn(|i| {
-            let handle = rtv_heap.get_cpu_handle(&device, i as u32);
+            let handle = rtv_heap.get_cpu_handle(i as u32);
             device.CreateRenderTargetView(&back_buffers[i], None, handle);
 
             handle
         });
 
         let dsv = {
-            let handle = dsv_heap.get_cpu_handle(&device, 0);
+            let handle = dsv_heap.get_cpu_handle(0);
             device.CreateDepthStencilView(&depth_buffer, None, handle);
 
             handle
@@ -429,21 +416,14 @@ fn main() -> Result<()> {
                 rtv_format: BACK_BUFFER_FORMAT,
                 dsv_format: DEPTH_BUFFER_FORMAT,
                 user_data: std::ptr::null_mut(),
-                srv_descriptor_heap: resource_heap.as_raw() as *mut _,
+                srv_descriptor_heap: resource_heap.d3d12().as_raw() as *mut _,
                 srv_descriptor_alloc_fn: None,
                 srv_descriptor_free_fn: None,
-                legacy_srv_cpu: resource_heap.get_cpu_handle(&device, GpuResource::ImGuiFont as u32),
-                legacy_srv_gpu: resource_heap.get_gpu_handle(&device, GpuResource::ImGuiFont as u32),
+                legacy_srv_cpu: resource_heap.get_cpu_handle(GpuResource::ImGuiFont as u32),
+                legacy_srv_gpu: resource_heap.get_gpu_handle(GpuResource::ImGuiFont as u32),
             });
         }
 
-        let mut freeze_camera = false;
-        let mut draw_patches = false;
-        let mut draw_quad_tree = true;
-        let mut display_lod = true;
-        let mut display_size = false;
-
-        let mut camera_position: glam::Vec3 = *camera.position();
         let mut terrain = TerrainData::new(&device, &resource_heap, &root_signature)?;
 
         let mut cpu_frame_index = 0;
@@ -481,10 +461,6 @@ fn main() -> Result<()> {
                 input.mouse_dy = 0;
             }
 
-            if !freeze_camera {
-                camera_position = *camera.position();
-            }
-
             // Render
             let active_frame_index = swap_chain.GetCurrentBackBufferIndex();
             let cmd_allocator = &cmd_allocators[active_frame_index as usize];
@@ -520,10 +496,10 @@ fn main() -> Result<()> {
             cmd_list.ClearRenderTargetView(rtv, &[0.3, 0.3, 0.3, 1.0], None);
             cmd_list.ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 0.0, 0, None);
 
-            cmd_list.SetDescriptorHeaps(&[Some(resource_heap.clone())]);
+            cmd_list.SetDescriptorHeaps(&[Some(resource_heap.d3d12().clone())]);
             cmd_list.SetGraphicsRootSignature(&root_signature);
 
-            let collect_patches_ms = measure_ms!(terrain.collect_leaf_patches(&camera_position, active_frame_index));
+            let collect_patches_ms = measure_ms!(terrain.collect_leaf_patches(camera.position(), active_frame_index));
             let upload_atlas_ms = measure_ms!(terrain.upload_atlas_data(
                 &device,
                 &cmd_list,
@@ -558,113 +534,31 @@ fn main() -> Result<()> {
                     );
 
                     imgui_text!("Host VRAM: {} mb", host_mem.CurrentUsage / (1024 * 1024));
+
+                    ImGui_NewLine();
+                    ImGui_SeparatorText(c"Camera".as_ptr());
+                    imgui_text!("Position: {}", camera.position());
+                    imgui_text!("Yaw:  {:>7.2}", camera_controller.yaw());
+                    imgui_text!("Pitch: {:>6.2}", camera_controller.pitch());
+                    ImGui_DragFloat(c"Speed".as_ptr(), &mut camera_controller.speed);
                 }
                 ImGui_End();
 
-                terrain.render_imgui_qtree(&camera_position);
-
-                ImGui_Begin(c"HeightMap".as_ptr(), std::ptr::null_mut(), 0);
+                ImGui_Begin(c"Profiler".as_ptr(), std::ptr::null_mut(), 0);
                 {
                     imgui_text!("Collect patches: {:.2} ms", collect_patches_ms);
                     imgui_text!("Upload atlas: {:.2} ms", upload_atlas_ms);
                     imgui_text!("Upload indirection: {:.2} ms", upload_indirection_ms);
 
-                    let stats = TerrainPatchStats::gather(&terrain);
-
-                    imgui_text!("Render distance: {}", terrain.render_distance);
-                    imgui_text!("Render patch count: {}", stats.render_count);
-                    imgui_text!("Render patch count ^2: {}", stats.render_count.pow(2));
-                    imgui_text!("Terrain patches (leafs): {}", terrain.leaf_patches().len());
-                    imgui_text!("Cached: {}", stats.cached_count);
-                    imgui_text!("Requested: {}", stats.requested_count);
-                    imgui_text!("Generated: {}", stats.generated_count);
-                    imgui_text!("Uploading: {}", stats.uploading_count);
-                    imgui_text!("Resident: {}", stats.resident_count);
                     ImGui_NewLine();
-
-                    ImGui_Checkbox(c"Freeze camera".as_ptr(), &mut freeze_camera);
-                    ImGui_Checkbox(c"Solid mode".as_ptr(), &mut terrain.solid_mode);
-                    ImGui_Checkbox(c"Wireframe mode".as_ptr(), &mut terrain.wireframe_mode);
-                    ImGui_Checkbox(c"Stitching".as_ptr(), &mut terrain.stitching_enabled);
-                    ImGui_Checkbox(c"Draw patches".as_ptr(), &mut draw_patches);
-                    ImGui_Checkbox(c"Draw quad tree".as_ptr(), &mut draw_quad_tree);
-
-                    if ImGui_Checkbox(c"Display LOD".as_ptr(), &mut display_lod) && display_lod {
-                        display_size = false;
-                    }
-
-                    if ImGui_Checkbox(c"Display size".as_ptr(), &mut display_size) && display_size {
-                        display_lod = false;
-                    }
-
-                    ImGui_NewLine();
-
-                    imgui_text!("Camera position: {}", camera.position());
-                    ImGui_DragFloat(c"Camera speed".as_ptr(), &mut camera_controller.speed);
-                    ImGui_NewLine();
-
-                    ImGui_InputInt(
-                        c"Render distance".as_ptr(),
-                        &mut terrain.render_distance as *mut u32 as *mut i32,
-                    );
-                    ImGui_InputFloat(c"LOD factor".as_ptr(), &mut terrain.lod_factor);
-                    ImGui_InputFloat(c"Height scale".as_ptr(), &mut terrain.height_scale);
-                    ImGui_InputFloat(c"World scale".as_ptr(), &mut terrain.world_scale);
-                    ImGui_NewLine();
-
-                    let image_position = ImGui_GetCursorScreenPos();
-                    let image_size = {
-                        let size = ImGui_GetContentRegionAvail();
-                        size.x.min(size.y)
-                    };
-
-                    ImGui_Image(
-                        ImTextureRef {
-                            _TexData: std::ptr::null_mut(),
-                            _TexID: resource_heap
-                                .get_gpu_handle(&device, GpuResource::TerrainHeightAtlas as u32)
-                                .ptr,
-                        },
-                        ImVec2 {
-                            x: image_size,
-                            y: image_size,
-                        },
-                    );
-
-                    let minimap_scale = image_size / (terrain.render_distance as f32 * 2.0);
-
-                    let draw_list = ImGui_GetWindowDrawList();
-
-                    if draw_patches {
-                        for patch_z in 0..stats.render_count {
-                            for patch_x in 0..stats.render_count {
-                                let center = Vec2::new(
-                                    image_position.x + ((patch_x * PATCH_WORLD_SIZE) as f32 * minimap_scale),
-                                    image_position.y + ((patch_z * PATCH_WORLD_SIZE) as f32 * minimap_scale),
-                                );
-
-                                ImDrawList_AddRectEx(
-                                    draw_list,
-                                    ImVec2 {
-                                        x: center.x,
-                                        y: center.y,
-                                    },
-                                    ImVec2 {
-                                        x: center.x + PATCH_WORLD_SIZE as f32 * minimap_scale,
-                                        y: center.y + PATCH_WORLD_SIZE as f32 * minimap_scale,
-                                    },
-                                    0xB3FF00FF,
-                                    0.0,
-                                    ImDrawFlags_None,
-                                    0.5,
-                                );
-                            }
-                        }
-                    }
                 }
                 ImGui_End();
 
-                ImGui_ShowDemoWindow(std::ptr::null_mut());
+                terrain.render_imgui();
+                terrain.render_imgui_qtree();
+                terrain.render_imgui_atlas(&resource_heap);
+
+                // ImGui_ShowDemoWindow(std::ptr::null_mut());
                 ImGui_Render();
 
                 cimgui_impldx12_render_draw_data(ImGui_GetDrawData(), cmd_list.as_raw() as *mut _);

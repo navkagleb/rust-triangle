@@ -261,168 +261,45 @@ impl<T> Drop for ConstBuffer<T> {
     }
 }
 
-pub trait D3D12GraphicsCommandListExt {
-    #[allow(dead_code)]
-    fn upload_top_mip(&self, device: &ID3D12Device, data: &[u8], texture: &ID3D12Resource) -> Result<ID3D12Resource>;
-    fn upload_mips<T>(
-        &self,
-        device: &ID3D12Device,
-        mips: &[Vec<T>],
-        texture: &ID3D12Resource,
-    ) -> Result<ID3D12Resource>;
+pub struct DescriptorHeap {
+    heap: ID3D12DescriptorHeap,
+    descriptor_size: u32,
 }
 
-impl D3D12GraphicsCommandListExt for ID3D12GraphicsCommandList {
-    fn upload_top_mip(&self, device: &ID3D12Device, data: &[u8], texture: &ID3D12Resource) -> Result<ID3D12Resource> {
-        let mut layout = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
-        let mut row_count = 0;
-        let mut row_size = 0;
-        let mut texture_size = 0;
-        unsafe {
-            device.GetCopyableFootprints(
-                &texture.GetDesc(),
-                0,
-                1,
-                0,
-                Some(&mut layout),
-                Some(&mut row_count),
-                Some(&mut row_size),
-                Some(&mut texture_size),
-            )
+impl DescriptorHeap {
+    pub fn new(device: &ID3D12Device, heap_type: D3D12_DESCRIPTOR_HEAP_TYPE, descriptor_count: u32) -> Result<Self> {
+        let heap = unsafe {
+            device.CreateDescriptorHeap::<ID3D12DescriptorHeap>(&D3D12_DESCRIPTOR_HEAP_DESC {
+                NumDescriptors: descriptor_count,
+                Type: heap_type,
+                Flags: if heap_type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV {
+                    D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE
+                } else {
+                    D3D12_DESCRIPTOR_HEAP_FLAG_NONE
+                },
+                NodeMask: 0,
+            })?
         };
 
-        let upload_buffer = ID3D12Resource::new_buffer(device, D3D12_HEAP_TYPE_UPLOAD, texture_size as usize)?;
-        let upload_cpu_ptr = upload_buffer.map::<u8>()?;
+        let descriptor_size = unsafe { device.GetDescriptorHandleIncrementSize(heap_type) };
 
-        for row_index in 0..row_count {
-            let data_row_offset = row_size as usize * row_index as usize;
-            let upload_row_offset = (layout.Footprint.RowPitch * row_index) as usize;
-
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    data.as_ptr().add(data_row_offset),
-                    upload_cpu_ptr.add(upload_row_offset),
-                    row_size as usize,
-                );
-            }
-        }
-
-        upload_buffer.unmap(texture_size as usize);
-
-        let dst_location = D3D12_TEXTURE_COPY_LOCATION {
-            pResource: unsafe { std::mem::transmute_copy(texture) },
-            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
-        };
-
-        let src_location = D3D12_TEXTURE_COPY_LOCATION {
-            pResource: unsafe { std::mem::transmute_copy(&upload_buffer) },
-            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                PlacedFootprint: layout,
-            },
-        };
-
-        unsafe { self.CopyTextureRegion(&dst_location, 0, 0, 0, &src_location, None) };
-
-        Ok(upload_buffer)
+        Ok(Self { heap, descriptor_size })
     }
 
-    fn upload_mips<T>(
-        &self,
-        device: &ID3D12Device,
-        mips: &[Vec<T>],
-        texture: &ID3D12Resource,
-    ) -> Result<ID3D12Resource> {
-        let subresource_count = mips.len();
-
-        let mut layouts = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); subresource_count];
-        let mut row_counts = vec![0; subresource_count];
-        let mut row_sizes = vec![0; subresource_count];
-        let mut texture_size = 0;
-        unsafe {
-            let desc = texture.GetDesc();
-
-            device.GetCopyableFootprints(
-                &desc,
-                0,
-                desc.MipLevels as u32,
-                0,
-                Some(layouts.as_mut_ptr()),
-                Some(row_counts.as_mut_ptr()),
-                Some(row_sizes.as_mut_ptr()),
-                Some(&mut texture_size),
-            )
-        };
-
-        let upload_buffer = ID3D12Resource::new_buffer(device, D3D12_HEAP_TYPE_UPLOAD, texture_size as usize)?;
-        let upload_cpu_ptr = upload_buffer.map::<u8>()?;
-
-        for si in 0..subresource_count {
-            let layout = layouts[si];
-            let row_count = row_counts[si];
-            let row_size = row_sizes[si];
-            let mip = &mips[si];
-
-            for ri in 0..row_count {
-                let cpu_offset = row_size as usize * ri as usize;
-                let gpu_offset = (layout.Offset + (layout.Footprint.RowPitch * ri) as u64) as usize;
-
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        (mip.as_ptr() as *const u8).add(cpu_offset),
-                        upload_cpu_ptr.add(gpu_offset),
-                        row_size as usize,
-                    );
-                }
-            }
-        }
-
-        upload_buffer.unmap(texture_size as usize);
-
-        for (i, &layout) in layouts.iter().enumerate() {
-            let dst_location = D3D12_TEXTURE_COPY_LOCATION {
-                pResource: unsafe { std::mem::transmute_copy(texture) },
-                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                    SubresourceIndex: i as u32,
-                },
-            };
-
-            let src_location = D3D12_TEXTURE_COPY_LOCATION {
-                pResource: unsafe { std::mem::transmute_copy(&upload_buffer) },
-                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                    PlacedFootprint: layout,
-                },
-            };
-
-            unsafe { self.CopyTextureRegion(&dst_location, 0, 0, 0, &src_location, None) };
-        }
-
-        Ok(upload_buffer)
+    pub fn d3d12(&self) -> &ID3D12DescriptorHeap {
+        &self.heap
     }
-}
 
-pub trait D3D12DescriptorHeapExt {
-    fn get_cpu_handle(&self, device: &ID3D12Device, index: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE;
-    fn get_gpu_handle(&self, device: &ID3D12Device, index: u32) -> D3D12_GPU_DESCRIPTOR_HANDLE;
-}
-
-impl D3D12DescriptorHeapExt for ID3D12DescriptorHeap {
-    fn get_cpu_handle(&self, device: &ID3D12Device, index: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
-        let view_size = unsafe { device.GetDescriptorHandleIncrementSize(self.GetDesc().Type) };
-
+    pub fn get_cpu_handle(&self, index: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
         D3D12_CPU_DESCRIPTOR_HANDLE {
-            ptr: unsafe { self.GetCPUDescriptorHandleForHeapStart().ptr } + (index * view_size) as usize,
+            ptr: unsafe { self.heap.GetCPUDescriptorHandleForHeapStart().ptr }
+                + (index * self.descriptor_size) as usize,
         }
     }
 
-    fn get_gpu_handle(&self, device: &ID3D12Device, index: u32) -> D3D12_GPU_DESCRIPTOR_HANDLE {
-        let view_size = unsafe { device.GetDescriptorHandleIncrementSize(self.GetDesc().Type) };
-
+    pub fn get_gpu_handle(&self, index: u32) -> D3D12_GPU_DESCRIPTOR_HANDLE {
         D3D12_GPU_DESCRIPTOR_HANDLE {
-            ptr: unsafe { self.GetGPUDescriptorHandleForHeapStart().ptr } + (index * view_size) as u64,
+            ptr: unsafe { self.heap.GetGPUDescriptorHandleForHeapStart().ptr } + (index * self.descriptor_size) as u64,
         }
     }
 }
@@ -440,6 +317,7 @@ impl ShaderBytecodeExt for D3D12_SHADER_BYTECODE {
     }
 }
 
+#[allow(unused)]
 #[repr(C)]
 pub struct MeshPipelineStream {
     pub root_signature: PsoSubobject<*mut std::ffi::c_void, { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE.0 }>,
@@ -459,6 +337,7 @@ pub struct PsoSubobject<T, const TYPE: i32> {
     value: T,
 }
 
+#[allow(unused)]
 impl<T, const TYPE: i32> PsoSubobject<T, TYPE> {
     pub fn new(value: T) -> Self {
         Self {
