@@ -36,6 +36,16 @@ macro_rules! imgui_text {
     };
 }
 
+macro_rules! measure_ms {
+    ($expression:expr) => {{
+        let start = std::time::Instant::now();
+        $expression?;
+        let elapsed_ms = start.elapsed().as_secs_f32() * 1000.0;
+
+        elapsed_ms
+    }};
+}
+
 #[repr(u32)]
 enum GpuResource {
     ImGuiFont,
@@ -434,7 +444,6 @@ fn main() -> Result<()> {
         let mut display_size = false;
 
         let mut camera_position: glam::Vec3 = *camera.position();
-
         let mut terrain = TerrainData::new(&device, &resource_heap, &root_signature)?;
 
         let mut cpu_frame_index = 0;
@@ -514,12 +523,18 @@ fn main() -> Result<()> {
             cmd_list.SetDescriptorHeaps(&[Some(resource_heap.clone())]);
             cmd_list.SetGraphicsRootSignature(&root_signature);
 
-            {
-                terrain.collect_leaf_patches(&camera_position, active_frame_index)?;
-                terrain.upload_atlas_data(&device, &cmd_list, cpu_frame_index, gpu_frame_index, active_frame_index)?;
-                terrain.upload_indirection_data(&device, &cmd_list, active_frame_index)?;
-                terrain.render(&cmd_list, &camera, active_frame_index);
-            }
+            let collect_patches_ms = measure_ms!(terrain.collect_leaf_patches(&camera_position, active_frame_index));
+            let upload_atlas_ms = measure_ms!(terrain.upload_atlas_data(
+                &device,
+                &cmd_list,
+                cpu_frame_index,
+                gpu_frame_index,
+                active_frame_index
+            ));
+            let upload_indirection_ms =
+                measure_ms!(terrain.upload_indirection_data(&device, &cmd_list, active_frame_index));
+
+            terrain.render(&cmd_list, &camera, active_frame_index);
 
             {
                 cimgui_implwin32_new_frame();
@@ -548,6 +563,10 @@ fn main() -> Result<()> {
 
                 ImGui_Begin(c"HeightMap".as_ptr(), std::ptr::null_mut(), 0);
                 {
+                    imgui_text!("Collect patches: {:.2} ms", collect_patches_ms);
+                    imgui_text!("Upload atlas: {:.2} ms", upload_atlas_ms);
+                    imgui_text!("Upload indirection: {:.2} ms", upload_indirection_ms);
+
                     let stats = TerrainPatchStats::gather(&terrain);
 
                     imgui_text!("Render distance: {}", terrain.render_distance);
