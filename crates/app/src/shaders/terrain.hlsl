@@ -12,7 +12,7 @@ struct VsOutput {
 
 struct TerrainConsts {
     float4x4 world_to_clip;
-    int2 cam_world_index;
+    int2 camera_world_index;
     float world_scale;
     float height_scale;
     uint wireframe_pass;
@@ -134,7 +134,7 @@ VsOutput ProcessVertex(uint vertex_id, uint instance_id) {
     const float2 world_xz = patch.world_index * (int)PATCH_WORLD_SIZE + world_size * uv;
 
     const uint lod_index = patch.lod_index;
-    const int2 relative_index = (patch.world_index >> lod_index) - (consts.cam_world_index >> lod_index);
+    const int2 relative_index = (patch.world_index >> lod_index) - (consts.camera_world_index >> lod_index);
     const int2 indirection_index = relative_index + (INDIRECTION_SLOT_COUNT >> lod_index) / 2;
     const uint2 atlas_index = indirection_texture.mips[lod_index][indirection_index];
 
