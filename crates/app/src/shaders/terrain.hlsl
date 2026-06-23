@@ -6,8 +6,8 @@ struct VsInput {
 struct VsOutput {
     float4 clip_position : SV_Position;
     float3 debug_color: DebugColor;
-    float2 uv : Uv;
     float height : Height;
+    float2 uv : Uv;
 };
 
 struct TerrainConsts {
@@ -61,31 +61,6 @@ float3 height_to_color(float h) {
     return snow;
 }
 
-float3 hsv_to_rgb(float h, float s, float v) {
-    const float4 K = float4(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);
-    const float3 p = abs(frac(h + K.xyz) * 6.0 - K.www);
-
-    return v * lerp(K.xxx, saturate(p - K.xxx), s);
-}
-
-float3 patch_color(TerrainPatch patch) {
-    const int x = patch.world_index.x;
-    const int z = patch.world_index.y;
-    const uint lod = patch.lod_index;
-
-    uint hash = x * 73856093u;
-    hash = hash ^ (z * 19349663u);
-    hash = hash ^ (lod * 83492791u);
-    hash ^= hash >> 17;
-    hash *= 0xbf324c81u;
-    hash ^= hash >> 11;
-    hash *= 0x9a812d7du;
-    hash ^= hash >> 15;
-
-    const float hue = frac((float)(hash & 0xFFFF) / 65535.0 + 0.618033988);
-    return hsv_to_rgb(hue, 0.75 + 0.25 * frac((float)(hash >> 16) / 65535.0), 0.9);
-}
-
 static const uint INDIRECTION_TEXTURE_INDEX = 1;
 static const uint HEIGHT_ATLAS_INDEX = 2;
 static const uint PATCH_INDEX_BUFFER_INDEX = 3;
@@ -105,7 +80,33 @@ static const uint BOTTOM_STITCH_BIT = 1 << 1;
 static const uint LEFT_STITCH_BIT = 1 << 2;
 static const uint RIGHT_STITCH_BIT = 1 << 3;
 
-VsOutput ProcessVertex(uint vertex_id, uint instance_id) {
+float3 get_lod_color(uint lod_index) {
+    switch (lod_index % PATCH_LOD_COUNT) {
+        case 0:
+            return float3(0.10, 0.80, 0.20); // green
+        case 1:
+            return float3(0.10, 0.45, 1.00); // blue
+        case 2:
+            return float3(1.00, 0.80, 0.10); // yellow
+        case 3:
+            return float3(1.00, 0.30, 0.10); // orange
+        case 4:
+            return float3(0.75, 0.20, 1.00); // purple
+    }
+
+    return 0.0;
+}
+
+float3 patch_color(TerrainPatch patch) {
+    const float3 lod_color = get_lod_color(patch.lod_index);
+    const int2 lod_world_index = patch.world_index >> patch.lod_index;
+    const bool is_odd_patch = ((lod_world_index.x + lod_world_index.y) & 1) != 0;
+    const float checker_factor = is_odd_patch ? 1.1 : 0.8;
+
+    return saturate(lod_color * checker_factor);
+}
+
+VsOutput process_vertex(uint vertex_id, uint instance_id) {
     const StructuredBuffer<TerrainPatch> patches = ResourceDescriptorHeap[consts.active_patch_buffer_index];
     const Texture2D<uint2> indirection_texture = ResourceDescriptorHeap[INDIRECTION_TEXTURE_INDEX];
     const Texture2D<float> height_atlas = ResourceDescriptorHeap[HEIGHT_ATLAS_INDEX];
@@ -148,15 +149,15 @@ VsOutput ProcessVertex(uint vertex_id, uint instance_id) {
 
     VsOutput output = (VsOutput)0;
     output.clip_position = mul(consts.world_to_clip, float4(world_position, 1.0));
-    output.debug_color = patch_color(patch);
     output.uv = uv;
     output.height = height;
+    output.debug_color = patch_color(patch);
 
     return output;
 }
 
 VsOutput vs_main(VsInput input) {
-    return ProcessVertex(input.vertex_id, input.instance_id);
+    return process_vertex(input.vertex_id, input.instance_id);
 }
 
 [NumThreads(128, 1, 1)]
@@ -170,7 +171,7 @@ void ms_main(
     SetMeshOutputCounts(PATCH_VERTEX_COUNT, PATCH_TRIANGLE_COUNT);
 
     if (gtid < PATCH_VERTEX_COUNT) {
-        vertices[gtid] = ProcessVertex(gtid, gid);
+        vertices[gtid] = process_vertex(gtid, gid);
     }
 
     const Buffer<uint> index_buffer = ResourceDescriptorHeap[PATCH_INDEX_BUFFER_INDEX];
