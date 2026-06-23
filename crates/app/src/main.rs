@@ -537,7 +537,7 @@ fn main() -> Result<()> {
 
                     ImGui_NewLine();
                     ImGui_SeparatorText(c"Camera".as_ptr());
-                    imgui_text!("Position: {}", camera.position());
+                    imgui_text!("Position: {:.2}", camera.position());
                     imgui_text!("Yaw:  {:>7.2}", camera_controller.yaw());
                     imgui_text!("Pitch: {:>6.2}", camera_controller.pitch());
                     ImGui_DragFloat(c"Speed".as_ptr(), &mut camera_controller.speed);

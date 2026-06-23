@@ -65,15 +65,15 @@ static const uint INDIRECTION_TEXTURE_INDEX = 1;
 static const uint HEIGHT_ATLAS_INDEX = 2;
 static const uint PATCH_INDEX_BUFFER_INDEX = 3;
 
+static const uint PATCH_LOD_COUNT = 6;
 static const uint PATCH_PIXEL_SIZE = 128;
-static const uint PATCH_WORLD_SIZE = 64;
-static const uint PATCH_LOD_COUNT = 5;
+static const uint PATCH_WORLD_SIZE = PATCH_PIXEL_SIZE / 2;
 static const uint PATCH_QUAD_COUNT = PATCH_PIXEL_SIZE;
 static const uint PATCH_VERTEX_COUNT = (PATCH_QUAD_COUNT + 1) * (PATCH_QUAD_COUNT + 1);
 static const uint PATCH_TRIANGLE_COUNT = PATCH_QUAD_COUNT * PATCH_QUAD_COUNT * 2;
 
 static const uint ATLAS_PATCH_PIXEL_SIZE = PATCH_PIXEL_SIZE + 1; // for pixel overlap
-static const uint INDIRECTION_SLOT_COUNT = 128;
+static const uint INDIRECTION_SLOT_COUNT = 512;
 
 static const uint TOP_STITCH_BIT = 1 << 0;
 static const uint BOTTOM_STITCH_BIT = 1 << 1;
@@ -92,6 +92,8 @@ float3 get_lod_color(uint lod_index) {
             return float3(1.00, 0.30, 0.10); // orange
         case 4:
             return float3(0.75, 0.20, 1.00); // purple
+        case 5:
+            return float3(0.10, 0.90, 0.90); // cyan
     }
 
     return 0.0;
@@ -143,7 +145,7 @@ VsOutput process_vertex(uint vertex_id, uint instance_id) {
 
     const float3 world_position = float3(
         world_xz.x * consts.world_scale,
-        height * 100.0,
+        height * consts.height_scale,
         world_xz.y * consts.world_scale
     );
 

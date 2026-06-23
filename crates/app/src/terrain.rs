@@ -19,7 +19,7 @@ use imgui_sys::*;
 
 const PATCH_GEN_WORKER_COUNT: usize = 16;
 
-const PATCH_LOD_COUNT: u32 = 5;
+const PATCH_LOD_COUNT: u32 = 6;
 const PATCH_PIXEL_SIZE: u32 = 128;
 const PATCH_WORLD_SIZE: u32 = PATCH_PIXEL_SIZE / 2;
 
@@ -27,7 +27,7 @@ const ATLAS_PATCH_PIXEL_SIZE: u32 = PATCH_PIXEL_SIZE + 1; // for pixel overlap
 const ATLAS_PATCH_COUNT: u32 = 32;
 const ATLAS_SIZE: u32 = ATLAS_PATCH_PIXEL_SIZE * ATLAS_PATCH_COUNT;
 const HEIGHT_ATLAS_FORMAT: DXGI_FORMAT = DXGI_FORMAT_R32_FLOAT;
-const INDIRECTION_SLOT_COUNT: u32 = 128;
+const INDIRECTION_SLOT_COUNT: u32 = 512;
 
 const PATCH_SIDE_QUAD_COUNT: u32 = PATCH_PIXEL_SIZE;
 const PATCH_SIDE_VERTEX_COUNT: u32 = PATCH_PIXEL_SIZE + 1;
@@ -154,8 +154,7 @@ impl TerrainData {
 
         patch_index_buffer.map_and_write(patch_indices.as_slice())?;
 
-        let render_distance = 2048;
-        let lod_factor = 3.0;
+        let render_distance = 4096;
 
         let max_patch_count = ((render_distance * 2) / PATCH_WORLD_SIZE).pow(2); // should be somehow recalculated
         let patch_buffer = ID3D12Resource::new_buffer(
@@ -352,9 +351,9 @@ impl TerrainData {
 
         Ok(Self {
             render_distance,
-            lod_factor,
+            lod_factor: 3.5,
 
-            height_scale: 15.0,
+            height_scale: 100.0,
             world_scale: 1.0,
 
             solid_mode: false,
@@ -423,28 +422,32 @@ impl TerrainData {
         };
 
         while let Some(node) = nodes_to_traverse.pop_front() {
-            let Some(children) = node.children.as_deref() else {
-                if is_resident(&node.key) {
-                    patches_to_render.push(node.key);
+            let is_node_renderable = node.key.lod_index < PATCH_LOD_COUNT;
+
+            if let Some(children) = node.children.as_deref() {
+                let children_ready = children.iter().all(|child| is_resident(&child.key));
+
+                if !is_node_renderable || children_ready {
+                    nodes_to_traverse.extend(children.iter());
+                    continue;
                 }
 
-                continue;
+                patches_to_request.extend(
+                    children
+                        .iter()
+                        .filter(|child| !self.patch_cache.contains_key(&child.key))
+                        .map(|child| child.key),
+                );
             };
 
-            if node.key.lod_index > PATCH_LOD_COUNT || children.iter().all(|child| is_resident(&child.key)) {
-                nodes_to_traverse.extend(children.iter());
+            if !is_node_renderable {
                 continue;
             }
 
-            patches_to_request.extend(
-                children
-                    .iter()
-                    .filter(|child| !self.patch_cache.contains_key(&child.key))
-                    .map(|child| child.key),
-            );
-
             if is_resident(&node.key) {
                 patches_to_render.push(node.key);
+            } else if !self.patch_cache.contains_key(&node.key) {
+                patches_to_request.push(node.key);
             }
         }
 
@@ -933,12 +936,12 @@ impl TerrainData {
             let start = self
                 .patches_to_render
                 .iter()
-                .map(|l| l.world_pos())
+                .map(|p| p.world_pos())
                 .fold(IVec2::MAX, |acc, p| acc.min(p));
             let end = self
                 .patches_to_render
                 .iter()
-                .map(|l| l.world_pos() + l.world_size() as i32)
+                .map(|p| p.world_pos() + p.world_size() as i32)
                 .fold(IVec2::MIN, |acc, p| acc.max(p));
 
             let corners = [
