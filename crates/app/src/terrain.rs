@@ -73,7 +73,7 @@ pub struct TerrainData {
     wireframe_mode: bool,
     stitching_enabled: bool,
     freeze_camera: bool,
-    camera_pos: Vec3,
+    camera_terrain_pos: Vec3,
 
     camera_world_index: IVec2,
     patches_to_render: Vec<PatchKey>,
@@ -353,14 +353,14 @@ impl TerrainData {
             render_distance,
             lod_factor: 3.5,
 
-            height_scale: 100.0,
+            height_scale: 150.0,
             world_scale: 1.0,
 
             solid_mode: false,
             wireframe_mode: true,
             stitching_enabled: true,
             freeze_camera: false,
-            camera_pos: Vec3::ZERO,
+            camera_terrain_pos: Vec3::ZERO,
 
             camera_world_index: IVec2::ZERO,
             patches_to_render: Vec::new(),
@@ -406,10 +406,11 @@ impl TerrainData {
 
     pub fn collect_leaf_patches(&mut self, camera_pos: &Vec3, active_frame_index: u32) -> Result<()> {
         if !self.freeze_camera {
-            self.camera_pos = *camera_pos;
+            self.camera_terrain_pos = *camera_pos / Vec3::new(self.world_scale, 1.0, self.world_scale);
         }
 
-        let root_node = PatchQuadTreeBuilder::new(&self.camera_pos, self.render_distance, self.lod_factor).build();
+        let root_node =
+            PatchQuadTreeBuilder::new(&self.camera_terrain_pos, self.render_distance, self.lod_factor).build();
 
         let mut patches_to_render = Vec::new();
         let mut patches_to_request = Vec::new();
@@ -452,11 +453,11 @@ impl TerrainData {
         }
 
         self.patches_to_render = patches_to_render;
-        self.camera_world_index = self.camera_pos.xz().as_ivec2() / PATCH_WORLD_SIZE as i32;
+        self.camera_world_index = self.camera_terrain_pos.xz().as_ivec2() / PATCH_WORLD_SIZE as i32;
 
         patches_to_request.sort_unstable_by(|a, b| {
-            let distance_a = (self.camera_pos - a.world_center().extend(0).xzy().as_vec3()).length_squared();
-            let distance_b = (self.camera_pos - b.world_center().extend(0).xzy().as_vec3()).length_squared();
+            let distance_a = (self.camera_terrain_pos - a.world_center().extend(0).xzy().as_vec3()).length_squared();
+            let distance_b = (self.camera_terrain_pos - b.world_center().extend(0).xzy().as_vec3()).length_squared();
 
             distance_a.total_cmp(&distance_b)
         });
@@ -921,12 +922,12 @@ impl TerrainData {
                 );
             }
 
-            let minimap_cam_pos = minimap_center + self.camera_pos.xz() * minimap_scale;
+            let minimap_camera_pos = minimap_center + self.camera_terrain_pos.xz() * minimap_scale;
             ImDrawList_AddCircleFilled(
                 draw_list,
                 ImVec2 {
-                    x: minimap_cam_pos.x,
-                    y: minimap_cam_pos.y,
+                    x: minimap_camera_pos.x,
+                    y: minimap_camera_pos.y,
                 },
                 5.0,
                 0xFF0000FF,
