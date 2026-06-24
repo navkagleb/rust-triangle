@@ -461,6 +461,8 @@ fn main() -> Result<()> {
                 input.mouse_dy = 0;
             }
 
+            terrain.update_camera_pos(camera.position());
+
             // Render
             let active_frame_index = swap_chain.GetCurrentBackBufferIndex();
             let cmd_allocator = &cmd_allocators[active_frame_index as usize];
@@ -506,7 +508,7 @@ fn main() -> Result<()> {
                 gpu_frame_index,
                 active_frame_index
             ));
-            let collect_patches_ms = measure_ms!(terrain.collect_leaf_patches(camera.position(), active_frame_index));
+            let traverse_qtree_ms = measure_ms!(terrain.traverse_qtree(active_frame_index));
             let upload_indirection_ms =
                 measure_ms!(terrain.upload_indirection_data(&device, &cmd_list, active_frame_index));
 
@@ -547,7 +549,7 @@ fn main() -> Result<()> {
                 ImGui_Begin(c"Profiler".as_ptr(), std::ptr::null_mut(), 0);
                 {
                     imgui_text!("Upload atlas: {:.2} ms", upload_atlas_ms);
-                    imgui_text!("Collect patches: {:.2} ms", collect_patches_ms);
+                    imgui_text!("Traverse qtree: {:.2} ms", traverse_qtree_ms);
                     imgui_text!("Upload indirection: {:.2} ms", upload_indirection_ms);
 
                     ImGui_NewLine();

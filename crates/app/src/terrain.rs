@@ -404,11 +404,16 @@ impl TerrainData {
         })
     }
 
-    pub fn collect_leaf_patches(&mut self, camera_world_pos: &Vec3, active_frame_index: u32) -> Result<()> {
-        if !self.freeze_camera {
-            self.camera_terrain_pos = self.world_to_terrain_pos(*camera_world_pos);
+    pub fn update_camera_pos(&mut self, camera_world_pos: &Vec3) {
+        if self.freeze_camera {
+            return;
         }
 
+        self.camera_terrain_pos = self.world_to_terrain_pos(*camera_world_pos);
+        self.camera_grid_index = self.camera_terrain_pos.xz().as_ivec2() / PATCH_TERRAIN_SIZE as i32;
+    }
+
+    pub fn traverse_qtree(&mut self, active_frame_index: u32) -> Result<()> {
         let root_node =
             PatchQuadTreeBuilder::new(&self.camera_terrain_pos, self.render_distance, self.lod_factor).build();
 
@@ -453,7 +458,6 @@ impl TerrainData {
         }
 
         self.patches_to_render = patches_to_render;
-        self.camera_grid_index = self.camera_terrain_pos.xz().as_ivec2() / PATCH_TERRAIN_SIZE as i32;
 
         patches_to_request.sort_unstable_by(|a, b| {
             let distance_a = (self.camera_terrain_pos - a.terrain_center().extend(0).xzy().as_vec3()).length_squared();
