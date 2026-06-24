@@ -12,16 +12,16 @@ struct VsOutput {
 
 struct TerrainConsts {
     float4x4 world_to_clip;
-    int2 camera_world_index;
-    float world_scale;
-    float height_scale;
+    int2 camera_grid_index;
+    float terrain_to_world_scale;
+    float terrain_height_scale;
     uint wireframe_pass;
     uint stitching_enabled;
     uint active_patch_buffer_index;
 };
 
 struct TerrainPatch {
-    int2 world_index;
+    int2 grid_index;
     uint lod_index;
     uint stitch_mask;
 };
@@ -67,7 +67,7 @@ static const uint PATCH_INDEX_BUFFER_INDEX = 3;
 
 static const uint PATCH_LOD_COUNT = 6;
 static const uint PATCH_PIXEL_SIZE = 128;
-static const uint PATCH_WORLD_SIZE = PATCH_PIXEL_SIZE / 2;
+static const uint PATCH_TERRAIN_SIZE = PATCH_PIXEL_SIZE / 2;
 static const uint PATCH_QUAD_COUNT = PATCH_PIXEL_SIZE;
 static const uint PATCH_VERTEX_COUNT = (PATCH_QUAD_COUNT + 1) * (PATCH_QUAD_COUNT + 1);
 static const uint PATCH_TRIANGLE_COUNT = PATCH_QUAD_COUNT * PATCH_QUAD_COUNT * 2;
@@ -101,8 +101,8 @@ float3 get_lod_color(uint lod_index) {
 
 float3 patch_color(TerrainPatch patch) {
     const float3 lod_color = get_lod_color(patch.lod_index);
-    const int2 lod_world_index = patch.world_index >> patch.lod_index;
-    const bool is_odd_patch = ((lod_world_index.x + lod_world_index.y) & 1) != 0;
+    const int2 lod_grid_index = patch.grid_index >> patch.lod_index;
+    const bool is_odd_patch = ((lod_grid_index.x + lod_grid_index.y) & 1) != 0;
     const float checker_factor = is_odd_patch ? 1.1 : 0.8;
 
     return saturate(lod_color * checker_factor);
@@ -133,20 +133,20 @@ VsOutput process_vertex(uint vertex_id, uint instance_id) {
     }
 
     const float2 uv = float2(ix, iz) / (float)PATCH_QUAD_COUNT; // 0..1
-    const float world_size = PATCH_WORLD_SIZE * 1 << patch.lod_index;
-    const float2 world_xz = patch.world_index * (int)PATCH_WORLD_SIZE + world_size * uv;
+    const float terrain_size = PATCH_TERRAIN_SIZE * 1 << patch.lod_index;
+    const float2 terrain_xz = patch.grid_index * (int)PATCH_TERRAIN_SIZE + terrain_size * uv;
 
     const uint lod_index = patch.lod_index;
-    const int2 relative_index = (patch.world_index >> lod_index) - (consts.camera_world_index >> lod_index);
+    const int2 relative_index = (patch.grid_index >> lod_index) - (consts.camera_grid_index >> lod_index);
     const int2 indirection_index = relative_index + (INDIRECTION_SLOT_COUNT >> lod_index) / 2;
     const uint2 atlas_index = indirection_texture.mips[lod_index][indirection_index];
 
     const float height = height_atlas[atlas_index * ATLAS_PATCH_PIXEL_SIZE + uint2(ix, iz)];
 
     const float3 world_position = float3(
-        world_xz.x * consts.world_scale,
-        height * consts.height_scale,
-        world_xz.y * consts.world_scale
+        terrain_xz.x * consts.terrain_to_world_scale,
+        height * consts.terrain_height_scale,
+        terrain_xz.y * consts.terrain_to_world_scale
     );
 
     VsOutput output = (VsOutput)0;
