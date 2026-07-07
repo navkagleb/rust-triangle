@@ -4,7 +4,8 @@ struct VsInput {
 };
 
 struct VsOutput {
-    float4 clip_position : SV_Position;
+    float4 clip_pos : SV_Position;
+    float3 normal: Normal;
     float3 debug_color: DebugColor;
     float height : Height;
     float2 uv : Uv;
@@ -15,9 +16,13 @@ struct TerrainConsts {
     int2 camera_grid_index;
     float terrain_to_world_scale;
     float terrain_height_scale;
-    uint wireframe_pass;
+    float elapsed_time;
     uint stitching_enabled;
     uint active_patch_buffer_index;
+
+    // Debug
+    uint wireframe_pass;
+    uint display_normals;
 };
 
 struct TerrainPatch {
@@ -63,7 +68,8 @@ float3 height_to_color(float h) {
 
 static const uint INDIRECTION_TEXTURE_INDEX = 1;
 static const uint HEIGHT_ATLAS_INDEX = 2;
-static const uint PATCH_INDEX_BUFFER_INDEX = 3;
+static const uint GRADIENT_ATLAS_INDEX = 3;
+static const uint PATCH_INDEX_BUFFER_INDEX = 4;
 
 static const uint PATCH_LOD_COUNT = 6;
 static const uint PATCH_PIXEL_SIZE = 128;
@@ -112,6 +118,7 @@ VsOutput process_vertex(uint vertex_id, uint instance_id) {
     const StructuredBuffer<TerrainPatch> patches = ResourceDescriptorHeap[consts.active_patch_buffer_index];
     const Texture2D<uint2> indirection_texture = ResourceDescriptorHeap[INDIRECTION_TEXTURE_INDEX];
     const Texture2D<float> height_atlas = ResourceDescriptorHeap[HEIGHT_ATLAS_INDEX];
+    const Texture2D<float2> gradient_atlas = ResourceDescriptorHeap[GRADIENT_ATLAS_INDEX];
 
     const TerrainPatch patch = patches[instance_id];
 
@@ -137,20 +144,26 @@ VsOutput process_vertex(uint vertex_id, uint instance_id) {
     const float2 terrain_xz = patch.grid_index * (int)PATCH_TERRAIN_SIZE + terrain_size * uv;
 
     const uint lod_index = patch.lod_index;
-    const int2 relative_index = (patch.grid_index >> lod_index) - (consts.camera_grid_index >> lod_index);
-    const int2 indirection_index = relative_index + (INDIRECTION_SLOT_COUNT >> lod_index) / 2;
-    const uint2 atlas_index = indirection_texture.mips[lod_index][indirection_index];
+    const int2 relative_slot = (patch.grid_index >> lod_index) - (consts.camera_grid_index >> lod_index);
+    const int2 indirection_slot = relative_slot + (INDIRECTION_SLOT_COUNT >> lod_index) / 2;
+    const uint2 atlas_slot = indirection_texture.mips[lod_index][indirection_slot];
+    const uint2 atlas_texel_pos = atlas_slot * ATLAS_PATCH_PIXEL_SIZE + uint2(ix, iz);
 
-    const float height = height_atlas[atlas_index * ATLAS_PATCH_PIXEL_SIZE + uint2(ix, iz)];
+    const float height = height_atlas[atlas_texel_pos];
+    const float2 gradient = gradient_atlas[atlas_texel_pos];
 
-    const float3 world_position = float3(
+    const float3 world_pos = float3(
         terrain_xz.x * consts.terrain_to_world_scale,
         height * consts.terrain_height_scale,
         terrain_xz.y * consts.terrain_to_world_scale
     );
 
+    const float slope_scale = consts.terrain_height_scale / consts.terrain_to_world_scale;
+    const float3 normal = normalize(float3(-gradient.x * slope_scale, 1.0, -gradient.y * slope_scale));
+
     VsOutput output = (VsOutput)0;
-    output.clip_position = mul(consts.world_to_clip, float4(world_position, 1.0));
+    output.clip_pos = mul(consts.world_to_clip, float4(world_pos, 1.0));
+    output.normal = normal;
     output.uv = uv;
     output.height = height;
     output.debug_color = patch_color(patch);
@@ -188,16 +201,24 @@ void ms_main(
 }
 
 float4 ps_main(VsOutput input) : SV_Target {
-#if 0
-    const Texture2D<float3> normal_map = ResourceDescriptorHeap[NORMAL_MAP_INDEX];
-    const float3 normal = normal_map.Sample(linear_clamp_sampler, input.uv);
+    if (consts.wireframe_pass)
+        return float4(input.debug_color, 1.0);
 
-    const float3 light_dir = normalize(float3(1.0, 2.0, 1.0));
-    const float ndotl = saturate(dot(normal, light_dir));
+    if (consts.display_normals)
+        return float4(input.normal * 0.5 + 0.5, 1.0);
+
+    const float sun_speed = 0.5;
+    const float sun_angle = consts.elapsed_time * sun_speed;
+
+    const float3 sun_light_dir = normalize(float3(
+        cos(sun_angle),
+        1.5,
+        sin(sun_angle)
+    ));
+
+    const float ndotl = saturate(dot(normalize(input.normal), sun_light_dir));
     const float3 ambient = 0.1;
-#endif
-    
-    float3 color = consts.wireframe_pass ? input.debug_color : height_to_color(input.height);
+    const float3 color = height_to_color(input.height) * ndotl + ambient;
 
     return float4(color, 1.0);
 }

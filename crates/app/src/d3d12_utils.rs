@@ -94,15 +94,15 @@ impl D3D12ResourceBarrierExt for D3D12_RESOURCE_BARRIER {
 }
 
 pub trait D3D12BufferExt {
-    fn new_buffer(device: &ID3D12Device, heap_type: D3D12_HEAP_TYPE, size: usize) -> Result<ID3D12Resource>;
+    fn new_buffer(device: &ID3D12Device, heap_type: D3D12_HEAP_TYPE, size: u64) -> Result<ID3D12Resource>;
     fn map<T>(&self) -> Result<*mut T>;
-    fn unmap(&self, size: usize);
+    fn unmap(&self, size: u64);
 
     fn map_and_write<T>(&self, items: &[T]) -> Result<()>;
 }
 
 impl D3D12BufferExt for ID3D12Resource {
-    fn new_buffer(device: &ID3D12Device, heap_type: D3D12_HEAP_TYPE, size: usize) -> Result<ID3D12Resource> {
+    fn new_buffer(device: &ID3D12Device, heap_type: D3D12_HEAP_TYPE, size: u64) -> Result<ID3D12Resource> {
         let mut buffer = None;
         unsafe {
             device.CreateCommittedResource::<ID3D12Resource>(
@@ -111,7 +111,7 @@ impl D3D12BufferExt for ID3D12Resource {
                 &D3D12_RESOURCE_DESC {
                     Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
                     Alignment: 0,
-                    Width: size as u64,
+                    Width: size,
                     Height: 1,
                     DepthOrArraySize: 1,
                     MipLevels: 1,
@@ -147,9 +147,15 @@ impl D3D12BufferExt for ID3D12Resource {
         Ok(cpu_ptr as *mut T)
     }
 
-    fn unmap(&self, size: usize) {
+    fn unmap(&self, size: u64) {
         unsafe {
-            self.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: size }));
+            self.Unmap(
+                0,
+                Some(&D3D12_RANGE {
+                    Begin: 0,
+                    End: size as usize,
+                }),
+            );
         }
     }
 
@@ -160,7 +166,7 @@ impl D3D12BufferExt for ID3D12Resource {
             std::ptr::copy_nonoverlapping(items.as_ptr(), cpu_ptr, items.len());
         }
 
-        self.unmap(size_of_val(items));
+        self.unmap(size_of_val(items) as u64);
 
         Ok(())
     }
@@ -174,6 +180,8 @@ pub trait D3D12TextureExt {
         height: u32,
         mip_count: u32,
     ) -> Result<ID3D12Resource>;
+
+    fn size(&self) -> Result<u64>;
 }
 
 impl D3D12TextureExt for ID3D12Resource {
@@ -211,6 +219,29 @@ impl D3D12TextureExt for ID3D12Resource {
 
         texture.ok_or(Error::from_thread().into())
     }
+
+    fn size(&self) -> Result<u64> {
+        let desc = unsafe { self.GetDesc() };
+        let mut size = 0;
+
+        unsafe {
+            let mut device: Option<ID3D12Device> = None;
+            self.GetDevice(&mut device)?;
+
+            device.unwrap().GetCopyableFootprints(
+                &desc,
+                0,
+                (desc.MipLevels * desc.DepthOrArraySize) as u32,
+                0,
+                None,
+                None,
+                None,
+                Some(&mut size),
+            );
+        }
+
+        Ok(size)
+    }
 }
 
 pub struct ConstBuffer<T> {
@@ -221,7 +252,7 @@ pub struct ConstBuffer<T> {
 
 impl<T> ConstBuffer<T> {
     pub fn new(device: &ID3D12Device) -> Result<Self> {
-        let resource = ID3D12Resource::new_buffer(device, D3D12_HEAP_TYPE_UPLOAD, Self::buffer_size())?;
+        let resource = ID3D12Resource::new_buffer(device, D3D12_HEAP_TYPE_UPLOAD, Self::size())?;
 
         Ok(Self {
             cpu_ptr: resource.map::<u8>()?,
@@ -246,18 +277,18 @@ impl<T> ConstBuffer<T> {
         }
     }
 
-    fn aligned_item_size() -> usize {
-        size_of::<T>().next_multiple_of(D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT as usize)
+    fn aligned_item_size() -> u64 {
+        (size_of::<T>() as u64).next_multiple_of(D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT as u64)
     }
 
-    fn buffer_size() -> usize {
-        Self::aligned_item_size() * FRAME_COUNT as usize
+    fn size() -> u64 {
+        Self::aligned_item_size() * FRAME_COUNT as u64
     }
 }
 
 impl<T> Drop for ConstBuffer<T> {
     fn drop(&mut self) {
-        self.resource.unmap(Self::buffer_size());
+        self.resource.unmap(Self::size());
     }
 }
 

@@ -35,21 +35,12 @@ macro_rules! imgui_text {
     };
 }
 
-macro_rules! measure_ms {
-    ($expression:expr) => {{
-        let start = Instant::now();
-        $expression?;
-        let elapsed_ms = start.elapsed().as_secs_f32() * 1000.0;
-
-        elapsed_ms
-    }};
-}
-
 #[repr(u32)]
 enum GpuResource {
     ImGuiFont,
     TerrainIndirectionTexture,
     TerrainHeightAtlas,
+    TerrainGradientAtlas,
     TerrainPatchIndexBuffer,
     TerrainPatchBufferFirst,
     #[allow(unused)]
@@ -461,7 +452,7 @@ fn main() -> Result<()> {
                 input.mouse_dy = 0;
             }
 
-            terrain.update_camera_pos(camera.position());
+            terrain.update_camera_pos(camera.position(), dt);
 
             // Render
             let active_frame_index = swap_chain.GetCurrentBackBufferIndex();
@@ -501,16 +492,17 @@ fn main() -> Result<()> {
             cmd_list.SetDescriptorHeaps(&[Some(resource_heap.d3d12().clone())]);
             cmd_list.SetGraphicsRootSignature(&root_signature);
 
-            let upload_atlas_ms = measure_ms!(terrain.upload_atlas_data(
-                &device,
-                &cmd_list,
-                cpu_frame_index,
-                gpu_frame_index,
-                active_frame_index
-            ));
-            let traverse_qtree_ms = measure_ms!(terrain.traverse_qtree(active_frame_index));
-            let upload_indirection_ms =
-                measure_ms!(terrain.upload_indirection_data(&device, &cmd_list, active_frame_index));
+            let t = Instant::now();
+            terrain.upload_atlas_data(&cmd_list, cpu_frame_index, gpu_frame_index, active_frame_index);
+            let upload_atlas_ms = t.elapsed().as_secs_f32() * 1000.0;
+
+            let t = Instant::now();
+            terrain.traverse_qtree(active_frame_index)?;
+            let traverse_qtree_ms = t.elapsed().as_secs_f32() * 1000.0;
+
+            let t = Instant::now();
+            terrain.upload_indirection_data(&device, &cmd_list, active_frame_index)?;
+            let upload_indirection_ms = t.elapsed().as_secs_f32() * 1000.0;
 
             terrain.render(&cmd_list, &camera, active_frame_index);
 
@@ -557,7 +549,7 @@ fn main() -> Result<()> {
                 ImGui_End();
 
                 terrain.render_imgui();
-                terrain.render_imgui_qtree();
+                terrain.render_imgui_qtree(camera.position());
                 terrain.render_imgui_atlas(&resource_heap);
 
                 // ImGui_ShowDemoWindow(std::ptr::null_mut());

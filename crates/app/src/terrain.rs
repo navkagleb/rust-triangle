@@ -23,15 +23,18 @@ const PATCH_LOD_COUNT: u32 = 6;
 const PATCH_PIXEL_SIZE: u32 = 128;
 const PATCH_TERRAIN_SIZE: u32 = PATCH_PIXEL_SIZE / 2;
 
-const ATLAS_PATCH_PIXEL_SIZE: u32 = PATCH_PIXEL_SIZE + 1; // for pixel overlap
+const ATLAS_PATCH_PIXEL_SIZE: usize = PATCH_PIXEL_SIZE as usize + 1; // for pixel overlap
+const ALTAS_PATCH_PIXEL_SIZE_WITH_BORDER: usize = ATLAS_PATCH_PIXEL_SIZE as usize + 2; // for gradient generation
 const ATLAS_PATCH_COUNT: u32 = 32;
-const ATLAS_SIZE: u32 = ATLAS_PATCH_PIXEL_SIZE * ATLAS_PATCH_COUNT;
-const HEIGHT_ATLAS_FORMAT: DXGI_FORMAT = DXGI_FORMAT_R32_FLOAT;
+const ATLAS_SIZE: u32 = ATLAS_PATCH_PIXEL_SIZE as u32 * ATLAS_PATCH_COUNT;
 const INDIRECTION_SLOT_COUNT: u32 = 512;
 
 const PATCH_SIDE_QUAD_COUNT: u32 = PATCH_PIXEL_SIZE;
 const PATCH_SIDE_VERTEX_COUNT: u32 = PATCH_PIXEL_SIZE + 1;
 const PATCH_INDEX_COUNT: u32 = PATCH_SIDE_QUAD_COUNT.pow(2) * 6;
+
+const NOISE_SCALE: f64 = 4.0;
+const NOISE_WORLD_SCALE: f64 = 2048.0;
 
 bitflags! {
     #[repr(transparent)]
@@ -57,9 +60,13 @@ struct GpuTerrainConsts {
     camera_grid_index: IVec2,
     terrain_to_world_scale: f32,
     terrain_height_scale: f32,
-    wireframe_pass: u32,
+    elapsed_time: f32,
     stitching_enabled: u32,
     active_patch_buffer_index: u32,
+
+    // Debug
+    wireframe_pass: u32,
+    display_normals: u32,
 }
 
 pub struct TerrainData {
@@ -71,7 +78,10 @@ pub struct TerrainData {
 
     solid_mode: bool,
     wireframe_mode: bool,
+    display_normals: bool,
     stitching_enabled: bool,
+    pause_sun_animation: bool,
+    terrain_elapsed_time: f32,
 
     freeze_camera: bool,
     camera_terrain_pos: Vec3,
@@ -91,12 +101,9 @@ pub struct TerrainData {
     indirection_texture: ID3D12Resource,
     indirection_texture_upload: ID3D12Resource,
     indirection_texture_ptr: *mut UVec2,
-    indirection_texture_size: usize,
 
-    height_atlas: ID3D12Resource,
-    height_atlas_upload: ID3D12Resource,
-    height_atlas_ptr: *mut f32,
-    height_atlas_size: usize,
+    height_atlas: TextureAtlas<f32>,
+    gradient_atlas: TextureAtlas<Vec2>,
 
     solid_const_buffer: ConstBuffer<GpuTerrainConsts>,
     wireframe_const_buffer: ConstBuffer<GpuTerrainConsts>,
@@ -149,8 +156,11 @@ impl TerrainData {
 
             indices
         };
-        let patch_index_buffer =
-            ID3D12Resource::new_buffer(device, D3D12_HEAP_TYPE_UPLOAD, size_of_val(patch_indices.as_slice()))?;
+        let patch_index_buffer = ID3D12Resource::new_buffer(
+            device,
+            D3D12_HEAP_TYPE_UPLOAD,
+            size_of_val(patch_indices.as_slice()) as u64,
+        )?;
 
         patch_index_buffer.map_and_write(patch_indices.as_slice())?;
 
@@ -160,7 +170,7 @@ impl TerrainData {
         let patch_buffer = ID3D12Resource::new_buffer(
             device,
             D3D12_HEAP_TYPE_UPLOAD,
-            (max_patch_count * FRAME_COUNT) as usize * size_of::<GpuTerrainPatch>(),
+            (max_patch_count * FRAME_COUNT) as u64 * size_of::<GpuTerrainPatch>() as u64,
         )?;
 
         unsafe {
@@ -203,26 +213,6 @@ impl TerrainData {
             );
         }
 
-        let get_texture_size = |texture: &ID3D12Resource| -> usize {
-            let desc = unsafe { texture.GetDesc() };
-            let mut size = 0;
-
-            unsafe {
-                device.GetCopyableFootprints(
-                    &desc,
-                    0,
-                    (desc.MipLevels * desc.DepthOrArraySize) as u32,
-                    0,
-                    None,
-                    None,
-                    None,
-                    Some(&mut size),
-                );
-            }
-
-            size as usize
-        };
-
         let indirection_format = DXGI_FORMAT_R32G32_UINT;
         let indirection_texture = ID3D12Resource::new_texture_2d(
             device,
@@ -231,11 +221,10 @@ impl TerrainData {
             INDIRECTION_SLOT_COUNT,
             PATCH_LOD_COUNT,
         )?;
-        let indirection_texture_size = get_texture_size(&indirection_texture);
         let indirection_texture_upload = ID3D12Resource::new_buffer(
             device,
             D3D12_HEAP_TYPE_UPLOAD,
-            indirection_texture_size * FRAME_COUNT as usize,
+            indirection_texture.size()? * FRAME_COUNT as u64,
         )?;
 
         indirection_texture.set_debug_name("TerrainIndirection")?;
@@ -258,34 +247,6 @@ impl TerrainData {
                     },
                 }),
                 resource_heap.get_cpu_handle(GpuResource::TerrainIndirectionTexture as u32),
-            );
-        }
-
-        let height_atlas = ID3D12Resource::new_texture_2d(device, HEIGHT_ATLAS_FORMAT, ATLAS_SIZE, ATLAS_SIZE, 1)?;
-        let height_atlas_size = get_texture_size(&height_atlas);
-        let height_atlas_upload =
-            ID3D12Resource::new_buffer(device, D3D12_HEAP_TYPE_UPLOAD, height_atlas_size * FRAME_COUNT as usize)?;
-
-        height_atlas.set_debug_name("TerrainHeightAtlas")?;
-        height_atlas_upload.set_debug_name("TerrainHeightAtlasUpload")?;
-
-        unsafe {
-            device.CreateShaderResourceView(
-                &height_atlas,
-                Some(&D3D12_SHADER_RESOURCE_VIEW_DESC {
-                    Format: HEIGHT_ATLAS_FORMAT,
-                    ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
-                    Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
-                    Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
-                        Texture2D: D3D12_TEX2D_SRV {
-                            MostDetailedMip: 0,
-                            MipLevels: 1,
-                            PlaneSlice: 0,
-                            ResourceMinLODClamp: 0.0,
-                        },
-                    },
-                }),
-                resource_heap.get_cpu_handle(GpuResource::TerrainHeightAtlas as u32),
             );
         }
 
@@ -356,9 +317,12 @@ impl TerrainData {
             terrain_to_world_scale: 1.0,
             terrain_height_scale: 120.0,
 
-            solid_mode: false,
-            wireframe_mode: true,
+            solid_mode: true,
+            wireframe_mode: false,
+            display_normals: false,
             stitching_enabled: true,
+            pause_sun_animation: false,
+            terrain_elapsed_time: 0.0,
 
             freeze_camera: false,
             camera_terrain_pos: Vec3::ZERO,
@@ -386,12 +350,19 @@ impl TerrainData {
             indirection_texture_ptr: indirection_texture_upload.map::<UVec2>()?,
             indirection_texture_upload,
             indirection_texture,
-            indirection_texture_size,
 
-            height_atlas_ptr: height_atlas_upload.map::<f32>()?,
-            height_atlas_upload,
-            height_atlas,
-            height_atlas_size,
+            height_atlas: TextureAtlas::new(
+                device,
+                resource_heap.get_cpu_handle(GpuResource::TerrainHeightAtlas as u32),
+                DXGI_FORMAT_R32_FLOAT,
+                "HeightAtlas",
+            )?,
+            gradient_atlas: TextureAtlas::new(
+                device,
+                resource_heap.get_cpu_handle(GpuResource::TerrainGradientAtlas as u32),
+                DXGI_FORMAT_R32G32_FLOAT,
+                "NormalAtlas",
+            )?,
 
             solid_const_buffer: ConstBuffer::new(device)?,
             wireframe_const_buffer: ConstBuffer::new(device)?,
@@ -404,13 +375,15 @@ impl TerrainData {
         })
     }
 
-    pub fn update_camera_pos(&mut self, camera_world_pos: &Vec3) {
-        if self.freeze_camera {
-            return;
+    pub fn update_camera_pos(&mut self, camera_world_pos: &Vec3, dt: f32) {
+        if !self.freeze_camera {
+            self.camera_terrain_pos = self.world_to_terrain_pos(*camera_world_pos);
+            self.camera_grid_index = self.camera_terrain_pos.xz().as_ivec2() / PATCH_TERRAIN_SIZE as i32;
         }
 
-        self.camera_terrain_pos = self.world_to_terrain_pos(*camera_world_pos);
-        self.camera_grid_index = self.camera_terrain_pos.xz().as_ivec2() / PATCH_TERRAIN_SIZE as i32;
+        if !self.pause_sun_animation {
+            self.terrain_elapsed_time += dt;
+        }
     }
 
     pub fn traverse_qtree(&mut self, active_frame_index: u32) -> Result<()> {
@@ -468,16 +441,17 @@ impl TerrainData {
 
         for result in self.patch_gen_pool.drain_results() {
             self.patch_cache.insert(
-                result.request,
+                result.patch,
                 PatchState::CpuGenerated {
-                    height_data: result.height_map,
+                    heights: result.heights,
+                    gradients: result.gradients,
                 },
             );
         }
 
-        for key in patches_to_request {
-            self.patch_gen_pool.requst_patch_generation(key);
-            self.patch_cache.insert(key, PatchState::GenerationQueued);
+        for patch in patches_to_request {
+            self.patch_gen_pool.request_patch_generation(patch);
+            self.patch_cache.insert(patch, PatchState::GenerationQueued);
         }
 
         let is_neighbor_coarser = |node: &PatchKey, direction: IVec2| -> bool {
@@ -534,33 +508,16 @@ impl TerrainData {
 
     pub fn upload_atlas_data(
         &mut self,
-        device: &ID3D12Device,
         cmd_list: &ID3D12GraphicsCommandList,
         cpu_frame_index: u64,
         gpu_frame_index: u64,
         active_frame_index: u32,
-    ) -> Result<()> {
-        let mut atlas_layout = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
-        unsafe {
-            device.GetCopyableFootprints(
-                &self.height_atlas.GetDesc(),
-                0,
-                1,
-                0,
-                Some(&mut atlas_layout),
-                None,
-                None,
-                None,
-            );
-        }
-
-        let upload_byte_offset = active_frame_index as usize * self.height_atlas_size;
-
+    ) {
         let mut patches_to_update = Vec::new();
 
         for (&key, state) in &self.patch_cache {
             if let PatchState::GpuUploadPending {
-                atlas_index,
+                atlas_slot,
                 submitted_frame,
             } = state
                 && *submitted_frame <= gpu_frame_index
@@ -568,69 +525,27 @@ impl TerrainData {
                 patches_to_update.push((
                     key,
                     PatchState::Resident {
-                        atlas_index: *atlas_index,
+                        atlas_slot: *atlas_slot,
                     },
                 ));
                 continue;
             }
 
-            let PatchState::CpuGenerated { height_data } = state else {
+            let PatchState::CpuGenerated { heights, gradients } = state else {
                 continue;
             };
 
-            let atlas_index = self.atlas_free_slots.pop().unwrap();
-            let atlas_row_pitch = atlas_layout.Footprint.RowPitch;
+            let atlas_slot = self.atlas_free_slots.pop().unwrap();
 
-            let patch_offset_bytes = atlas_index.y * ATLAS_PATCH_PIXEL_SIZE * atlas_row_pitch
-                + atlas_index.x * ATLAS_PATCH_PIXEL_SIZE * size_of::<f32>() as u32;
-
-            for row in 0..ATLAS_PATCH_PIXEL_SIZE {
-                let src_offset = row * ATLAS_PATCH_PIXEL_SIZE;
-                let dst_offset = patch_offset_bytes + row * atlas_row_pitch;
-
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        height_data.as_ptr().add(src_offset as usize),
-                        self.height_atlas_ptr.byte_add(upload_byte_offset + dst_offset as usize),
-                        ATLAS_PATCH_PIXEL_SIZE as usize,
-                    );
-                }
-            }
-
-            unsafe {
-                cmd_list.CopyTextureRegion(
-                    &D3D12_TEXTURE_COPY_LOCATION {
-                        pResource: std::mem::transmute_copy(&self.height_atlas),
-                        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
-                    },
-                    atlas_index.x * ATLAS_PATCH_PIXEL_SIZE,
-                    atlas_index.y * ATLAS_PATCH_PIXEL_SIZE,
-                    0,
-                    &D3D12_TEXTURE_COPY_LOCATION {
-                        pResource: std::mem::transmute_copy(&self.height_atlas_upload),
-                        Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                            PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
-                                Offset: upload_byte_offset as u64 + patch_offset_bytes as u64,
-                                Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
-                                    Format: HEIGHT_ATLAS_FORMAT,
-                                    Width: ATLAS_PATCH_PIXEL_SIZE,
-                                    Height: ATLAS_PATCH_PIXEL_SIZE,
-                                    Depth: 1,
-                                    RowPitch: atlas_row_pitch,
-                                },
-                            },
-                        },
-                    },
-                    None,
-                );
-            }
+            self.height_atlas
+                .copy_to(cmd_list, active_frame_index, atlas_slot, heights.as_slice());
+            self.gradient_atlas
+                .copy_to(cmd_list, active_frame_index, atlas_slot, gradients.as_slice());
 
             patches_to_update.push((
                 key,
                 PatchState::GpuUploadPending {
-                    atlas_index,
+                    atlas_slot,
                     submitted_frame: cpu_frame_index,
                 },
             ));
@@ -639,8 +554,6 @@ impl TerrainData {
         for (key, state) in patches_to_update {
             self.patch_cache.insert(key, state);
         }
-
-        Ok(())
     }
 
     pub fn upload_indirection_data(
@@ -657,23 +570,23 @@ impl TerrainData {
         });
 
         for (key, state) in &self.patch_cache {
-            let PatchState::Resident { atlas_index } = state else {
+            let PatchState::Resident { atlas_slot } = state else {
                 continue;
             };
 
             let lod_index = key.lod_index;
             let slot_count = INDIRECTION_SLOT_COUNT >> lod_index;
 
-            let relative_index = (key.grid_index >> lod_index) - (self.camera_grid_index >> lod_index);
-            let indirection_index = relative_index + slot_count as i32 / 2;
+            let relative_slot = (key.grid_index >> lod_index) - (self.camera_grid_index >> lod_index);
+            let indirection_slot = relative_slot + slot_count as i32 / 2;
 
             let range = 0..slot_count as i32;
-            if !range.contains(&indirection_index.x) || !range.contains(&indirection_index.y) {
+            if !range.contains(&indirection_slot.x) || !range.contains(&indirection_slot.y) {
                 continue;
             }
 
-            let flat_indirection_index = indirection_index.y as u32 * slot_count + indirection_index.x as u32;
-            resident_patch_lods[lod_index as usize][flat_indirection_index as usize] = *atlas_index;
+            let flat_indirection_index = indirection_slot.y as u32 * slot_count + indirection_slot.x as u32;
+            resident_patch_lods[lod_index as usize][flat_indirection_index as usize] = *atlas_slot;
         }
 
         let desc = unsafe { self.indirection_texture.GetDesc() };
@@ -692,7 +605,7 @@ impl TerrainData {
             );
         }
 
-        let upload_byte_offset = active_frame_index as usize * self.indirection_texture_size;
+        let upload_byte_offset = active_frame_index as u64 * self.indirection_texture.size()?;
 
         for lod_index in 0..PATCH_LOD_COUNT {
             let slot_count = INDIRECTION_SLOT_COUNT >> lod_index;
@@ -711,7 +624,7 @@ impl TerrainData {
                             .as_ptr()
                             .add(cpu_offset as usize),
                         self.indirection_texture_ptr
-                            .byte_add(upload_byte_offset + gpu_offset as usize),
+                            .byte_add((upload_byte_offset + gpu_offset) as usize),
                         slot_count as usize,
                     );
                 }
@@ -734,7 +647,7 @@ impl TerrainData {
                         Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
                         Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
                             PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
-                                Offset: upload_byte_offset as u64 + gpu_lod_offset,
+                                Offset: upload_byte_offset + gpu_lod_offset,
                                 Footprint: layouts[lod_index as usize].Footprint,
                             },
                         },
@@ -753,9 +666,12 @@ impl TerrainData {
             camera_grid_index: self.camera_grid_index,
             terrain_to_world_scale: self.terrain_to_world_scale,
             terrain_height_scale: self.terrain_height_scale,
-            wireframe_pass: false.into(),
+            elapsed_time: self.terrain_elapsed_time,
             stitching_enabled: self.stitching_enabled.into(),
             active_patch_buffer_index: GpuResource::TerrainPatchBufferFirst as u32 + active_frame_index,
+
+            wireframe_pass: false.into(),
+            display_normals: self.display_normals.into(),
         };
 
         let render_terrain = |vertex_pso: &ID3D12PipelineState| {
@@ -815,7 +731,9 @@ impl TerrainData {
             ImGui_Checkbox(c"Freeze camera".as_ptr(), &mut self.freeze_camera);
             ImGui_Checkbox(c"Solid mode".as_ptr(), &mut self.solid_mode);
             ImGui_Checkbox(c"Wireframe mode".as_ptr(), &mut self.wireframe_mode);
+            ImGui_Checkbox(c"Display normals".as_ptr(), &mut self.display_normals);
             ImGui_Checkbox(c"Stitching".as_ptr(), &mut self.stitching_enabled);
+            ImGui_Checkbox(c"Pause sun animation".as_ptr(), &mut self.pause_sun_animation);
 
             ImGui_NewLine();
 
@@ -847,7 +765,7 @@ impl TerrainData {
         }
     }
 
-    pub fn render_imgui_qtree(&mut self) {
+    pub fn render_imgui_qtree(&mut self, camera_world_pos: &Vec3) {
         unsafe {
             ImGui_Begin(c"TerrainQuadTree".as_ptr(), null_mut(), 0);
 
@@ -939,7 +857,7 @@ impl TerrainData {
                 );
             }
 
-            let minimap_camera_pos = minimap_center + self.camera_terrain_pos.xz() * minimap_scale;
+            let minimap_camera_pos = minimap_center + self.world_to_terrain_pos(*camera_world_pos).xz() * minimap_scale;
             ImDrawList_AddCircleFilled(
                 draw_list,
                 ImVec2 {
@@ -1035,9 +953,9 @@ impl TerrainData {
 
 enum PatchState {
     GenerationQueued,
-    CpuGenerated { height_data: Vec<f32> },
-    GpuUploadPending { atlas_index: UVec2, submitted_frame: u64 },
-    Resident { atlas_index: UVec2 },
+    CpuGenerated { heights: Vec<f32>, gradients: Vec<Vec2> },
+    GpuUploadPending { atlas_slot: UVec2, submitted_frame: u64 },
+    Resident { atlas_slot: UVec2 },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -1063,8 +981,9 @@ impl PatchKey {
 type PatchGenRequest = PatchKey;
 
 struct PatchGenResult {
-    request: PatchGenRequest,
-    height_map: Vec<f32>,
+    patch: PatchKey,
+    heights: Vec<f32>,
+    gradients: Vec<Vec2>,
 }
 
 struct PatchGenPool {
@@ -1107,38 +1026,34 @@ impl PatchGenPool {
                     .spawn(move || {
                         loop {
                             let request = request_receiver.lock().unwrap().recv();
-                            let Ok(request) = request else {
+                            let Ok(patch) = request else {
                                 break;
                             };
 
-                            let noise_scale = 4.0_f64;
-                            let world_scale = 2048.0_f64;
-
-                            let fbm_pos = request.terrain_origin().as_dvec2() / world_scale * noise_scale;
-                            let fbm_size = request.terrain_size() as f64 / world_scale * noise_scale;
-                            let fbm_pixel_size =
-                                request.terrain_size() as f64 / PATCH_PIXEL_SIZE as f64 / world_scale * noise_scale;
-
                             let instant = std::time::Instant::now();
 
-                            let height_map = PlaneMapBuilder::new(&fbm)
-                                .set_size(ATLAS_PATCH_PIXEL_SIZE as usize, ATLAS_PATCH_PIXEL_SIZE as usize)
-                                .set_x_bounds(fbm_pos.x, fbm_pos.x + fbm_size + fbm_pixel_size) // pixel overlap
-                                .set_y_bounds(fbm_pos.y, fbm_pos.y + fbm_size + fbm_pixel_size) // pixel overlap
-                                .build()
-                                .into_iter()
-                                .map(|n| (n as f32 * 1.5 + 0.3).clamp(0.0, 1.0))
-                                .collect::<Vec<_>>();
+                            let heights_with_border = Self::generate_heights_with_border(&fbm, patch);
+                            let heights = Self::extract_patch_heights(&heights_with_border);
+                            let gradients = Self::generate_gradients(&heights_with_border, patch);
 
                             {
                                 let ms = instant.elapsed().as_secs_f32() * 1000.0;
-                                let min = height_map.iter().cloned().fold(f32::INFINITY, f32::min);
-                                let max = height_map.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                                let min = heights_with_border.iter().cloned().fold(f32::INFINITY, f32::min);
+                                let max = heights_with_border.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
 
-                                println!("grid={}, min={}, max={} ({:.2} ms)", request.grid_index, min, max, ms);
+                                println!(
+                                    "grid={}, lod={}, min={}, max={} ({:.2} ms)",
+                                    patch.grid_index, patch.lod_index, min, max, ms
+                                );
                             }
 
-                            result_sender.send(PatchGenResult { request, height_map }).unwrap();
+                            result_sender
+                                .send(PatchGenResult {
+                                    patch,
+                                    heights,
+                                    gradients,
+                                })
+                                .unwrap();
                         }
                     })
                     .unwrap()
@@ -1152,12 +1067,68 @@ impl PatchGenPool {
         }
     }
 
-    fn requst_patch_generation(&self, request: PatchGenRequest) {
+    fn request_patch_generation(&self, request: PatchGenRequest) {
         self.request_sender.as_ref().unwrap().send(request).unwrap()
     }
 
     fn drain_results(&self) -> impl Iterator<Item = PatchGenResult> + '_ {
         self.result_receiver.try_iter()
+    }
+
+    fn generate_heights_with_border(fbm: &Fbm<Perlin>, patch: PatchKey) -> Vec<f32> {
+        let fbm_pos = patch.terrain_origin().as_dvec2() / NOISE_WORLD_SCALE * NOISE_SCALE;
+        let fbm_size = patch.terrain_size() as f64 / NOISE_WORLD_SCALE * NOISE_SCALE;
+        let fbm_pixel_size = fbm_size / PATCH_PIXEL_SIZE as f64;
+
+        PlaneMapBuilder::new(fbm)
+            .set_size(ALTAS_PATCH_PIXEL_SIZE_WITH_BORDER, ALTAS_PATCH_PIXEL_SIZE_WITH_BORDER)
+            .set_x_bounds(fbm_pos.x - fbm_pixel_size, fbm_pos.x + fbm_size + fbm_pixel_size * 2.0)
+            .set_y_bounds(fbm_pos.y - fbm_pixel_size, fbm_pos.y + fbm_size + fbm_pixel_size * 2.0)
+            .build()
+            .into_iter()
+            .map(|h| {
+                let h = h as f32 * 1.15 + 0.4;
+                h.clamp(0.0, 1.0)
+            })
+            .collect()
+    }
+
+    fn extract_patch_heights(heights_with_border: &[f32]) -> Vec<f32> {
+        let mut heights = vec![0.0; ATLAS_PATCH_PIXEL_SIZE.pow(2)];
+
+        for z in 0..ATLAS_PATCH_PIXEL_SIZE {
+            for x in 0..ATLAS_PATCH_PIXEL_SIZE {
+                heights[z * ATLAS_PATCH_PIXEL_SIZE + x] =
+                    heights_with_border[(z + 1) * ALTAS_PATCH_PIXEL_SIZE_WITH_BORDER + (x + 1)];
+            }
+        }
+
+        heights
+    }
+
+    fn generate_gradients(heights_with_border: &[f32], patch: PatchKey) -> Vec<Vec2> {
+        let texel_terrain_size = patch.terrain_size() as f32 / PATCH_PIXEL_SIZE as f32;
+
+        let mut gradients = vec![Vec2::ZERO; ATLAS_PATCH_PIXEL_SIZE.pow(2)];
+
+        for z in 0..ATLAS_PATCH_PIXEL_SIZE {
+            for x in 0..ATLAS_PATCH_PIXEL_SIZE {
+                let sx = x + 1;
+                let sz = z + 1;
+
+                let hl = heights_with_border[sz * ALTAS_PATCH_PIXEL_SIZE_WITH_BORDER + (sx - 1)];
+                let hr = heights_with_border[sz * ALTAS_PATCH_PIXEL_SIZE_WITH_BORDER + (sx + 1)];
+                let hb = heights_with_border[(sz - 1) * ALTAS_PATCH_PIXEL_SIZE_WITH_BORDER + sx];
+                let ht = heights_with_border[(sz + 1) * ALTAS_PATCH_PIXEL_SIZE_WITH_BORDER + sx];
+
+                let dhdx = (hl - hr) / (2.0 * texel_terrain_size);
+                let dhdz = (hb - ht) / (2.0 * texel_terrain_size);
+
+                gradients[z * ATLAS_PATCH_PIXEL_SIZE + x] = Vec2::new(dhdx, dhdz);
+            }
+        }
+
+        gradients
     }
 }
 
@@ -1240,133 +1211,120 @@ impl<'a> PatchQuadTreeBuilder<'a> {
     }
 }
 
-#[allow(unused)]
-struct MapData {
-    height_mips: Vec<Vec<f32>>,
-    normal_mips: Vec<Vec<Vec3>>,
+struct TextureAtlas<T> {
+    texture: ID3D12Resource,
+    upload: ID3D12Resource,
+    mapped_ptr: *mut T,
+    format: DXGI_FORMAT,
+    gpu_layout: D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+    gpu_size: u64,
 }
 
-#[allow(unused)]
-struct MapGeneratorParams {
-    size: usize,
-    scale: f32,
-    octaves: usize,
-    frequency: f64,
-    lacunarity: f64,
-    persistence: f64,
-    seed: u32,
-}
+impl<T> TextureAtlas<T> {
+    fn new(
+        device: &ID3D12Device,
+        cpu_srv: D3D12_CPU_DESCRIPTOR_HANDLE,
+        format: DXGI_FORMAT,
+        debug_name: &str,
+    ) -> Result<TextureAtlas<T>> {
+        let texture = ID3D12Resource::new_texture_2d(device, format, ATLAS_SIZE, ATLAS_SIZE, 1)?;
 
-#[allow(unused)]
-impl MapGeneratorParams {
-    fn new(size: usize) -> Self {
-        Self {
-            size,
-            scale: 7.0,
-            octaves: 6,
-            frequency: 1.0,
-            lacunarity: 2.0,
-            persistence: 0.5,
-            seed: 123,
-        }
-    }
-
-    fn generate(&self, terrain_size: usize) -> MapData {
-        let fbm = Fbm::<Perlin>::new(self.seed)
-            .set_octaves(self.octaves)
-            .set_frequency(self.frequency)
-            .set_lacunarity(self.lacunarity)
-            .set_persistence(self.persistence);
-
-        let height_map = PlaneMapBuilder::new(fbm)
-            .set_size(self.size, self.size)
-            .set_x_bounds(0.0, self.scale as f64)
-            .set_y_bounds(0.0, self.scale as f64)
-            .build()
-            .into_iter()
-            .map(|n| n as f32)
-            .collect::<Vec<_>>();
-
-        let min = height_map.iter().cloned().fold(f32::INFINITY, f32::min);
-        let max = height_map.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        println!("height map: min={}, max={}", min, max);
-
-        let height_map = height_map.iter().map(|n| (n - min) / (max - min)).collect::<Vec<_>>();
-        let normal_map = self.generate_normals(height_map.as_slice(), terrain_size);
-
-        MapData {
-            height_mips: self.generate_mips(height_map, |s0, s1, s2, s3| (s0 + s1 + s2 + s3) * 0.25),
-            normal_mips: self.generate_mips(normal_map, |s0, s1, s2, s3| {
-                let n = (s0 + s1 + s2 + s3) * 0.25;
-
-                if n.length_squared() > 1e-8 {
-                    n.normalize()
-                } else {
-                    Vec3::Y
-                }
-            }),
-        }
-    }
-
-    fn generate_mips<T, F>(&self, data: Vec<T>, mut downsample: F) -> Vec<Vec<T>>
-    where
-        T: Copy,
-        F: FnMut(T, T, T, T) -> T,
-    {
-        let mut mips = vec![data];
-        let mut current_size = self.size;
-
-        while current_size > 1 {
-            current_size /= 2;
-
-            let prev = mips.last().unwrap();
-            let mip = (0..current_size * current_size)
-                .map(|i| {
-                    let x = (i % current_size) * 2;
-                    let y = (i / current_size) * 2;
-                    let prev_size = current_size * 2;
-
-                    let s00 = prev[y * prev_size + x];
-                    let s10 = prev[y * prev_size + x + 1];
-                    let s01 = prev[(y + 1) * prev_size + x];
-                    let s11 = prev[(y + 1) * prev_size + x + 1];
-
-                    downsample(s00, s10, s01, s11)
-                })
-                .collect();
-
-            mips.push(mip);
+        let mut gpu_layout = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+        let mut gpu_size = 0;
+        unsafe {
+            device.GetCopyableFootprints(
+                &texture.GetDesc(),
+                0,
+                1,
+                0,
+                Some(&mut gpu_layout),
+                None,
+                None,
+                Some(&mut gpu_size),
+            );
         }
 
-        mips
+        let upload = ID3D12Resource::new_buffer(device, D3D12_HEAP_TYPE_UPLOAD, gpu_size * FRAME_COUNT as u64)?;
+
+        texture.set_debug_name(debug_name)?;
+        upload.set_debug_name(format!("{}Upload", debug_name).as_str())?;
+
+        unsafe {
+            device.CreateShaderResourceView(
+                &texture,
+                Some(&D3D12_SHADER_RESOURCE_VIEW_DESC {
+                    Format: format,
+                    ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+                    Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                    Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                        Texture2D: D3D12_TEX2D_SRV {
+                            MostDetailedMip: 0,
+                            MipLevels: 1,
+                            PlaneSlice: 0,
+                            ResourceMinLODClamp: 0.0,
+                        },
+                    },
+                }),
+                cpu_srv,
+            );
+        }
+
+        Ok(Self {
+            texture,
+            mapped_ptr: upload.map::<T>()?,
+            upload,
+            format,
+            gpu_layout,
+            gpu_size,
+        })
     }
 
-    fn generate_normals(&self, height_map: &[f32], terrain_size: usize) -> Vec<Vec3> {
-        let world_scale = terrain_size as f32 / self.size as f32;
-        let mut normals = vec![Vec3::ZERO; self.size * self.size];
+    fn copy_to(&self, cmd_list: &ID3D12GraphicsCommandList, active_frame_index: u32, cell: UVec2, data: &[T]) {
+        let row_pitch = self.gpu_layout.Footprint.RowPitch as usize;
+        let texel_size = size_of::<T>();
 
-        for z in 0..self.size {
-            for x in 0..self.size {
-                let sample = |sx: i32, sz: i32| -> f32 {
-                    let cx = sx.clamp(0, self.size as i32 - 1) as usize;
-                    let cz = sz.clamp(0, self.size as i32 - 1) as usize;
+        let frame_offset = active_frame_index as usize * self.gpu_size as usize;
+        let patch_offset = cell.y as usize * ATLAS_PATCH_PIXEL_SIZE * row_pitch
+            + cell.x as usize * ATLAS_PATCH_PIXEL_SIZE * texel_size;
+        let dst_patch_base = frame_offset + patch_offset;
 
-                    height_map[cz * self.size + cx]
-                };
+        for row in 0..ATLAS_PATCH_PIXEL_SIZE {
+            unsafe {
+                let src = data.as_ptr().add(row * ATLAS_PATCH_PIXEL_SIZE);
+                let dst = self.mapped_ptr.byte_add(dst_patch_base + row * row_pitch);
 
-                let hl = sample(x as i32 - 1, z as i32);
-                let hr = sample(x as i32 + 1, z as i32);
-                let hb = sample(x as i32, z as i32 - 1);
-                let ht = sample(x as i32, z as i32 + 1);
-
-                let height_scale = 10.0;
-                let dx = (hl - hr) * height_scale;
-                let dz = (hb - ht) * height_scale;
-
-                normals[z * self.size + x] = glam::Vec3::new(dx, 2.0 * world_scale, dz).normalize();
+                std::ptr::copy_nonoverlapping(src, dst, ATLAS_PATCH_PIXEL_SIZE);
             }
         }
 
-        normals
+        unsafe {
+            cmd_list.CopyTextureRegion(
+                &D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(&self.texture),
+                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+                },
+                cell.x * ATLAS_PATCH_PIXEL_SIZE as u32,
+                cell.y * ATLAS_PATCH_PIXEL_SIZE as u32,
+                0,
+                &D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(&self.upload),
+                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                            Offset: dst_patch_base as u64,
+                            Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                                Format: self.format,
+                                Width: ATLAS_PATCH_PIXEL_SIZE as u32,
+                                Height: ATLAS_PATCH_PIXEL_SIZE as u32,
+                                Depth: 1,
+                                RowPitch: row_pitch as u32,
+                            },
+                        },
+                    },
+                },
+                None,
+            );
+        }
     }
 }
