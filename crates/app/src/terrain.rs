@@ -1,10 +1,12 @@
+mod config;
+mod patch;
+
 use std::collections::HashMap;
 use std::ptr::null_mut;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
-use bitflags::bitflags;
 use glam::{IVec2, Mat4, UVec2, Vec2, Vec3, Vec3Swizzles, f32};
 use noise::utils::{NoiseMapBuilder, PlaneMapBuilder};
 use noise::{Fbm, MultiFractal, Perlin};
@@ -15,43 +17,15 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use crate::camera::Camera;
 use crate::d3d12_utils::*;
 use crate::{BACK_BUFFER_FORMAT, DEPTH_BUFFER_FORMAT, FRAME_COUNT, GpuResource, imgui_text};
+use config::*;
 use imgui_sys::*;
-
-const PATCH_GEN_WORKER_COUNT: usize = 8;
-
-const PATCH_LOD_COUNT: u32 = 6;
-const PATCH_PIXEL_SIZE: u32 = 128;
-const PATCH_TERRAIN_SIZE: u32 = PATCH_PIXEL_SIZE / 2;
-
-const ATLAS_PATCH_PIXEL_SIZE: usize = PATCH_PIXEL_SIZE as usize + 1; // for pixel overlap
-const ALTAS_PATCH_PIXEL_SIZE_WITH_BORDER: usize = ATLAS_PATCH_PIXEL_SIZE + 2; // for gradient generation
-const ATLAS_PATCH_COUNT: u32 = 32;
-const ATLAS_SIZE: u32 = ATLAS_PATCH_PIXEL_SIZE as u32 * ATLAS_PATCH_COUNT;
-const INDIRECTION_SLOT_COUNT: u32 = 512;
-
-const PATCH_SIDE_QUAD_COUNT: u32 = PATCH_PIXEL_SIZE;
-const PATCH_SIDE_VERTEX_COUNT: u32 = PATCH_PIXEL_SIZE + 1;
-const PATCH_INDEX_COUNT: u32 = PATCH_SIDE_QUAD_COUNT.pow(2) * 6;
-
-const NOISE_SCALE: f64 = 4.0;
-const NOISE_WORLD_SCALE: f64 = 2048.0;
-
-bitflags! {
-    #[repr(transparent)]
-    #[derive(Clone, Copy, Debug)]
-    struct StitchMask: u32 {
-        const TOP = 1 << 0;
-        const BOTTOM = 1 << 1;
-        const LEFT = 1 << 2;
-        const RIGHT = 1 << 3;
-    }
-}
+use patch::*;
 
 #[repr(C)]
 struct GpuTerrainPatch {
     grid_index: IVec2,
     lod_index: u32,
-    stitch_mask: StitchMask,
+    stitch_mask: PatchStitchMask,
 }
 
 #[repr(C)]
@@ -487,13 +461,13 @@ impl TerrainData {
             .iter()
             .map(|l| {
                 let directions = [
-                    (StitchMask::TOP, IVec2::NEG_Y),
-                    (StitchMask::BOTTOM, IVec2::Y),
-                    (StitchMask::LEFT, IVec2::NEG_X),
-                    (StitchMask::RIGHT, IVec2::X),
+                    (PatchStitchMask::TOP, IVec2::NEG_Y),
+                    (PatchStitchMask::BOTTOM, IVec2::Y),
+                    (PatchStitchMask::LEFT, IVec2::NEG_X),
+                    (PatchStitchMask::RIGHT, IVec2::X),
                 ];
 
-                let mut stitch_mask = StitchMask::empty();
+                let mut stitch_mask = PatchStitchMask::empty();
 
                 for &(flag, direction) in &directions {
                     if is_neighbor_coarser(l, direction) {
@@ -968,33 +942,6 @@ impl TerrainData {
         let world_scale = self.terrain_to_world_scale.max(0.0001);
 
         Vec3::new(world_pos.x / world_scale, world_pos.y, world_pos.z / world_scale)
-    }
-}
-
-enum PatchState {
-    GenerationQueued,
-    CpuGenerated { heights: Vec<f32>, gradients: Vec<Vec2> },
-    GpuUploadPending { atlas_slot: UVec2, submitted_frame: u64 },
-    Resident { atlas_slot: UVec2 },
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-struct PatchKey {
-    grid_index: IVec2,
-    lod_index: u32,
-}
-
-impl PatchKey {
-    fn terrain_origin(&self) -> IVec2 {
-        self.grid_index * PATCH_TERRAIN_SIZE as i32
-    }
-
-    fn terrain_size(&self) -> u32 {
-        PATCH_TERRAIN_SIZE * 2_u32.pow(self.lod_index)
-    }
-
-    fn terrain_center(&self) -> IVec2 {
-        self.terrain_origin() + self.terrain_size() as i32 / 2
     }
 }
 
