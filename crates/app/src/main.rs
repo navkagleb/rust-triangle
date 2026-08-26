@@ -415,7 +415,7 @@ fn main() -> Result<()> {
             });
         }
 
-        let mut terrain = TerrainData::new(&device, &resource_heap, &root_signature)?;
+        let mut terrain = Terrain::new(&device, &resource_heap, &root_signature)?;
 
         let mut cpu_frame_index = 0;
         let mut gpu_frame_index = 0;
