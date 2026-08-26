@@ -14,6 +14,7 @@ rand = "0.10.0"
 anyhow = "1.0.102"
 noise = "0.9.0"
 bitflags = "2.11.1"
+crossbeam-channel = "0.5.16"
 imgui-sys = { path = "../imgui-sys" }
 
 [dependencies.glam]

@@ -1,6 +1,3 @@
-use std::sync::mpsc::{Receiver, Sender};
-use std::sync::{Arc, Mutex};
-
 use glam::Vec2;
 use noise::utils::{NoiseMapBuilder, PlaneMapBuilder};
 use noise::{Fbm, MultiFractal, Perlin};
@@ -17,17 +14,15 @@ pub(super) struct PatchGenResult {
 }
 
 pub(super) struct PatchGenPool {
-    workers: Vec<std::thread::JoinHandle<()>>,
-    request_sender: Option<Sender<PatchGenRequest>>,
-    result_receiver: Receiver<PatchGenResult>,
+    threads: Vec<std::thread::JoinHandle<()>>,
+    request_sender: Option<crossbeam_channel::Sender<PatchGenRequest>>,
+    result_receiver: std::sync::mpsc::Receiver<PatchGenResult>,
 }
 
 impl PatchGenPool {
     pub(super) fn new() -> Self {
-        let (request_sender, request_receiver) = std::sync::mpsc::channel::<PatchGenRequest>();
+        let (request_sender, request_receiver) = crossbeam_channel::unbounded::<PatchGenRequest>();
         let (result_sender, result_receiver) = std::sync::mpsc::channel::<PatchGenResult>();
-
-        let request_receiver = Arc::new(Mutex::new(request_receiver));
 
         let fbm = Fbm::<Perlin>::new(123)
             .set_octaves(8)
@@ -35,53 +30,47 @@ impl PatchGenPool {
             .set_lacunarity(2.0)
             .set_persistence(0.5);
 
-        let workers = (0..PATCH_GEN_WORKER_COUNT)
-            .map(|i| {
-                let request_receiver = Arc::clone(&request_receiver);
+        let threads = (0..PATCH_GEN_THREAD_COUNT)
+            .map(|_| {
+                let request_receiver = request_receiver.clone();
                 let result_sender = result_sender.clone();
                 let fbm = fbm.clone();
 
-                std::thread::Builder::new()
-                    .name(format!("tile-generator-{}", i))
-                    .spawn(move || {
-                        loop {
-                            let request = request_receiver.lock().unwrap().recv();
-                            let Ok(patch) = request else {
-                                break;
-                            };
+                std::thread::spawn(move || {
+                    loop {
+                        let request = request_receiver.recv();
+                        let Ok(patch) = request else {
+                            break;
+                        };
 
-                            let instant = std::time::Instant::now();
+                        let instant = std::time::Instant::now();
 
-                            let heights_with_border = Self::generate_heights_with_border(&fbm, patch);
-                            let heights = Self::extract_patch_heights(&heights_with_border);
-                            let gradients = Self::generate_gradients(&heights_with_border, patch);
+                        let heights_with_border = Self::generate_heights_with_border(&fbm, patch);
+                        let heights = Self::extract_patch_heights(&heights_with_border);
+                        let gradients = Self::generate_gradients(&heights_with_border, patch);
 
-                            {
-                                let ms = instant.elapsed().as_secs_f32() * 1000.0;
-                                let min = heights_with_border.iter().cloned().fold(f32::INFINITY, f32::min);
-                                let max = heights_with_border.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                        println!(
+                            "Generated: index=[{:4}, {:4}], size={:4} ({:.2} ms)",
+                            patch.grid_index.x,
+                            patch.grid_index.y,
+                            patch.terrain_size(),
+                            instant.elapsed().as_secs_f32() * 1000.0
+                        );
 
-                                println!(
-                                    "grid={}, lod={}, min={}, max={} ({:.2} ms)",
-                                    patch.grid_index, patch.lod_index, min, max, ms
-                                );
-                            }
-
-                            result_sender
-                                .send(PatchGenResult {
-                                    patch,
-                                    heights,
-                                    gradients,
-                                })
-                                .unwrap();
-                        }
-                    })
-                    .unwrap()
+                        result_sender
+                            .send(PatchGenResult {
+                                patch,
+                                heights,
+                                gradients,
+                            })
+                            .unwrap();
+                    }
+                })
             })
             .collect();
 
         Self {
-            workers,
+            threads,
             request_sender: Some(request_sender),
             result_receiver,
         }
@@ -156,8 +145,8 @@ impl Drop for PatchGenPool {
     fn drop(&mut self) {
         drop(self.request_sender.take());
 
-        for worker in self.workers.drain(..) {
-            worker.join().unwrap();
+        for thread in self.threads.drain(..) {
+            thread.join().unwrap();
         }
     }
 }

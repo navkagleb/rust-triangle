@@ -1,4 +1,4 @@
-pub(super) const PATCH_GEN_WORKER_COUNT: usize = 8;
+pub(super) const PATCH_GEN_THREAD_COUNT: usize = 8;
 
 pub(super) const PATCH_LOD_COUNT: u32 = 6;
 pub(super) const PATCH_PIXEL_SIZE: u32 = 128;
