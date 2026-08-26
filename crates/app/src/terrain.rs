@@ -17,14 +17,14 @@ use crate::d3d12_utils::*;
 use crate::{BACK_BUFFER_FORMAT, DEPTH_BUFFER_FORMAT, FRAME_COUNT, GpuResource, imgui_text};
 use imgui_sys::*;
 
-const PATCH_GEN_WORKER_COUNT: usize = 16;
+const PATCH_GEN_WORKER_COUNT: usize = 8;
 
 const PATCH_LOD_COUNT: u32 = 6;
 const PATCH_PIXEL_SIZE: u32 = 128;
 const PATCH_TERRAIN_SIZE: u32 = PATCH_PIXEL_SIZE / 2;
 
 const ATLAS_PATCH_PIXEL_SIZE: usize = PATCH_PIXEL_SIZE as usize + 1; // for pixel overlap
-const ALTAS_PATCH_PIXEL_SIZE_WITH_BORDER: usize = ATLAS_PATCH_PIXEL_SIZE as usize + 2; // for gradient generation
+const ALTAS_PATCH_PIXEL_SIZE_WITH_BORDER: usize = ATLAS_PATCH_PIXEL_SIZE + 2; // for gradient generation
 const ATLAS_PATCH_COUNT: u32 = 32;
 const ATLAS_SIZE: u32 = ATLAS_PATCH_PIXEL_SIZE as u32 * ATLAS_PATCH_COUNT;
 const INDIRECTION_SLOT_COUNT: u32 = 512;
@@ -387,12 +387,11 @@ impl TerrainData {
     }
 
     pub fn traverse_qtree(&mut self, active_frame_index: u32) -> Result<()> {
-        let root_node =
-            PatchQuadTreeBuilder::new(&self.camera_terrain_pos, self.render_distance, self.lod_factor).build();
+        let qtree = PatchQuadTreeBuilder::new(&self.camera_terrain_pos, self.render_distance, self.lod_factor).build();
 
         let mut patches_to_render = Vec::new();
         let mut patches_to_request = Vec::new();
-        let mut nodes_to_traverse = std::collections::VecDeque::from([&root_node]);
+        let mut nodes_to_traverse = std::collections::VecDeque::from([&qtree.root]);
 
         let is_resident = |key| {
             self.patch_cache
@@ -429,6 +428,22 @@ impl TerrainData {
                 patches_to_request.push(node.key);
             }
         }
+
+        self.patch_cache.retain(|key, state| {
+            let grid_index = key.grid_index;
+            if grid_index.cmpge(qtree.min_grid_index).all() && grid_index.cmple(qtree.max_grid_index).all() {
+                return true;
+            }
+
+            match state {
+                PatchState::GpuUploadPending { atlas_slot, .. } | PatchState::Resident { atlas_slot } => {
+                    self.atlas_free_slots.push(*atlas_slot);
+                }
+                _ => {}
+            }
+
+            false
+        });
 
         self.patches_to_render = patches_to_render;
 
@@ -760,6 +775,11 @@ impl TerrainData {
             imgui_text!("Generated: {}", generated_count);
             imgui_text!("Uploading: {}", uploading_count);
             imgui_text!("Resident: {}", resident_count);
+            imgui_text!(
+                "Atlas slots: {}/{}",
+                self.atlas_free_slots.len(),
+                ATLAS_PATCH_COUNT * ATLAS_PATCH_COUNT
+            );
 
             ImGui_End();
         }
@@ -1147,6 +1167,12 @@ impl PatchQuadNode {
     }
 }
 
+struct PatchQuadTree {
+    root: PatchQuadNode,
+    min_grid_index: IVec2,
+    max_grid_index: IVec2,
+}
+
 struct PatchQuadTreeBuilder<'a> {
     camera_terrain_pos: &'a Vec3,
     render_distance: u32,
@@ -1162,11 +1188,17 @@ impl<'a> PatchQuadTreeBuilder<'a> {
         }
     }
 
-    fn build(self) -> PatchQuadNode {
+    fn build(self) -> PatchQuadTree {
         let mut root = self.root_node();
         self.split_recursive(&mut root);
 
-        root
+        let grid_render_size = (self.render_distance * 2 / PATCH_TERRAIN_SIZE) as i32;
+
+        PatchQuadTree {
+            min_grid_index: root.key.grid_index,
+            max_grid_index: root.key.grid_index + grid_render_size,
+            root,
+        }
     }
 
     fn root_node(&self) -> PatchQuadNode {
