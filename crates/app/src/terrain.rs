@@ -1,14 +1,17 @@
 mod config;
+mod gpu_types;
 mod patch;
 mod patch_gen_pool;
+mod patch_priority_queue;
 mod patch_quad_tree;
 mod terrain_imgui;
 mod texture_atlas;
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use anyhow::Result;
-use glam::{IVec2, Mat4, UVec2, Vec2, Vec3, Vec3Swizzles, f32};
+use glam::{IVec2, UVec2, Vec2, Vec3, Vec3Swizzles, f32};
 use windows::Win32::Graphics::Direct3D::*;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -17,32 +20,12 @@ use crate::camera::Camera;
 use crate::d3d12_utils::*;
 use crate::{BACK_BUFFER_FORMAT, DEPTH_BUFFER_FORMAT, FRAME_COUNT, GpuResource};
 use config::*;
+use gpu_types::*;
 use patch::*;
 use patch_gen_pool::*;
+use patch_priority_queue::*;
 use patch_quad_tree::*;
 use texture_atlas::*;
-
-#[repr(C)]
-struct GpuTerrainPatch {
-    grid_index: IVec2,
-    lod_index: u32,
-    stitch_mask: PatchStitchMask,
-}
-
-#[repr(C)]
-struct GpuTerrainConsts {
-    world_to_clip: Mat4,
-    camera_grid_index: IVec2,
-    terrain_to_world_scale: f32,
-    terrain_height_scale: f32,
-    elapsed_time: f32,
-    stitching_enabled: u32,
-    active_patch_buffer_index: u32,
-
-    // Debug
-    wireframe_pass: u32,
-    display_normals: u32,
-}
 
 pub struct Terrain {
     render_distance: u32,
@@ -59,10 +42,12 @@ pub struct Terrain {
     terrain_elapsed_time: f32,
 
     freeze_camera: bool,
-    camera_terrain_pos: Vec3,
+    camera_pos: Vec2,
+    camera_forward: Vec2,
     camera_grid_index: IVec2,
 
     patch_cache: HashMap<PatchKey, PatchState>,
+    patch_queue: Arc<PatchPriorityQueue>,
     patch_gen_pool: PatchGenPool,
     atlas_free_slots: Vec<UVec2>,
     patches_to_render: Vec<PatchKey>,
@@ -285,6 +270,8 @@ impl Terrain {
                 }
             };
 
+        let patch_queue = Arc::new(PatchPriorityQueue::new());
+
         Ok(Self {
             render_distance,
             lod_factor: 3.5,
@@ -300,11 +287,13 @@ impl Terrain {
             terrain_elapsed_time: 0.0,
 
             freeze_camera: false,
-            camera_terrain_pos: Vec3::ZERO,
+            camera_pos: Vec2::ZERO,
+            camera_forward: Vec2::Y,
             camera_grid_index: IVec2::ZERO,
 
             patch_cache: HashMap::new(),
-            patch_gen_pool: PatchGenPool::new(),
+            patch_gen_pool: PatchGenPool::new(Arc::clone(&patch_queue)),
+            patch_queue,
             atlas_free_slots: {
                 let mut free_slots = Vec::with_capacity((ATLAS_PATCH_COUNT * ATLAS_PATCH_COUNT) as usize);
                 for y in (0..ATLAS_PATCH_COUNT).rev() {
@@ -350,10 +339,11 @@ impl Terrain {
         })
     }
 
-    pub fn update_camera_pos(&mut self, camera_world_pos: &Vec3, dt: f32) {
+    pub fn update_camera(&mut self, camera_pos: &Vec3, camera_forward: &Vec3, dt: f32) {
         if !self.freeze_camera {
-            self.camera_terrain_pos = self.world_to_terrain_pos(*camera_world_pos);
-            self.camera_grid_index = self.camera_terrain_pos.xz().as_ivec2() / PATCH_TERRAIN_SIZE as i32;
+            self.camera_pos = self.world_to_terrain_pos(*camera_pos);
+            self.camera_forward = camera_forward.xz();
+            self.camera_grid_index = self.camera_pos.as_ivec2() / PATCH_TERRAIN_SIZE as i32;
         }
 
         if !self.pause_sun_animation {
@@ -361,11 +351,29 @@ impl Terrain {
         }
     }
 
-    pub fn traverse_qtree(&mut self, active_frame_index: u32) -> Result<()> {
-        let qtree = PatchQuadTreeBuilder::new(&self.camera_terrain_pos, self.render_distance, self.lod_factor).build();
+    pub fn traverse_qtree(&mut self, frame_index: u64, active_frame_index: u32) -> Result<()> {
+        for result in self.patch_gen_pool.drain_results() {
+            match self.patch_queue.finish_result(&result.queue_entry) {
+                ResultDisposition::Accept => {
+                    self.patch_cache.insert(
+                        result.queue_entry.patch(),
+                        PatchState::CpuGenerated {
+                            heights: result.heights,
+                            gradients: result.gradients,
+                        },
+                    );
+                }
 
-        let mut patches_to_render = Vec::new();
-        let mut patches_to_request = Vec::new();
+                ResultDisposition::Discard | ResultDisposition::Stale => {
+                    // The camera moved or this result belongs to an old request
+                }
+            }
+        }
+
+        let qtree = PatchQuadTreeBuilder::new(self.camera_pos, self.render_distance, self.lod_factor).build();
+
+        let mut renderable_patches = Vec::new();
+        let mut desired_patches = Vec::new();
         let mut nodes_to_traverse = std::collections::VecDeque::from([&qtree.root]);
 
         let is_resident = |key| {
@@ -374,23 +382,32 @@ impl Terrain {
                 .is_some_and(|status| matches!(status, PatchState::Resident { .. }))
         };
 
+        let is_need_generation = |patch: &PatchKey| !self.patch_cache.contains_key(patch);
+
         while let Some(node) = nodes_to_traverse.pop_front() {
             let is_node_renderable = node.key.lod_index < PATCH_LOD_COUNT;
 
             if let Some(children) = node.children.as_deref() {
-                let children_ready = children.iter().all(|child| is_resident(&child.key));
+                let ready_child_count = children.iter().filter(|child| is_resident(&child.key)).count() as u8;
+                let all_children_ready = children.iter().all(|child| is_resident(&child.key));
 
-                if !is_node_renderable || children_ready {
+                if !is_node_renderable || all_children_ready {
                     nodes_to_traverse.extend(children.iter());
                     continue;
                 }
 
-                patches_to_request.extend(
-                    children
-                        .iter()
-                        .filter(|child| !self.patch_cache.contains_key(&child.key))
-                        .map(|child| child.key),
-                );
+                // The parent is currently being used as fallback.
+                // Request every child that still needs generation.
+                for child in children {
+                    if is_need_generation(&child.key) {
+                        desired_patches.push(DesiredPatch::new(
+                            child.key,
+                            ready_child_count,
+                            self.camera_pos,
+                            self.camera_forward,
+                        ));
+                    }
+                }
             };
 
             if !is_node_renderable {
@@ -398,9 +415,9 @@ impl Terrain {
             }
 
             if is_resident(&node.key) {
-                patches_to_render.push(node.key);
-            } else if !self.patch_cache.contains_key(&node.key) {
-                patches_to_request.push(node.key);
+                renderable_patches.push(node.key);
+            } else if is_need_generation(&node.key) {
+                desired_patches.push(DesiredPatch::new(node.key, 0, self.camera_pos, self.camera_forward))
             }
         }
 
@@ -420,29 +437,8 @@ impl Terrain {
             false
         });
 
-        self.patches_to_render = patches_to_render;
-
-        patches_to_request.sort_unstable_by(|a, b| {
-            let distance_a = (self.camera_terrain_pos - a.terrain_center().extend(0).xzy().as_vec3()).length_squared();
-            let distance_b = (self.camera_terrain_pos - b.terrain_center().extend(0).xzy().as_vec3()).length_squared();
-
-            distance_a.total_cmp(&distance_b)
-        });
-
-        for result in self.patch_gen_pool.drain_results() {
-            self.patch_cache.insert(
-                result.patch,
-                PatchState::CpuGenerated {
-                    heights: result.heights,
-                    gradients: result.gradients,
-                },
-            );
-        }
-
-        for patch in patches_to_request {
-            self.patch_gen_pool.request_patch_generation(patch);
-            self.patch_cache.insert(patch, PatchState::GenerationQueued);
-        }
+        self.patches_to_render = renderable_patches;
+        self.patch_queue.rebuild(frame_index, desired_patches);
 
         let is_neighbor_coarser = |node: &PatchKey, direction: IVec2| -> bool {
             let probe = node.terrain_center() + direction * node.terrain_size() as i32;
@@ -703,9 +699,9 @@ impl Terrain {
         }
     }
 
-    fn world_to_terrain_pos(&self, world_pos: Vec3) -> Vec3 {
+    fn world_to_terrain_pos(&self, world_pos: Vec3) -> Vec2 {
         let world_scale = self.terrain_to_world_scale.max(0.0001);
 
-        Vec3::new(world_pos.x / world_scale, world_pos.y, world_pos.z / world_scale)
+        Vec2::new(world_pos.x / world_scale, world_pos.z / world_scale)
     }
 }

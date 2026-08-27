@@ -24,7 +24,6 @@ impl PatchKey {
 }
 
 pub(super) enum PatchState {
-    GenerationQueued,
     CpuGenerated { heights: Vec<f32>, gradients: Vec<Vec2> },
     GpuUploadPending { atlas_slot: UVec2, submitted_frame: u64 },
     Resident { atlas_slot: UVec2 },

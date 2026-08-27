@@ -1,27 +1,27 @@
+use std::sync::Arc;
+
 use glam::Vec2;
 use noise::utils::{NoiseMapBuilder, PlaneMapBuilder};
 use noise::{Fbm, MultiFractal, Perlin};
 
 use super::config::*;
 use super::patch::PatchKey;
+use super::patch_priority_queue::{PatchPriorityQueue, PatchQueueEntry};
 
-type PatchGenRequest = PatchKey;
-
-pub(super) struct PatchGenResult {
-    pub(super) patch: PatchKey,
-    pub(super) heights: Vec<f32>,
-    pub(super) gradients: Vec<Vec2>,
+pub struct PatchGenResult {
+    pub queue_entry: PatchQueueEntry,
+    pub heights: Vec<f32>,
+    pub gradients: Vec<Vec2>,
 }
 
-pub(super) struct PatchGenPool {
+pub struct PatchGenPool {
     threads: Vec<std::thread::JoinHandle<()>>,
-    request_sender: Option<crossbeam_channel::Sender<PatchGenRequest>>,
+    patch_queue: Arc<PatchPriorityQueue>,
     result_receiver: std::sync::mpsc::Receiver<PatchGenResult>,
 }
 
 impl PatchGenPool {
-    pub(super) fn new() -> Self {
-        let (request_sender, request_receiver) = crossbeam_channel::unbounded::<PatchGenRequest>();
+    pub fn new(patch_queue: Arc<PatchPriorityQueue>) -> Self {
         let (result_sender, result_receiver) = std::sync::mpsc::channel::<PatchGenResult>();
 
         let fbm = Fbm::<Perlin>::new(123)
@@ -32,17 +32,13 @@ impl PatchGenPool {
 
         let threads = (0..PATCH_GEN_THREAD_COUNT)
             .map(|_| {
-                let request_receiver = request_receiver.clone();
+                let patch_queue = Arc::clone(&patch_queue);
                 let result_sender = result_sender.clone();
                 let fbm = fbm.clone();
 
                 std::thread::spawn(move || {
-                    loop {
-                        let request = request_receiver.recv();
-                        let Ok(patch) = request else {
-                            break;
-                        };
-
+                    while let Some(entry) = patch_queue.pop_blocking() {
+                        let patch = entry.patch();
                         let instant = std::time::Instant::now();
 
                         let heights_with_border = Self::generate_heights_with_border(&fbm, patch);
@@ -57,13 +53,15 @@ impl PatchGenPool {
                             instant.elapsed().as_secs_f32() * 1000.0
                         );
 
-                        result_sender
-                            .send(PatchGenResult {
-                                patch,
-                                heights,
-                                gradients,
-                            })
-                            .unwrap();
+                        let send_result = result_sender.send(PatchGenResult {
+                            queue_entry: entry,
+                            heights,
+                            gradients,
+                        });
+
+                        if send_result.is_err() {
+                            break;
+                        }
                     }
                 })
             })
@@ -71,16 +69,12 @@ impl PatchGenPool {
 
         Self {
             threads,
-            request_sender: Some(request_sender),
+            patch_queue,
             result_receiver,
         }
     }
 
-    pub(super) fn request_patch_generation(&self, request: PatchGenRequest) {
-        self.request_sender.as_ref().unwrap().send(request).unwrap()
-    }
-
-    pub(super) fn drain_results(&self) -> impl Iterator<Item = PatchGenResult> + '_ {
+    pub fn drain_results(&self) -> impl Iterator<Item = PatchGenResult> + '_ {
         self.result_receiver.try_iter()
     }
 
@@ -143,7 +137,7 @@ impl PatchGenPool {
 
 impl Drop for PatchGenPool {
     fn drop(&mut self) {
-        drop(self.request_sender.take());
+        self.patch_queue.shutdown();
 
         for thread in self.threads.drain(..) {
             thread.join().unwrap();

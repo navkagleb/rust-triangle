@@ -8,6 +8,7 @@ const SPEED_MULTIPLIER: f32 = 10.0;
 
 pub struct Camera {
     position: Vec3,
+    forward: Vec3,
     world_to_view: Mat4,
     view_to_clip: Mat4,
 }
@@ -20,6 +21,7 @@ impl Camera {
 
         Self {
             position,
+            forward: Vec3::Y,
             world_to_view: Mat4::IDENTITY,
             view_to_clip: Mat4::perspective_infinite_reverse_lh(fov_y, aspect_ratio, near_z),
         }
@@ -27,6 +29,10 @@ impl Camera {
 
     pub fn position(&self) -> &Vec3 {
         &self.position
+    }
+
+    pub fn forward(&self) -> &Vec3 {
+        &self.forward
     }
 
     pub fn world_to_clip(&self) -> Mat4 {
@@ -54,12 +60,14 @@ impl CameraController {
         let yaw_rad = self.yaw.to_radians();
         let pitch_rad = self.pitch.to_radians();
 
-        let front_dir = Vec3::new(
-            yaw_rad.cos() * pitch_rad.cos(),
-            pitch_rad.sin(),
-            yaw_rad.sin() * pitch_rad.cos(),
-        )
-        .normalize();
+        let forward = {
+            let dir = Vec3::new(
+                yaw_rad.cos() * pitch_rad.cos(),
+                pitch_rad.sin(),
+                yaw_rad.sin() * pitch_rad.cos(),
+            );
+            dir.normalize()
+        };
 
         let mut speed = self.speed * dt;
         if input.keys[VK_SHIFT.0 as usize] {
@@ -67,19 +75,19 @@ impl CameraController {
         }
 
         if input.keys[b'W' as usize] {
-            camera.position += front_dir * speed;
+            camera.position += forward * speed;
         }
 
         if input.keys[b'S' as usize] {
-            camera.position -= front_dir * speed;
+            camera.position -= forward * speed;
         }
 
         if input.keys[b'A' as usize] {
-            camera.position += front_dir.cross(Vec3::Y).normalize() * speed;
+            camera.position += forward.cross(Vec3::Y).normalize() * speed;
         }
 
         if input.keys[b'D' as usize] {
-            camera.position -= front_dir.cross(Vec3::Y).normalize() * speed;
+            camera.position -= forward.cross(Vec3::Y).normalize() * speed;
         }
 
         if input.keys[VK_SPACE.0 as usize] {
@@ -90,7 +98,8 @@ impl CameraController {
             camera.position.y -= speed;
         }
 
-        camera.world_to_view = Mat4::look_to_lh(camera.position, front_dir, Vec3::Y);
+        camera.forward = forward;
+        camera.world_to_view = Mat4::look_to_lh(camera.position, forward, Vec3::Y);
     }
 
     pub fn yaw(&self) -> f32 {

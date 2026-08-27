@@ -35,14 +35,12 @@ impl Terrain {
             ImGui_NewLine();
 
             let render_count = (self.render_distance * 2) / PATCH_TERRAIN_SIZE;
-            let mut requested_count = 0;
             let mut generated_count = 0;
             let mut uploading_count = 0;
             let mut resident_count = 0;
 
             for state in self.patch_cache.values() {
                 match state {
-                    PatchState::GenerationQueued => requested_count += 1,
                     PatchState::CpuGenerated { .. } => generated_count += 1,
                     PatchState::GpuUploadPending { .. } => uploading_count += 1,
                     PatchState::Resident { .. } => resident_count += 1,
@@ -53,7 +51,6 @@ impl Terrain {
             imgui_text!("Max render squared patches: {}", render_count.pow(2));
             imgui_text!("Render (leafs): {}", self.patches_to_render.len());
             imgui_text!("Cached: {}", self.patch_cache.len());
-            imgui_text!("Requested: {}", requested_count);
             imgui_text!("Generated: {}", generated_count);
             imgui_text!("Uploading: {}", uploading_count);
             imgui_text!("Resident: {}", resident_count);
@@ -67,7 +64,7 @@ impl Terrain {
         }
     }
 
-    pub fn render_imgui_qtree(&mut self, camera_world_pos: &Vec3) {
+    pub fn render_imgui_qtree(&mut self, camera_world_pos: &Vec3, camera_forward: &Vec3) {
         unsafe {
             ImGui_Begin(c"TerrainQuadTree".as_ptr(), null_mut(), 0);
 
@@ -159,7 +156,10 @@ impl Terrain {
                 );
             }
 
-            let minimap_camera_pos = minimap_center + self.world_to_terrain_pos(*camera_world_pos).xz() * minimap_scale;
+            let camera_color = 0xFF0000FF_u32;
+            let minimap_camera_pos = minimap_center + self.world_to_terrain_pos(*camera_world_pos) * minimap_scale;
+            let minimap_camera_forward_pos = minimap_camera_pos + camera_forward.xz().normalize() * 100.0;
+
             ImDrawList_AddCircleFilled(
                 draw_list,
                 ImVec2 {
@@ -167,8 +167,21 @@ impl Terrain {
                     y: minimap_camera_pos.y,
                 },
                 5.0,
-                0xFF0000FF,
+                camera_color,
                 5,
+            );
+
+            ImDrawList_AddLine(
+                draw_list,
+                ImVec2 {
+                    x: minimap_camera_pos.x,
+                    y: minimap_camera_pos.y,
+                },
+                ImVec2 {
+                    x: minimap_camera_forward_pos.x,
+                    y: minimap_camera_forward_pos.y,
+                },
+                camera_color,
             );
 
             let start = self

@@ -452,7 +452,7 @@ fn main() -> Result<()> {
                 input.mouse_dy = 0;
             }
 
-            terrain.update_camera_pos(camera.position(), dt);
+            terrain.update_camera(camera.position(), camera.forward(), dt);
 
             // Render
             let active_frame_index = swap_chain.GetCurrentBackBufferIndex();
@@ -497,7 +497,7 @@ fn main() -> Result<()> {
             let upload_atlas_ms = t.elapsed().as_secs_f32() * 1000.0;
 
             let t = Instant::now();
-            terrain.traverse_qtree(active_frame_index)?;
+            terrain.traverse_qtree(cpu_frame_index, active_frame_index)?;
             let traverse_qtree_ms = t.elapsed().as_secs_f32() * 1000.0;
 
             let t = Instant::now();
@@ -549,7 +549,7 @@ fn main() -> Result<()> {
                 ImGui_End();
 
                 terrain.render_imgui();
-                terrain.render_imgui_qtree(camera.position());
+                terrain.render_imgui_qtree(camera.position(), camera.forward());
                 terrain.render_imgui_atlas(&resource_heap);
 
                 // ImGui_ShowDemoWindow(std::ptr::null_mut());

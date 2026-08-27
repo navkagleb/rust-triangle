@@ -1,0 +1,25 @@
+use glam::{IVec2, Mat4};
+
+use super::patch::PatchStitchMask;
+
+#[repr(C)]
+pub struct GpuTerrainPatch {
+    pub grid_index: IVec2,
+    pub lod_index: u32,
+    pub stitch_mask: PatchStitchMask,
+}
+
+#[repr(C)]
+pub struct GpuTerrainConsts {
+    pub world_to_clip: Mat4,
+    pub camera_grid_index: IVec2,
+    pub terrain_to_world_scale: f32,
+    pub terrain_height_scale: f32,
+    pub elapsed_time: f32,
+    pub stitching_enabled: u32,
+    pub active_patch_buffer_index: u32,
+
+    // Debug
+    pub wireframe_pass: u32,
+    pub display_normals: u32,
+}
