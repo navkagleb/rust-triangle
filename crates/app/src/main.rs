@@ -497,7 +497,7 @@ fn main() -> Result<()> {
             let upload_atlas_ms = t.elapsed().as_secs_f32() * 1000.0;
 
             let t = Instant::now();
-            terrain.traverse_qtree(cpu_frame_index, active_frame_index)?;
+            terrain.traverse_qtree(active_frame_index)?;
             let traverse_qtree_ms = t.elapsed().as_secs_f32() * 1000.0;
 
             let t = Instant::now();

@@ -5,7 +5,7 @@ pub(super) const PATCH_PIXEL_SIZE: u32 = 128;
 pub(super) const PATCH_TERRAIN_SIZE: u32 = PATCH_PIXEL_SIZE / 2;
 
 pub(super) const ATLAS_PATCH_PIXEL_SIZE: usize = PATCH_PIXEL_SIZE as usize + 1; // for pixel overlap
-pub(super) const ALTAS_PATCH_PIXEL_SIZE_WITH_BORDER: usize = ATLAS_PATCH_PIXEL_SIZE + 2; // for gradient generation
+pub(super) const ATLAS_PATCH_PIXEL_SIZE_WITH_BORDER: usize = ATLAS_PATCH_PIXEL_SIZE + 2; // for gradient generation
 pub(super) const ATLAS_PATCH_COUNT: u32 = 32;
 pub(super) const ATLAS_SIZE: u32 = ATLAS_PATCH_PIXEL_SIZE as u32 * ATLAS_PATCH_COUNT;
 pub(super) const INDIRECTION_SLOT_COUNT: u32 = 512;

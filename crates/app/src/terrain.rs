@@ -1,14 +1,13 @@
 mod config;
 mod gpu_types;
 mod patch;
-mod patch_gen_pool;
-mod patch_priority_queue;
+mod patch_generator;
 mod patch_quad_tree;
+mod patch_queue;
 mod terrain_imgui;
 mod texture_atlas;
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use anyhow::Result;
 use glam::{IVec2, UVec2, Vec2, Vec3, Vec3Swizzles, f32};
@@ -22,8 +21,7 @@ use crate::{BACK_BUFFER_FORMAT, DEPTH_BUFFER_FORMAT, FRAME_COUNT, GpuResource};
 use config::*;
 use gpu_types::*;
 use patch::*;
-use patch_gen_pool::*;
-use patch_priority_queue::*;
+use patch_generator::*;
 use patch_quad_tree::*;
 use texture_atlas::*;
 
@@ -47,8 +45,7 @@ pub struct Terrain {
     camera_grid_index: IVec2,
 
     patch_cache: HashMap<PatchKey, PatchState>,
-    patch_queue: Arc<PatchPriorityQueue>,
-    patch_gen_pool: PatchGenPool,
+    patch_generator: PatchGenerator,
     atlas_free_slots: Vec<UVec2>,
     patches_to_render: Vec<PatchKey>,
 
@@ -270,8 +267,6 @@ impl Terrain {
                 }
             };
 
-        let patch_queue = Arc::new(PatchPriorityQueue::new());
-
         Ok(Self {
             render_distance,
             lod_factor: 3.5,
@@ -292,8 +287,7 @@ impl Terrain {
             camera_grid_index: IVec2::ZERO,
 
             patch_cache: HashMap::new(),
-            patch_gen_pool: PatchGenPool::new(Arc::clone(&patch_queue)),
-            patch_queue,
+            patch_generator: PatchGenerator::new(),
             atlas_free_slots: {
                 let mut free_slots = Vec::with_capacity((ATLAS_PATCH_COUNT * ATLAS_PATCH_COUNT) as usize);
                 for y in (0..ATLAS_PATCH_COUNT).rev() {
@@ -351,29 +345,21 @@ impl Terrain {
         }
     }
 
-    pub fn traverse_qtree(&mut self, frame_index: u64, active_frame_index: u32) -> Result<()> {
-        for result in self.patch_gen_pool.drain_results() {
-            match self.patch_queue.finish_result(&result.queue_entry) {
-                ResultDisposition::Accept => {
-                    self.patch_cache.insert(
-                        result.queue_entry.patch(),
-                        PatchState::CpuGenerated {
-                            heights: result.heights,
-                            gradients: result.gradients,
-                        },
-                    );
-                }
-
-                ResultDisposition::Discard | ResultDisposition::Stale => {
-                    // The camera moved or this result belongs to an old request
-                }
-            }
+    pub fn traverse_qtree(&mut self, active_frame_index: u32) -> Result<()> {
+        for result in self.patch_generator.drain_generated() {
+            self.patch_cache.insert(
+                result.patch,
+                PatchState::CpuGenerated {
+                    heights: result.heights,
+                    gradients: result.gradients,
+                },
+            );
         }
 
         let qtree = PatchQuadTreeBuilder::new(self.camera_pos, self.render_distance, self.lod_factor).build();
 
         let mut renderable_patches = Vec::new();
-        let mut desired_patches = Vec::new();
+        let mut wanted_patches = Vec::new();
         let mut nodes_to_traverse = std::collections::VecDeque::from([&qtree.root]);
 
         let is_resident = |key| {
@@ -388,7 +374,6 @@ impl Terrain {
             let is_node_renderable = node.key.lod_index < PATCH_LOD_COUNT;
 
             if let Some(children) = node.children.as_deref() {
-                let ready_child_count = children.iter().filter(|child| is_resident(&child.key)).count() as u8;
                 let all_children_ready = children.iter().all(|child| is_resident(&child.key));
 
                 if !is_node_renderable || all_children_ready {
@@ -400,12 +385,7 @@ impl Terrain {
                 // Request every child that still needs generation.
                 for child in children {
                     if is_need_generation(&child.key) {
-                        desired_patches.push(DesiredPatch::new(
-                            child.key,
-                            ready_child_count,
-                            self.camera_pos,
-                            self.camera_forward,
-                        ));
+                        wanted_patches.push(WantedPatch::new(child.key, false, self.camera_pos, self.camera_forward));
                     }
                 }
             };
@@ -417,7 +397,7 @@ impl Terrain {
             if is_resident(&node.key) {
                 renderable_patches.push(node.key);
             } else if is_need_generation(&node.key) {
-                desired_patches.push(DesiredPatch::new(node.key, 0, self.camera_pos, self.camera_forward))
+                wanted_patches.push(WantedPatch::new(node.key, true, self.camera_pos, self.camera_forward))
             }
         }
 
@@ -438,7 +418,7 @@ impl Terrain {
         });
 
         self.patches_to_render = renderable_patches;
-        self.patch_queue.rebuild(frame_index, desired_patches);
+        self.patch_generator.update_wanted_patches(wanted_patches.as_slice());
 
         let is_neighbor_coarser = |node: &PatchKey, direction: IVec2| -> bool {
             let probe = node.terrain_center() + direction * node.terrain_size() as i32;
