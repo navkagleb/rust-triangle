@@ -49,7 +49,7 @@ impl Terrain {
 
             imgui_text!("Max render side patches: {}", render_count);
             imgui_text!("Max render squared patches: {}", render_count.pow(2));
-            imgui_text!("Render (leafs): {}", self.patches_to_render.len());
+            imgui_text!("Render (leafs): {}", self.renderable_patches.len());
             imgui_text!("Cached: {}", self.patch_cache.len());
             imgui_text!("Generated: {}", generated_count);
             imgui_text!("Uploading: {}", uploading_count);
@@ -118,7 +118,7 @@ impl Terrain {
 
             let draw_list = ImGui_GetWindowDrawList();
 
-            for patch in &self.patches_to_render {
+            for patch in &self.renderable_patches {
                 let minimap_leaf_pos = minimap_center + patch.terrain_origin().as_vec2() * minimap_scale;
                 let minimap_leaf_size = patch.terrain_size() as f32 * minimap_scale;
 
@@ -185,12 +185,12 @@ impl Terrain {
             );
 
             let start = self
-                .patches_to_render
+                .renderable_patches
                 .iter()
                 .map(|p| p.terrain_origin())
                 .fold(IVec2::MAX, |acc, p| acc.min(p));
             let end = self
-                .patches_to_render
+                .renderable_patches
                 .iter()
                 .map(|p| p.terrain_origin() + p.terrain_size() as i32)
                 .fold(IVec2::MIN, |acc, p| acc.max(p));

@@ -22,7 +22,7 @@ use config::*;
 use gpu_types::*;
 use patch::*;
 use patch_generator::*;
-use patch_quad_tree::*;
+use patch_quad_tree::PatchQuadTree;
 use texture_atlas::*;
 
 pub struct Terrain {
@@ -46,8 +46,8 @@ pub struct Terrain {
 
     patch_cache: HashMap<PatchKey, PatchState>,
     patch_generator: PatchGenerator,
+    renderable_patches: Vec<PatchKey>,
     atlas_free_slots: Vec<UVec2>,
-    patches_to_render: Vec<PatchKey>,
 
     patch_index_buffer: ID3D12Resource,
     #[allow(unused)]
@@ -288,6 +288,7 @@ impl Terrain {
 
             patch_cache: HashMap::new(),
             patch_generator: PatchGenerator::new(),
+            renderable_patches: Vec::new(),
             atlas_free_slots: {
                 let mut free_slots = Vec::with_capacity((ATLAS_PATCH_COUNT * ATLAS_PATCH_COUNT) as usize);
                 for y in (0..ATLAS_PATCH_COUNT).rev() {
@@ -298,7 +299,6 @@ impl Terrain {
 
                 free_slots
             },
-            patches_to_render: Vec::new(),
 
             patch_index_buffer,
             patch_buffer_item_count: max_patch_count,
@@ -336,7 +336,7 @@ impl Terrain {
     pub fn update_camera(&mut self, camera_pos: &Vec3, camera_forward: &Vec3, dt: f32) {
         if !self.freeze_camera {
             self.camera_pos = self.world_to_terrain_pos(*camera_pos);
-            self.camera_forward = camera_forward.xz();
+            self.camera_forward = camera_forward.xz().normalize_or_zero();
             self.camera_grid_index = self.camera_pos.as_ivec2() / PATCH_TERRAIN_SIZE as i32;
         }
 
@@ -345,131 +345,37 @@ impl Terrain {
         }
     }
 
-    pub fn traverse_qtree(&mut self, active_frame_index: u32) -> Result<()> {
-        for result in self.patch_generator.drain_generated() {
-            self.patch_cache.insert(
-                result.patch,
-                PatchState::CpuGenerated {
-                    heights: result.heights,
-                    gradients: result.gradients,
-                },
-            );
-        }
+    pub fn update_patches(&mut self, active_frame_index: u32) {
+        self.collect_generated_patches();
 
-        let qtree = PatchQuadTreeBuilder::new(self.camera_pos, self.render_distance, self.lod_factor).build();
+        let qtree = PatchQuadTree::build(self.camera_pos, self.render_distance, self.lod_factor);
+        let selection = qtree.select(
+            |patch: PatchKey| {
+                self.patch_cache
+                    .get(&patch)
+                    .is_some_and(|status| matches!(status, PatchState::Resident { .. }))
+            },
+            |patch: PatchKey| !self.patch_cache.contains_key(&patch),
+        );
 
-        let mut renderable_patches = Vec::new();
-        let mut wanted_patches = Vec::new();
-        let mut nodes_to_traverse = std::collections::VecDeque::from([&qtree.root]);
-
-        let is_resident = |key| {
-            self.patch_cache
-                .get(key)
-                .is_some_and(|status| matches!(status, PatchState::Resident { .. }))
-        };
-
-        let is_need_generation = |patch: &PatchKey| !self.patch_cache.contains_key(patch);
-
-        while let Some(node) = nodes_to_traverse.pop_front() {
-            let is_node_renderable = node.key.lod_index < PATCH_LOD_COUNT;
-
-            if let Some(children) = node.children.as_deref() {
-                let all_children_ready = children.iter().all(|child| is_resident(&child.key));
-
-                if !is_node_renderable || all_children_ready {
-                    nodes_to_traverse.extend(children.iter());
-                    continue;
-                }
-
-                // The parent is currently being used as fallback.
-                // Request every child that still needs generation.
-                for child in children {
-                    if is_need_generation(&child.key) {
-                        wanted_patches.push(WantedPatch::new(child.key, false, self.camera_pos, self.camera_forward));
-                    }
-                }
-            };
-
-            if !is_node_renderable {
-                continue;
-            }
-
-            if is_resident(&node.key) {
-                renderable_patches.push(node.key);
-            } else if is_need_generation(&node.key) {
-                wanted_patches.push(WantedPatch::new(node.key, true, self.camera_pos, self.camera_forward))
-            }
-        }
-
-        self.patch_cache.retain(|key, state| {
-            let grid_index = key.grid_index;
-            if grid_index.cmpge(qtree.min_grid_index).all() && grid_index.cmple(qtree.max_grid_index).all() {
-                return true;
-            }
-
-            match state {
-                PatchState::GpuUploadPending { atlas_slot, .. } | PatchState::Resident { atlas_slot } => {
-                    self.atlas_free_slots.push(*atlas_slot);
-                }
-                _ => {}
-            }
-
-            false
-        });
-
-        self.patches_to_render = renderable_patches;
-        self.patch_generator.update_wanted_patches(wanted_patches.as_slice());
-
-        let is_neighbor_coarser = |node: &PatchKey, direction: IVec2| -> bool {
-            let probe = node.terrain_center() + direction * node.terrain_size() as i32;
-
-            let neighbor_lod_index = self
-                .patches_to_render
-                .iter()
-                .find(|l| (l.terrain_center() - probe).length_squared() < node.terrain_size().pow(2) as i32)
-                .map(|l| l.lod_index)
-                .unwrap_or(node.lod_index);
-
-            neighbor_lod_index > node.lod_index
-        };
-
-        let gpu_patches: Vec<_> = self
-            .patches_to_render
-            .iter()
-            .map(|l| {
-                let directions = [
-                    (PatchStitchMask::TOP, IVec2::NEG_Y),
-                    (PatchStitchMask::BOTTOM, IVec2::Y),
-                    (PatchStitchMask::LEFT, IVec2::NEG_X),
-                    (PatchStitchMask::RIGHT, IVec2::X),
-                ];
-
-                let mut stitch_mask = PatchStitchMask::empty();
-
-                for &(flag, direction) in &directions {
-                    if is_neighbor_coarser(l, direction) {
-                        stitch_mask.insert(flag);
-                    }
-                }
-
-                GpuTerrainPatch {
-                    grid_index: l.grid_index,
-                    lod_index: l.lod_index,
-                    stitch_mask,
-                }
+        let wanted_patches: Vec<_> = selection
+            .missing
+            .into_iter()
+            .map(|missing| {
+                WantedPatch::new(
+                    missing.patch,
+                    missing.coverage_required,
+                    self.camera_pos,
+                    self.camera_forward,
+                )
             })
             .collect();
 
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                gpu_patches.as_ptr(),
-                self.patch_buffer_ptr
-                    .add((active_frame_index * self.patch_buffer_item_count) as usize),
-                gpu_patches.len(),
-            );
-        }
+        self.renderable_patches = selection.renderable;
+        self.patch_generator.update_wanted_patches(&wanted_patches);
 
-        Ok(())
+        self.evict_patches(&qtree);
+        self.write_gpu_patch_buffer(active_frame_index);
     }
 
     pub fn upload_atlas_data(
@@ -641,7 +547,7 @@ impl Terrain {
         };
 
         let render_terrain = |vertex_pso: &ID3D12PipelineState| {
-            if self.patches_to_render.is_empty() {
+            if self.renderable_patches.is_empty() {
                 return;
             }
 
@@ -654,7 +560,7 @@ impl Terrain {
                     Format: DXGI_FORMAT_R32_UINT,
                 }));
 
-                cmd_list.DrawIndexedInstanced(PATCH_INDEX_COUNT, self.patches_to_render.len() as u32, 0, 0, 0);
+                cmd_list.DrawIndexedInstanced(PATCH_INDEX_COUNT, self.renderable_patches.len() as u32, 0, 0, 0);
             }
         };
 
@@ -683,5 +589,82 @@ impl Terrain {
         let world_scale = self.terrain_to_world_scale.max(0.0001);
 
         Vec2::new(world_pos.x / world_scale, world_pos.z / world_scale)
+    }
+
+    fn collect_generated_patches(&mut self) {
+        for result in self.patch_generator.drain_generated() {
+            self.patch_cache.insert(
+                result.patch,
+                PatchState::CpuGenerated {
+                    heights: result.heights,
+                    gradients: result.gradients,
+                },
+            );
+        }
+    }
+
+    fn evict_patches(&mut self, qtree: &PatchQuadTree) {
+        self.patch_cache.retain(|patch, state| {
+            if qtree.contains_grid_index(patch.grid_index) {
+                return true;
+            }
+
+            if let PatchState::GpuUploadPending { atlas_slot, .. } | PatchState::Resident { atlas_slot } = state {
+                self.atlas_free_slots.push(*atlas_slot);
+            }
+
+            false
+        });
+    }
+
+    fn write_gpu_patch_buffer(&self, active_frame_index: u32) {
+        let is_neighbor_coarser = |node: &PatchKey, direction: IVec2| -> bool {
+            let probe = node.terrain_center() + direction * node.terrain_size() as i32;
+
+            let neighbor_lod_index = self
+                .renderable_patches
+                .iter()
+                .find(|p| (p.terrain_center() - probe).length_squared() < node.terrain_size().pow(2) as i32)
+                .map(|p| p.lod_index)
+                .unwrap_or(node.lod_index);
+
+            neighbor_lod_index > node.lod_index
+        };
+
+        let gpu_patches: Vec<_> = self
+            .renderable_patches
+            .iter()
+            .map(|patch| {
+                let directions = [
+                    (PatchStitchMask::TOP, IVec2::NEG_Y),
+                    (PatchStitchMask::BOTTOM, IVec2::Y),
+                    (PatchStitchMask::LEFT, IVec2::NEG_X),
+                    (PatchStitchMask::RIGHT, IVec2::X),
+                ];
+
+                let mut stitch_mask = PatchStitchMask::empty();
+
+                for &(flag, direction) in &directions {
+                    if is_neighbor_coarser(patch, direction) {
+                        stitch_mask.insert(flag);
+                    }
+                }
+
+                GpuTerrainPatch {
+                    grid_index: patch.grid_index,
+                    lod_index: patch.lod_index,
+                    stitch_mask,
+                }
+            })
+            .collect();
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                gpu_patches.as_ptr(),
+                self.patch_buffer_ptr
+                    .add((active_frame_index * self.patch_buffer_item_count) as usize),
+                gpu_patches.len(),
+            );
+        }
     }
 }
