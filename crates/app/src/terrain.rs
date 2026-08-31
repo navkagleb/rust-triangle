@@ -46,7 +46,6 @@ pub struct Terrain {
 
     patch_generator: PatchGenerator,
     patch_cache: PatchCache,
-    resident_patches: Vec<ResidentPatch>,
     patches_to_upload: Vec<PatchUpload>,
     patches_to_render: Vec<PatchKey>,
 
@@ -59,6 +58,8 @@ pub struct Terrain {
     indirection_texture: ID3D12Resource,
     indirection_texture_upload: ID3D12Resource,
     indirection_texture_ptr: *mut AtlasSlot,
+    indirection_texture_data: [Vec<AtlasSlot>; PATCH_LOD_COUNT as usize],
+    indirection_texture_size: u64,
 
     height_atlas: TextureAtlas<f32>,
     gradient_atlas: TextureAtlas<Vec2>,
@@ -289,7 +290,6 @@ impl Terrain {
 
             patch_generator: PatchGenerator::new(),
             patch_cache: PatchCache::new(),
-            resident_patches: Vec::new(),
             patches_to_upload: Vec::new(),
             patches_to_render: Vec::new(),
 
@@ -298,9 +298,14 @@ impl Terrain {
             patch_buffer_ptr: patch_buffer.map::<GpuTerrainPatch>()?,
             patch_buffer,
 
+            indirection_texture_size: indirection_texture.size()?,
             indirection_texture_ptr: indirection_texture_upload.map::<AtlasSlot>()?,
             indirection_texture_upload,
             indirection_texture,
+            indirection_texture_data: std::array::from_fn(|i| {
+                let slot_count = INDIRECTION_SLOT_COUNT >> i;
+                vec![AtlasSlot::new(ATLAS_PATCH_COUNT, ATLAS_PATCH_COUNT); slot_count.pow(2) as usize]
+            }),
 
             height_atlas: TextureAtlas::new(
                 device,
@@ -338,7 +343,7 @@ impl Terrain {
         }
     }
 
-    pub fn update_patches(&mut self, cpu_frame_index: u64, gpu_frame_index: u64, active_frame_index: u32) {
+    pub fn update(&mut self, cpu_frame_index: u64, gpu_frame_index: u64, active_frame_index: u32) {
         self.collect_generated_patches();
 
         let qtree = PatchQuadTree::build(self.camera_pos, self.render_distance, self.lod_factor);
@@ -366,112 +371,22 @@ impl Terrain {
         self.patch_cache.evict_outside(&qtree);
         self.patch_cache.completed_uploads(gpu_frame_index);
         self.patches_to_upload = self.patch_cache.prepare_uploads(cpu_frame_index);
-        self.resident_patches = self.patch_cache.collect_resident_patches();
+
+        let resident_patches = self.patch_cache.collect_resident_patches();
+        self.update_indirection_texture_data(&resident_patches);
 
         self.write_gpu_patch_buffer(active_frame_index);
     }
 
-    pub fn upload_indirection_data(
+    pub fn render(
         &self,
         device: &ID3D12Device,
         cmd_list: &ID3D12GraphicsCommandList,
+        camera: &Camera,
         active_frame_index: u32,
-    ) -> Result<()> {
-        let empty_slot = AtlasSlot::new(ATLAS_PATCH_COUNT, ATLAS_PATCH_COUNT);
+    ) {
+        self.upload_indirection_texture(device, cmd_list, active_frame_index);
 
-        let mut resident_patch_lods: [Vec<AtlasSlot>; PATCH_LOD_COUNT as usize] = std::array::from_fn(|i| {
-            let slot_count = INDIRECTION_SLOT_COUNT >> i;
-            vec![empty_slot; slot_count.pow(2) as usize]
-        });
-
-        for resident in &self.resident_patches {
-            let lod_index = resident.patch.lod_index;
-            let slot_count = INDIRECTION_SLOT_COUNT >> lod_index;
-
-            let relative_slot = (resident.patch.grid_index >> lod_index) - (self.camera_grid_index >> lod_index);
-            let indirection_slot = relative_slot + slot_count as i32 / 2;
-
-            let range = 0..slot_count as i32;
-            if !range.contains(&indirection_slot.x) || !range.contains(&indirection_slot.y) {
-                continue;
-            }
-
-            let flat_indirection_index = indirection_slot.y as u32 * slot_count + indirection_slot.x as u32;
-            resident_patch_lods[lod_index as usize][flat_indirection_index as usize] = resident.atlas_slot;
-        }
-
-        let desc = unsafe { self.indirection_texture.GetDesc() };
-        let mut layouts = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); PATCH_LOD_COUNT as usize];
-
-        unsafe {
-            device.GetCopyableFootprints(
-                &desc,
-                0,
-                PATCH_LOD_COUNT,
-                0,
-                Some(layouts.as_mut_ptr()),
-                None,
-                None,
-                None,
-            );
-        }
-
-        let upload_byte_offset = active_frame_index as u64 * self.indirection_texture.size()?;
-
-        for lod_index in 0..PATCH_LOD_COUNT {
-            let slot_count = INDIRECTION_SLOT_COUNT >> lod_index;
-
-            let gpu_layout = layouts[lod_index as usize];
-            let gpu_row_pitch = gpu_layout.Footprint.RowPitch;
-            let gpu_lod_offset = gpu_layout.Offset;
-
-            for row_index in 0..slot_count {
-                let cpu_offset = row_index * slot_count;
-                let gpu_offset = gpu_lod_offset + (row_index * gpu_row_pitch) as u64;
-
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        resident_patch_lods[lod_index as usize]
-                            .as_ptr()
-                            .add(cpu_offset as usize),
-                        self.indirection_texture_ptr
-                            .byte_add((upload_byte_offset + gpu_offset) as usize),
-                        slot_count as usize,
-                    );
-                }
-            }
-
-            unsafe {
-                cmd_list.CopyTextureRegion(
-                    &D3D12_TEXTURE_COPY_LOCATION {
-                        pResource: std::mem::transmute_copy(&self.indirection_texture),
-                        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                            SubresourceIndex: lod_index,
-                        },
-                    },
-                    0,
-                    0,
-                    0,
-                    &D3D12_TEXTURE_COPY_LOCATION {
-                        pResource: std::mem::transmute_copy(&self.indirection_texture_upload),
-                        Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                            PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
-                                Offset: upload_byte_offset + gpu_lod_offset,
-                                Footprint: layouts[lod_index as usize].Footprint,
-                            },
-                        },
-                    },
-                    None,
-                );
-            }
-        }
-
-        Ok(())
-    }
-
-    pub fn render(&self, cmd_list: &ID3D12GraphicsCommandList, camera: &Camera, active_frame_index: u32) {
         for upload in &self.patches_to_upload {
             self.height_atlas.copy_to(
                 cmd_list,
@@ -552,6 +467,26 @@ impl Terrain {
         }
     }
 
+    fn update_indirection_texture_data(&mut self, resident_patches: &[ResidentPatch]) {
+        for resident in resident_patches {
+            let lod_index = resident.patch.lod_index;
+            let slot_count = INDIRECTION_SLOT_COUNT >> lod_index;
+
+            let relative_slot = (resident.patch.grid_index >> lod_index) - (self.camera_grid_index >> lod_index);
+            let indirection_slot = relative_slot + slot_count as i32 / 2;
+
+            let flat_indirection_index = indirection_slot.y as u32 * slot_count + indirection_slot.x as u32;
+            let texel = &mut self.indirection_texture_data[lod_index as usize][flat_indirection_index as usize];
+
+            let range = 0..slot_count as i32;
+            if range.contains(&indirection_slot.x) && range.contains(&indirection_slot.y) {
+                *texel = resident.atlas_slot;
+            } else {
+                *texel = AtlasSlot::new(ATLAS_PATCH_COUNT, ATLAS_PATCH_COUNT);
+            }
+        }
+    }
+
     fn write_gpu_patch_buffer(&self, active_frame_index: u32) {
         let is_neighbor_coarser = |node: &PatchKey, direction: IVec2| -> bool {
             let probe = node.terrain_center() + direction * node.terrain_size() as i32;
@@ -600,6 +535,81 @@ impl Terrain {
                     .add((active_frame_index * self.patch_buffer_item_count) as usize),
                 gpu_patches.len(),
             );
+        }
+    }
+
+    fn upload_indirection_texture(
+        &self,
+        device: &ID3D12Device,
+        cmd_list: &ID3D12GraphicsCommandList,
+        active_frame_index: u32,
+    ) {
+        let desc = unsafe { self.indirection_texture.GetDesc() };
+        let mut layouts = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); PATCH_LOD_COUNT as usize];
+
+        unsafe {
+            device.GetCopyableFootprints(
+                &desc,
+                0,
+                PATCH_LOD_COUNT,
+                0,
+                Some(layouts.as_mut_ptr()),
+                None,
+                None,
+                None,
+            );
+        }
+
+        let upload_byte_offset = active_frame_index as u64 * self.indirection_texture_size;
+
+        for lod_index in 0..PATCH_LOD_COUNT {
+            let slot_count = INDIRECTION_SLOT_COUNT >> lod_index;
+
+            let gpu_layout = layouts[lod_index as usize];
+            let gpu_row_pitch = gpu_layout.Footprint.RowPitch;
+            let gpu_lod_offset = gpu_layout.Offset;
+
+            for row_index in 0..slot_count {
+                let cpu_offset = row_index * slot_count;
+                let gpu_offset = gpu_lod_offset + (row_index * gpu_row_pitch) as u64;
+
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        self.indirection_texture_data[lod_index as usize]
+                            .as_ptr()
+                            .add(cpu_offset as usize),
+                        self.indirection_texture_ptr
+                            .byte_add((upload_byte_offset + gpu_offset) as usize),
+                        slot_count as usize,
+                    );
+                }
+            }
+
+            unsafe {
+                cmd_list.CopyTextureRegion(
+                    &D3D12_TEXTURE_COPY_LOCATION {
+                        pResource: std::mem::transmute_copy(&self.indirection_texture),
+                        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                            SubresourceIndex: lod_index,
+                        },
+                    },
+                    0,
+                    0,
+                    0,
+                    &D3D12_TEXTURE_COPY_LOCATION {
+                        pResource: std::mem::transmute_copy(&self.indirection_texture_upload),
+                        Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                            PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                                Offset: upload_byte_offset + gpu_lod_offset,
+                                Footprint: layouts[lod_index as usize].Footprint,
+                            },
+                        },
+                    },
+                    None,
+                );
+            }
         }
     }
 }

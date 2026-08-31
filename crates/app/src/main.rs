@@ -493,16 +493,12 @@ fn main() -> Result<()> {
             cmd_list.SetGraphicsRootSignature(&root_signature);
 
             let t = Instant::now();
-            terrain.update_patches(cpu_frame_index, gpu_frame_index, active_frame_index);
-            let update_patches_ms = t.elapsed().as_secs_f32() * 1000.0;
+            terrain.update(cpu_frame_index, gpu_frame_index, active_frame_index);
+            let terrain_update_ms = t.elapsed().as_secs_f32() * 1000.0;
 
             let t = Instant::now();
-            terrain.upload_indirection_data(&device, &cmd_list, active_frame_index)?;
-            let upload_indirection_ms = t.elapsed().as_secs_f32() * 1000.0;
-
-            let t = Instant::now();
-            terrain.render(&cmd_list, &camera, active_frame_index);
-            let render_ms = t.elapsed().as_secs_f32() * 1000.0;
+            terrain.render(&device, &cmd_list, &camera, active_frame_index);
+            let terrain_render_ms = t.elapsed().as_secs_f32() * 1000.0;
 
             {
                 cimgui_implwin32_new_frame();
@@ -538,9 +534,8 @@ fn main() -> Result<()> {
 
                 ImGui_Begin(c"Profiler".as_ptr(), std::ptr::null_mut(), 0);
                 {
-                    imgui_text!("Update patches: {:.2} ms", update_patches_ms);
-                    imgui_text!("Upload indirection: {:.2} ms", upload_indirection_ms);
-                    imgui_text!("Render: {:.2} ms", render_ms);
+                    imgui_text!("Terrain::update: {:.2} ms", terrain_update_ms);
+                    imgui_text!("Terrain::render: {:.2} ms", terrain_render_ms);
 
                     ImGui_NewLine();
                 }
