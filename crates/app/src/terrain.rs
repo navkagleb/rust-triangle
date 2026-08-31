@@ -372,9 +372,7 @@ impl Terrain {
         self.patch_cache.completed_uploads(gpu_frame_index);
         self.patches_to_upload = self.patch_cache.prepare_uploads(cpu_frame_index);
 
-        let resident_patches = self.patch_cache.collect_resident_patches();
-        self.update_indirection_texture_data(&resident_patches);
-
+        self.write_indirection_texture_data(&self.patch_cache.collect_resident_patches());
         self.write_gpu_patch_buffer(active_frame_index);
     }
 
@@ -467,7 +465,7 @@ impl Terrain {
         }
     }
 
-    fn update_indirection_texture_data(&mut self, resident_patches: &[ResidentPatch]) {
+    fn write_indirection_texture_data(&mut self, resident_patches: &[ResidentPatch]) {
         for resident in resident_patches {
             let lod_index = resident.patch.lod_index;
             let slot_count = INDIRECTION_SLOT_COUNT >> lod_index;

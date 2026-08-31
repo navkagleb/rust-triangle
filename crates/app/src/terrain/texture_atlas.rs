@@ -7,7 +7,7 @@ use super::config::{ATLAS_PATCH_PIXEL_SIZE, ATLAS_SIZE};
 use crate::FRAME_COUNT;
 use crate::d3d12_utils::{D3D12BufferExt, D3D12TextureExt, InterfaceExt};
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct AtlasSlot(UVec2);
 
 impl AtlasSlot {
@@ -15,7 +15,7 @@ impl AtlasSlot {
         Self(UVec2::new(x, y))
     }
 
-    fn coords(&self) -> UVec2 {
+    pub fn coords(&self) -> UVec2 {
         self.0
     }
 }

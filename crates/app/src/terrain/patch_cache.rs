@@ -1,5 +1,8 @@
 use std::collections::HashMap;
 
+use imgui_sys::*;
+use windows::Win32::Graphics::Direct3D12::D3D12_GPU_DESCRIPTOR_HANDLE;
+
 use super::config::ATLAS_PATCH_COUNT;
 use super::patch::{PatchData, PatchKey};
 use super::patch_generator::GeneratedPatch;
@@ -105,6 +108,47 @@ impl PatchCache {
 
             false
         });
+    }
+
+    pub unsafe fn render_imgui(&self, height_atlas: D3D12_GPU_DESCRIPTOR_HANDLE) {
+        unsafe {
+            ImGui_Begin(c"TerrainAtlas".as_ptr(), std::ptr::null_mut(), 0);
+
+            let image_pos = ImGui_GetCursorScreenPos();
+            let image_size = {
+                let size = ImGui_GetContentRegionAvail();
+                size.x.min(size.y)
+            };
+
+            ImGui_Image(
+                ImTextureRef {
+                    _TexData: std::ptr::null_mut(),
+                    _TexID: height_atlas.ptr,
+                },
+                ImVec2 {
+                    x: image_size,
+                    y: image_size,
+                },
+            );
+
+            let draw_list = ImGui_GetWindowDrawList();
+            let slot_size = image_size / ATLAS_PATCH_COUNT as f32;
+
+            for slot in &self.available_atlas_slots {
+                ImDrawList_AddCircleFilled(
+                    draw_list,
+                    ImVec2 {
+                        x: image_pos.x + slot_size * slot.coords().x as f32 + slot_size * 0.5,
+                        y: image_pos.y + slot_size * slot.coords().y as f32 + slot_size * 0.5,
+                    },
+                    3.0,
+                    0xFFFFFFFF,
+                    5,
+                );
+            }
+
+            ImGui_End();
+        }
     }
 
     fn create_atlas_slots() -> Vec<AtlasSlot> {

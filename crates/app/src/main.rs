@@ -541,9 +541,7 @@ fn main() -> Result<()> {
                 }
                 ImGui_End();
 
-                terrain.render_imgui();
-                terrain.render_imgui_qtree(camera.position(), camera.forward());
-                terrain.render_imgui_atlas(&resource_heap);
+                terrain.render_imgui(&resource_heap, camera.position(), camera.forward());
 
                 // ImGui_ShowDemoWindow(std::ptr::null_mut());
                 ImGui_Render();

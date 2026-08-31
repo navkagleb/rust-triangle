@@ -10,7 +10,7 @@ use crate::{GpuResource, imgui_text};
 use imgui_sys::*;
 
 impl Terrain {
-    pub fn render_imgui(&mut self) {
+    pub unsafe fn render_imgui(&mut self, descriptor_heap: &DescriptorHeap, camera_pos: &Vec3, camera_forward: &Vec3) {
         unsafe {
             ImGui_Begin(c"Terrain".as_ptr(), null_mut(), 0);
 
@@ -42,10 +42,15 @@ impl Terrain {
             imgui_text!("Patches to render: {}", self.patches_to_render.len());
 
             ImGui_End();
+
+            self.patch_cache
+                .render_imgui(descriptor_heap.get_gpu_handle(GpuResource::TerrainHeightAtlas as u32));
+
+            self.render_imgui_qtree(camera_pos, camera_forward)
         }
     }
 
-    pub fn render_imgui_qtree(&mut self, camera_world_pos: &Vec3, camera_forward: &Vec3) {
+    fn render_imgui_qtree(&mut self, camera_pos: &Vec3, camera_forward: &Vec3) {
         unsafe {
             ImGui_Begin(c"TerrainQuadTree".as_ptr(), null_mut(), 0);
 
@@ -138,7 +143,7 @@ impl Terrain {
             }
 
             let camera_color = 0xFF0000FF_u32;
-            let minimap_camera_pos = minimap_center + self.world_to_terrain_pos(*camera_world_pos) * minimap_scale;
+            let minimap_camera_pos = minimap_center + self.world_to_terrain_pos(*camera_pos) * minimap_scale;
             let minimap_camera_forward_pos = minimap_camera_pos + camera_forward.xz().normalize() * 100.0;
 
             ImDrawList_AddCircleFilled(
@@ -211,30 +216,6 @@ impl Terrain {
 
                 ImDrawList_AddText(draw_list, ImVec2 { x, y }, 0xFFFFFFFF, text.as_ptr());
             }
-
-            ImGui_End();
-        }
-    }
-
-    pub fn render_imgui_atlas(&self, resource_heap: &DescriptorHeap) {
-        unsafe {
-            ImGui_Begin(c"TerrainAtlas".as_ptr(), null_mut(), 0);
-
-            let image_size = {
-                let size = ImGui_GetContentRegionAvail();
-                size.x.min(size.y)
-            };
-
-            ImGui_Image(
-                ImTextureRef {
-                    _TexData: std::ptr::null_mut(),
-                    _TexID: resource_heap.get_gpu_handle(GpuResource::TerrainHeightAtlas as u32).ptr,
-                },
-                ImVec2 {
-                    x: image_size,
-                    y: image_size,
-                },
-            );
 
             ImGui_End();
         }
