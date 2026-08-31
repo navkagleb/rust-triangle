@@ -36,8 +36,8 @@ impl PatchQuadTree {
 
     pub fn select<R, M>(&self, is_resident: R, is_missing: M) -> PatchSelection
     where
-        R: Fn(PatchKey) -> bool,
-        M: Fn(PatchKey) -> bool,
+        R: Fn(&PatchKey) -> bool,
+        M: Fn(&PatchKey) -> bool,
     {
         let mut selection = PatchSelection {
             renderable: Vec::new(),
@@ -109,13 +109,13 @@ impl PatchQuadTree {
         is_missing: &M,
         selection: &mut PatchSelection,
     ) where
-        R: Fn(PatchKey) -> bool,
-        M: Fn(PatchKey) -> bool,
+        R: Fn(&PatchKey) -> bool,
+        M: Fn(&PatchKey) -> bool,
     {
         let is_renderable = node.patch.lod_index < PATCH_LOD_COUNT;
 
         if let Some(children) = node.children.as_deref() {
-            let all_children_resident = children.iter().all(|c| is_resident(c.patch));
+            let all_children_resident = children.iter().all(|c| is_resident(&c.patch));
 
             if !is_renderable || all_children_resident {
                 for child in children {
@@ -127,7 +127,7 @@ impl PatchQuadTree {
 
             // The parent remains as fallback while finer patches load
             for child in children {
-                if is_missing(child.patch) {
+                if is_missing(&child.patch) {
                     selection.missing.push(MissingPatch {
                         patch: child.patch,
                         coverage_required: false,
@@ -140,9 +140,9 @@ impl PatchQuadTree {
             return;
         }
 
-        if is_resident(node.patch) {
+        if is_resident(&node.patch) {
             selection.renderable.push(node.patch);
-        } else if is_missing(node.patch) {
+        } else if is_missing(&node.patch) {
             selection.missing.push(MissingPatch {
                 patch: node.patch,
                 coverage_required: true,

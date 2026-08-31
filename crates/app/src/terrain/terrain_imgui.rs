@@ -2,8 +2,8 @@ use std::ptr::null_mut;
 
 use glam::{IVec2, Vec2, Vec3, Vec3Swizzles};
 
-use super::config::{ATLAS_PATCH_COUNT, PATCH_TERRAIN_SIZE};
-use super::patch::PatchState;
+use super::config::PATCH_TERRAIN_SIZE;
+use super::patch_cache::PatchCache;
 use crate::d3d12_utils::DescriptorHeap;
 use crate::terrain::Terrain;
 use crate::{GpuResource, imgui_text};
@@ -15,7 +15,7 @@ impl Terrain {
             ImGui_Begin(c"Terrain".as_ptr(), null_mut(), 0);
 
             if ImGui_Button(c"Clear cache".as_ptr()) {
-                self.patch_cache.clear();
+                self.patch_cache = PatchCache::new();
             }
 
             ImGui_NewLine();
@@ -35,30 +35,11 @@ impl Terrain {
             ImGui_NewLine();
 
             let render_count = (self.render_distance * 2) / PATCH_TERRAIN_SIZE;
-            let mut generated_count = 0;
-            let mut uploading_count = 0;
-            let mut resident_count = 0;
-
-            for state in self.patch_cache.values() {
-                match state {
-                    PatchState::CpuGenerated { .. } => generated_count += 1,
-                    PatchState::GpuUploadPending { .. } => uploading_count += 1,
-                    PatchState::Resident { .. } => resident_count += 1,
-                }
-            }
-
             imgui_text!("Max render side patches: {}", render_count);
             imgui_text!("Max render squared patches: {}", render_count.pow(2));
-            imgui_text!("Render (leafs): {}", self.renderable_patches.len());
-            imgui_text!("Cached: {}", self.patch_cache.len());
-            imgui_text!("Generated: {}", generated_count);
-            imgui_text!("Uploading: {}", uploading_count);
-            imgui_text!("Resident: {}", resident_count);
-            imgui_text!(
-                "Atlas slots: {}/{}",
-                self.atlas_free_slots.len(),
-                ATLAS_PATCH_COUNT * ATLAS_PATCH_COUNT
-            );
+
+            imgui_text!("Patches to upload: {}", self.patches_to_upload.len());
+            imgui_text!("Patches to render: {}", self.patches_to_render.len());
 
             ImGui_End();
         }
@@ -118,7 +99,7 @@ impl Terrain {
 
             let draw_list = ImGui_GetWindowDrawList();
 
-            for patch in &self.renderable_patches {
+            for patch in &self.patches_to_render {
                 let minimap_leaf_pos = minimap_center + patch.terrain_origin().as_vec2() * minimap_scale;
                 let minimap_leaf_size = patch.terrain_size() as f32 * minimap_scale;
 
@@ -185,12 +166,12 @@ impl Terrain {
             );
 
             let start = self
-                .renderable_patches
+                .patches_to_render
                 .iter()
                 .map(|p| p.terrain_origin())
                 .fold(IVec2::MAX, |acc, p| acc.min(p));
             let end = self
-                .renderable_patches
+                .patches_to_render
                 .iter()
                 .map(|p| p.terrain_origin() + p.terrain_size() as i32)
                 .fold(IVec2::MIN, |acc, p| acc.max(p));

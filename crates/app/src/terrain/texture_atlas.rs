@@ -1,4 +1,5 @@
 use anyhow::Result;
+use glam::UVec2;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
@@ -6,7 +7,20 @@ use super::config::{ATLAS_PATCH_PIXEL_SIZE, ATLAS_SIZE};
 use crate::FRAME_COUNT;
 use crate::d3d12_utils::{D3D12BufferExt, D3D12TextureExt, InterfaceExt};
 
-pub(super) struct TextureAtlas<T> {
+#[derive(Clone, Copy)]
+pub struct AtlasSlot(UVec2);
+
+impl AtlasSlot {
+    pub fn new(x: u32, y: u32) -> Self {
+        Self(UVec2::new(x, y))
+    }
+
+    fn coords(&self) -> UVec2 {
+        self.0
+    }
+}
+
+pub struct TextureAtlas<T> {
     texture: ID3D12Resource,
     upload: ID3D12Resource,
     mapped_ptr: *mut T,
@@ -16,7 +30,7 @@ pub(super) struct TextureAtlas<T> {
 }
 
 impl<T> TextureAtlas<T> {
-    pub(super) fn new(
+    pub fn new(
         device: &ID3D12Device,
         cpu_srv: D3D12_CPU_DESCRIPTOR_HANDLE,
         format: DXGI_FORMAT,
@@ -74,19 +88,13 @@ impl<T> TextureAtlas<T> {
         })
     }
 
-    pub(super) fn copy_to(
-        &self,
-        cmd_list: &ID3D12GraphicsCommandList,
-        active_frame_index: u32,
-        cell: glam::UVec2,
-        data: &[T],
-    ) {
+    pub fn copy_to(&self, cmd_list: &ID3D12GraphicsCommandList, active_frame_index: u32, slot: AtlasSlot, data: &[T]) {
         let row_pitch = self.gpu_layout.Footprint.RowPitch as usize;
         let texel_size = size_of::<T>();
 
         let frame_offset = active_frame_index as usize * self.gpu_size as usize;
-        let patch_offset = cell.y as usize * ATLAS_PATCH_PIXEL_SIZE * row_pitch
-            + cell.x as usize * ATLAS_PATCH_PIXEL_SIZE * texel_size;
+        let patch_offset = slot.coords().y as usize * ATLAS_PATCH_PIXEL_SIZE * row_pitch
+            + slot.coords().x as usize * ATLAS_PATCH_PIXEL_SIZE * texel_size;
         let dst_patch_base = frame_offset + patch_offset;
 
         for row in 0..ATLAS_PATCH_PIXEL_SIZE {
@@ -105,8 +113,8 @@ impl<T> TextureAtlas<T> {
                     Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
                     Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
                 },
-                cell.x * ATLAS_PATCH_PIXEL_SIZE as u32,
-                cell.y * ATLAS_PATCH_PIXEL_SIZE as u32,
+                slot.coords().x * ATLAS_PATCH_PIXEL_SIZE as u32,
+                slot.coords().y * ATLAS_PATCH_PIXEL_SIZE as u32,
                 0,
                 &D3D12_TEXTURE_COPY_LOCATION {
                     pResource: std::mem::transmute_copy(&self.upload),

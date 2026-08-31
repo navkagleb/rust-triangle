@@ -1,5 +1,5 @@
 use bitflags::bitflags;
-use glam::{IVec2, UVec2, Vec2};
+use glam::{IVec2, Vec2};
 
 use super::config::PATCH_TERRAIN_SIZE;
 
@@ -23,10 +23,10 @@ impl PatchKey {
     }
 }
 
-pub(super) enum PatchState {
-    CpuGenerated { heights: Vec<f32>, gradients: Vec<Vec2> },
-    GpuUploadPending { atlas_slot: UVec2, submitted_frame: u64 },
-    Resident { atlas_slot: UVec2 },
+#[derive(Default)]
+pub struct PatchData {
+    pub heights: Vec<f32>,
+    pub gradients: Vec<Vec2>,
 }
 
 bitflags! {

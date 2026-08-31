@@ -1,16 +1,15 @@
 mod config;
 mod gpu_types;
 mod patch;
+mod patch_cache;
 mod patch_generator;
 mod patch_quad_tree;
 mod patch_queue;
 mod terrain_imgui;
 mod texture_atlas;
 
-use std::collections::HashMap;
-
 use anyhow::Result;
-use glam::{IVec2, UVec2, Vec2, Vec3, Vec3Swizzles, f32};
+use glam::{IVec2, Vec2, Vec3, Vec3Swizzles, f32};
 use windows::Win32::Graphics::Direct3D::*;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -19,11 +18,12 @@ use crate::camera::Camera;
 use crate::d3d12_utils::*;
 use crate::{BACK_BUFFER_FORMAT, DEPTH_BUFFER_FORMAT, FRAME_COUNT, GpuResource};
 use config::*;
-use gpu_types::*;
-use patch::*;
-use patch_generator::*;
+use gpu_types::{GpuTerrainConsts, GpuTerrainPatch};
+use patch::{PatchKey, PatchStitchMask};
+use patch_cache::{PatchCache, PatchUpload, ResidentPatch};
+use patch_generator::{PatchGenerator, WantedPatch};
 use patch_quad_tree::PatchQuadTree;
-use texture_atlas::*;
+use texture_atlas::{AtlasSlot, TextureAtlas};
 
 pub struct Terrain {
     render_distance: u32,
@@ -44,10 +44,11 @@ pub struct Terrain {
     camera_forward: Vec2,
     camera_grid_index: IVec2,
 
-    patch_cache: HashMap<PatchKey, PatchState>,
     patch_generator: PatchGenerator,
-    renderable_patches: Vec<PatchKey>,
-    atlas_free_slots: Vec<UVec2>,
+    patch_cache: PatchCache,
+    resident_patches: Vec<ResidentPatch>,
+    patches_to_upload: Vec<PatchUpload>,
+    patches_to_render: Vec<PatchKey>,
 
     patch_index_buffer: ID3D12Resource,
     #[allow(unused)]
@@ -57,7 +58,7 @@ pub struct Terrain {
 
     indirection_texture: ID3D12Resource,
     indirection_texture_upload: ID3D12Resource,
-    indirection_texture_ptr: *mut UVec2,
+    indirection_texture_ptr: *mut AtlasSlot,
 
     height_atlas: TextureAtlas<f32>,
     gradient_atlas: TextureAtlas<Vec2>,
@@ -286,26 +287,18 @@ impl Terrain {
             camera_forward: Vec2::Y,
             camera_grid_index: IVec2::ZERO,
 
-            patch_cache: HashMap::new(),
             patch_generator: PatchGenerator::new(),
-            renderable_patches: Vec::new(),
-            atlas_free_slots: {
-                let mut free_slots = Vec::with_capacity((ATLAS_PATCH_COUNT * ATLAS_PATCH_COUNT) as usize);
-                for y in (0..ATLAS_PATCH_COUNT).rev() {
-                    for x in (0..ATLAS_PATCH_COUNT).rev() {
-                        free_slots.push(UVec2::new(x, y));
-                    }
-                }
-
-                free_slots
-            },
+            patch_cache: PatchCache::new(),
+            resident_patches: Vec::new(),
+            patches_to_upload: Vec::new(),
+            patches_to_render: Vec::new(),
 
             patch_index_buffer,
             patch_buffer_item_count: max_patch_count,
             patch_buffer_ptr: patch_buffer.map::<GpuTerrainPatch>()?,
             patch_buffer,
 
-            indirection_texture_ptr: indirection_texture_upload.map::<UVec2>()?,
+            indirection_texture_ptr: indirection_texture_upload.map::<AtlasSlot>()?,
             indirection_texture_upload,
             indirection_texture,
 
@@ -345,17 +338,13 @@ impl Terrain {
         }
     }
 
-    pub fn update_patches(&mut self, active_frame_index: u32) {
+    pub fn update_patches(&mut self, cpu_frame_index: u64, gpu_frame_index: u64, active_frame_index: u32) {
         self.collect_generated_patches();
 
         let qtree = PatchQuadTree::build(self.camera_pos, self.render_distance, self.lod_factor);
         let selection = qtree.select(
-            |patch: PatchKey| {
-                self.patch_cache
-                    .get(&patch)
-                    .is_some_and(|status| matches!(status, PatchState::Resident { .. }))
-            },
-            |patch: PatchKey| !self.patch_cache.contains_key(&patch),
+            |patch| self.patch_cache.is_resident(patch),
+            |patch| !self.patch_cache.contains(patch),
         );
 
         let wanted_patches: Vec<_> = selection
@@ -371,61 +360,15 @@ impl Terrain {
             })
             .collect();
 
-        self.renderable_patches = selection.renderable;
+        self.patches_to_render = selection.renderable;
         self.patch_generator.update_wanted_patches(&wanted_patches);
 
-        self.evict_patches(&qtree);
+        self.patch_cache.evict_outside(&qtree);
+        self.patch_cache.completed_uploads(gpu_frame_index);
+        self.patches_to_upload = self.patch_cache.prepare_uploads(cpu_frame_index);
+        self.resident_patches = self.patch_cache.collect_resident_patches();
+
         self.write_gpu_patch_buffer(active_frame_index);
-    }
-
-    pub fn upload_atlas_data(
-        &mut self,
-        cmd_list: &ID3D12GraphicsCommandList,
-        cpu_frame_index: u64,
-        gpu_frame_index: u64,
-        active_frame_index: u32,
-    ) {
-        let mut patches_to_update = Vec::new();
-
-        for (&key, state) in &self.patch_cache {
-            if let PatchState::GpuUploadPending {
-                atlas_slot,
-                submitted_frame,
-            } = state
-                && *submitted_frame <= gpu_frame_index
-            {
-                patches_to_update.push((
-                    key,
-                    PatchState::Resident {
-                        atlas_slot: *atlas_slot,
-                    },
-                ));
-                continue;
-            }
-
-            let PatchState::CpuGenerated { heights, gradients } = state else {
-                continue;
-            };
-
-            let atlas_slot = self.atlas_free_slots.pop().unwrap();
-
-            self.height_atlas
-                .copy_to(cmd_list, active_frame_index, atlas_slot, heights.as_slice());
-            self.gradient_atlas
-                .copy_to(cmd_list, active_frame_index, atlas_slot, gradients.as_slice());
-
-            patches_to_update.push((
-                key,
-                PatchState::GpuUploadPending {
-                    atlas_slot,
-                    submitted_frame: cpu_frame_index,
-                },
-            ));
-        }
-
-        for (key, state) in patches_to_update {
-            self.patch_cache.insert(key, state);
-        }
     }
 
     pub fn upload_indirection_data(
@@ -434,22 +377,18 @@ impl Terrain {
         cmd_list: &ID3D12GraphicsCommandList,
         active_frame_index: u32,
     ) -> Result<()> {
-        let empty_patch = UVec2::splat(ATLAS_PATCH_COUNT);
+        let empty_slot = AtlasSlot::new(ATLAS_PATCH_COUNT, ATLAS_PATCH_COUNT);
 
-        let mut resident_patch_lods: [Vec<UVec2>; PATCH_LOD_COUNT as usize] = std::array::from_fn(|i| {
+        let mut resident_patch_lods: [Vec<AtlasSlot>; PATCH_LOD_COUNT as usize] = std::array::from_fn(|i| {
             let slot_count = INDIRECTION_SLOT_COUNT >> i;
-            vec![empty_patch; slot_count.pow(2) as usize]
+            vec![empty_slot; slot_count.pow(2) as usize]
         });
 
-        for (key, state) in &self.patch_cache {
-            let PatchState::Resident { atlas_slot } = state else {
-                continue;
-            };
-
-            let lod_index = key.lod_index;
+        for resident in &self.resident_patches {
+            let lod_index = resident.patch.lod_index;
             let slot_count = INDIRECTION_SLOT_COUNT >> lod_index;
 
-            let relative_slot = (key.grid_index >> lod_index) - (self.camera_grid_index >> lod_index);
+            let relative_slot = (resident.patch.grid_index >> lod_index) - (self.camera_grid_index >> lod_index);
             let indirection_slot = relative_slot + slot_count as i32 / 2;
 
             let range = 0..slot_count as i32;
@@ -458,7 +397,7 @@ impl Terrain {
             }
 
             let flat_indirection_index = indirection_slot.y as u32 * slot_count + indirection_slot.x as u32;
-            resident_patch_lods[lod_index as usize][flat_indirection_index as usize] = *atlas_slot;
+            resident_patch_lods[lod_index as usize][flat_indirection_index as usize] = resident.atlas_slot;
         }
 
         let desc = unsafe { self.indirection_texture.GetDesc() };
@@ -533,6 +472,22 @@ impl Terrain {
     }
 
     pub fn render(&self, cmd_list: &ID3D12GraphicsCommandList, camera: &Camera, active_frame_index: u32) {
+        for upload in &self.patches_to_upload {
+            self.height_atlas.copy_to(
+                cmd_list,
+                active_frame_index,
+                upload.atlas_slot,
+                upload.data.heights.as_slice(),
+            );
+
+            self.gradient_atlas.copy_to(
+                cmd_list,
+                active_frame_index,
+                upload.atlas_slot,
+                upload.data.gradients.as_slice(),
+            );
+        }
+
         let mut consts = GpuTerrainConsts {
             world_to_clip: camera.world_to_clip(),
             camera_grid_index: self.camera_grid_index,
@@ -547,7 +502,7 @@ impl Terrain {
         };
 
         let render_terrain = |vertex_pso: &ID3D12PipelineState| {
-            if self.renderable_patches.is_empty() {
+            if self.patches_to_render.is_empty() {
                 return;
             }
 
@@ -560,7 +515,7 @@ impl Terrain {
                     Format: DXGI_FORMAT_R32_UINT,
                 }));
 
-                cmd_list.DrawIndexedInstanced(PATCH_INDEX_COUNT, self.renderable_patches.len() as u32, 0, 0, 0);
+                cmd_list.DrawIndexedInstanced(PATCH_INDEX_COUNT, self.patches_to_render.len() as u32, 0, 0, 0);
             }
         };
 
@@ -592,29 +547,9 @@ impl Terrain {
     }
 
     fn collect_generated_patches(&mut self) {
-        for result in self.patch_generator.drain_generated() {
-            self.patch_cache.insert(
-                result.patch,
-                PatchState::CpuGenerated {
-                    heights: result.heights,
-                    gradients: result.gradients,
-                },
-            );
+        for generated in self.patch_generator.drain_generated() {
+            self.patch_cache.insert_generated(generated);
         }
-    }
-
-    fn evict_patches(&mut self, qtree: &PatchQuadTree) {
-        self.patch_cache.retain(|patch, state| {
-            if qtree.contains_grid_index(patch.grid_index) {
-                return true;
-            }
-
-            if let PatchState::GpuUploadPending { atlas_slot, .. } | PatchState::Resident { atlas_slot } = state {
-                self.atlas_free_slots.push(*atlas_slot);
-            }
-
-            false
-        });
     }
 
     fn write_gpu_patch_buffer(&self, active_frame_index: u32) {
@@ -622,7 +557,7 @@ impl Terrain {
             let probe = node.terrain_center() + direction * node.terrain_size() as i32;
 
             let neighbor_lod_index = self
-                .renderable_patches
+                .patches_to_render
                 .iter()
                 .find(|p| (p.terrain_center() - probe).length_squared() < node.terrain_size().pow(2) as i32)
                 .map(|p| p.lod_index)
@@ -632,7 +567,7 @@ impl Terrain {
         };
 
         let gpu_patches: Vec<_> = self
-            .renderable_patches
+            .patches_to_render
             .iter()
             .map(|patch| {
                 let directions = [

@@ -6,7 +6,7 @@ use noise::utils::{NoiseMapBuilder, PlaneMapBuilder};
 use noise::{Fbm, MultiFractal, Perlin};
 
 use super::config::*;
-use super::patch::PatchKey;
+use super::patch::{PatchData, PatchKey};
 use super::patch_queue::PatchQueue;
 
 #[derive(Copy, Clone)]
@@ -71,8 +71,7 @@ impl WantedPatch {
 
 pub struct GeneratedPatch {
     pub patch: PatchKey,
-    pub heights: Vec<f32>,
-    pub gradients: Vec<Vec2>,
+    pub data: PatchData,
 }
 
 pub struct PatchGenerator {
@@ -142,8 +141,7 @@ impl PatchGenerator {
 
         GeneratedPatch {
             patch,
-            heights,
-            gradients,
+            data: PatchData { heights, gradients },
         }
     }
 
