@@ -497,7 +497,7 @@ fn main() -> Result<()> {
             let terrain_update_ms = t.elapsed().as_secs_f32() * 1000.0;
 
             let t = Instant::now();
-            terrain.render(&device, &cmd_list, &camera, active_frame_index);
+            terrain.render(&cmd_list, &camera, active_frame_index);
             let terrain_render_ms = t.elapsed().as_secs_f32() * 1000.0;
 
             {

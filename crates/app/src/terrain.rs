@@ -3,6 +3,7 @@ mod gpu_types;
 mod patch;
 mod patch_cache;
 mod patch_generator;
+mod patch_indirection_texture;
 mod patch_quad_tree;
 mod patch_queue;
 mod terrain_imgui;
@@ -20,10 +21,11 @@ use crate::{BACK_BUFFER_FORMAT, DEPTH_BUFFER_FORMAT, FRAME_COUNT, GpuResource};
 use config::*;
 use gpu_types::{GpuTerrainConsts, GpuTerrainPatch};
 use patch::{PatchKey, PatchStitchMask};
-use patch_cache::{PatchCache, PatchUpload, ResidentPatch};
+use patch_cache::{PatchCache, PatchUpload};
 use patch_generator::{PatchGenerator, WantedPatch};
+use patch_indirection_texture::PatchIndirectionTexture;
 use patch_quad_tree::PatchQuadTree;
-use texture_atlas::{AtlasSlot, TextureAtlas};
+use texture_atlas::TextureAtlas;
 
 pub struct Terrain {
     render_distance: u32,
@@ -55,11 +57,7 @@ pub struct Terrain {
     patch_buffer_item_count: u32,
     patch_buffer_ptr: *mut GpuTerrainPatch,
 
-    indirection_texture: ID3D12Resource,
-    indirection_texture_upload: ID3D12Resource,
-    indirection_texture_ptr: *mut AtlasSlot,
-    indirection_texture_data: [Vec<AtlasSlot>; PATCH_LOD_COUNT as usize],
-    indirection_texture_size: u64,
+    indirection_texture: PatchIndirectionTexture,
 
     height_atlas: TextureAtlas<f32>,
     gradient_atlas: TextureAtlas<Vec2>,
@@ -172,43 +170,6 @@ impl Terrain {
             );
         }
 
-        let indirection_format = DXGI_FORMAT_R32G32_UINT;
-        let indirection_texture = ID3D12Resource::new_texture_2d(
-            device,
-            indirection_format,
-            INDIRECTION_SLOT_COUNT,
-            INDIRECTION_SLOT_COUNT,
-            PATCH_LOD_COUNT,
-        )?;
-        let indirection_texture_upload = ID3D12Resource::new_buffer(
-            device,
-            D3D12_HEAP_TYPE_UPLOAD,
-            indirection_texture.size()? * FRAME_COUNT as u64,
-        )?;
-
-        indirection_texture.set_debug_name("TerrainIndirection")?;
-        indirection_texture_upload.set_debug_name("TerrainIndirectionUpload")?;
-
-        unsafe {
-            device.CreateShaderResourceView(
-                &indirection_texture,
-                Some(&D3D12_SHADER_RESOURCE_VIEW_DESC {
-                    Format: indirection_format,
-                    ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
-                    Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
-                    Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
-                        Texture2D: D3D12_TEX2D_SRV {
-                            MostDetailedMip: 0,
-                            MipLevels: PATCH_LOD_COUNT,
-                            PlaneSlice: 0,
-                            ResourceMinLODClamp: 0.0,
-                        },
-                    },
-                }),
-                resource_heap.get_cpu_handle(GpuResource::TerrainIndirectionTexture as u32),
-            );
-        }
-
         let vs_blob = std::fs::read(std::path::Path::new("target/dxil/terrain.vs.dxil"))?;
         let ps_blob = std::fs::read(std::path::Path::new("target/dxil/terrain.ps.dxil"))?;
 
@@ -298,14 +259,10 @@ impl Terrain {
             patch_buffer_ptr: patch_buffer.map::<GpuTerrainPatch>()?,
             patch_buffer,
 
-            indirection_texture_size: indirection_texture.size()?,
-            indirection_texture_ptr: indirection_texture_upload.map::<AtlasSlot>()?,
-            indirection_texture_upload,
-            indirection_texture,
-            indirection_texture_data: std::array::from_fn(|i| {
-                let slot_count = INDIRECTION_SLOT_COUNT >> i;
-                vec![AtlasSlot::new(ATLAS_PATCH_COUNT, ATLAS_PATCH_COUNT); slot_count.pow(2) as usize]
-            }),
+            indirection_texture: PatchIndirectionTexture::new(
+                device,
+                resource_heap.get_cpu_handle(GpuResource::TerrainIndirectionTexture as u32),
+            )?,
 
             height_atlas: TextureAtlas::new(
                 device,
@@ -369,18 +326,13 @@ impl Terrain {
         self.patches_to_upload = cache_frame.uploads;
         self.patches_to_render = selection.renderable;
 
-        self.write_indirection_texture_data(&cache_frame.resident);
+        self.indirection_texture
+            .rebuild(self.camera_grid_index, &cache_frame.resident);
         self.write_gpu_patch_buffer(active_frame_index);
     }
 
-    pub fn render(
-        &self,
-        device: &ID3D12Device,
-        cmd_list: &ID3D12GraphicsCommandList,
-        camera: &Camera,
-        active_frame_index: u32,
-    ) {
-        self.upload_indirection_texture(device, cmd_list, active_frame_index);
+    pub fn render(&self, cmd_list: &ID3D12GraphicsCommandList, camera: &Camera, active_frame_index: u32) {
+        self.indirection_texture.upload(cmd_list, active_frame_index);
 
         for upload in &self.patches_to_upload {
             self.height_atlas.copy_to(
@@ -462,26 +414,6 @@ impl Terrain {
         }
     }
 
-    fn write_indirection_texture_data(&mut self, resident_patches: &[ResidentPatch]) {
-        for resident in resident_patches {
-            let lod_index = resident.patch.lod_index;
-            let slot_count = INDIRECTION_SLOT_COUNT >> lod_index;
-
-            let relative_slot = (resident.patch.grid_index >> lod_index) - (self.camera_grid_index >> lod_index);
-            let indirection_slot = relative_slot + slot_count as i32 / 2;
-
-            let flat_indirection_index = indirection_slot.y as u32 * slot_count + indirection_slot.x as u32;
-            let texel = &mut self.indirection_texture_data[lod_index as usize][flat_indirection_index as usize];
-
-            let range = 0..slot_count as i32;
-            if range.contains(&indirection_slot.x) && range.contains(&indirection_slot.y) {
-                *texel = resident.atlas_slot;
-            } else {
-                *texel = AtlasSlot::new(ATLAS_PATCH_COUNT, ATLAS_PATCH_COUNT);
-            }
-        }
-    }
-
     fn write_gpu_patch_buffer(&self, active_frame_index: u32) {
         let is_neighbor_coarser = |node: &PatchKey, direction: IVec2| -> bool {
             let probe = node.terrain_center() + direction * node.terrain_size() as i32;
@@ -530,81 +462,6 @@ impl Terrain {
                     .add((active_frame_index * self.patch_buffer_item_count) as usize),
                 gpu_patches.len(),
             );
-        }
-    }
-
-    fn upload_indirection_texture(
-        &self,
-        device: &ID3D12Device,
-        cmd_list: &ID3D12GraphicsCommandList,
-        active_frame_index: u32,
-    ) {
-        let desc = unsafe { self.indirection_texture.GetDesc() };
-        let mut layouts = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); PATCH_LOD_COUNT as usize];
-
-        unsafe {
-            device.GetCopyableFootprints(
-                &desc,
-                0,
-                PATCH_LOD_COUNT,
-                0,
-                Some(layouts.as_mut_ptr()),
-                None,
-                None,
-                None,
-            );
-        }
-
-        let upload_byte_offset = active_frame_index as u64 * self.indirection_texture_size;
-
-        for lod_index in 0..PATCH_LOD_COUNT {
-            let slot_count = INDIRECTION_SLOT_COUNT >> lod_index;
-
-            let gpu_layout = layouts[lod_index as usize];
-            let gpu_row_pitch = gpu_layout.Footprint.RowPitch;
-            let gpu_lod_offset = gpu_layout.Offset;
-
-            for row_index in 0..slot_count {
-                let cpu_offset = row_index * slot_count;
-                let gpu_offset = gpu_lod_offset + (row_index * gpu_row_pitch) as u64;
-
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        self.indirection_texture_data[lod_index as usize]
-                            .as_ptr()
-                            .add(cpu_offset as usize),
-                        self.indirection_texture_ptr
-                            .byte_add((upload_byte_offset + gpu_offset) as usize),
-                        slot_count as usize,
-                    );
-                }
-            }
-
-            unsafe {
-                cmd_list.CopyTextureRegion(
-                    &D3D12_TEXTURE_COPY_LOCATION {
-                        pResource: std::mem::transmute_copy(&self.indirection_texture),
-                        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                            SubresourceIndex: lod_index,
-                        },
-                    },
-                    0,
-                    0,
-                    0,
-                    &D3D12_TEXTURE_COPY_LOCATION {
-                        pResource: std::mem::transmute_copy(&self.indirection_texture_upload),
-                        Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                            PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
-                                Offset: upload_byte_offset + gpu_lod_offset,
-                                Footprint: layouts[lod_index as usize].Footprint,
-                            },
-                        },
-                    },
-                    None,
-                );
-            }
         }
     }
 }

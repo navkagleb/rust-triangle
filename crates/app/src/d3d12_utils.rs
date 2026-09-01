@@ -180,8 +180,6 @@ pub trait D3D12TextureExt {
         height: u32,
         mip_count: u32,
     ) -> Result<ID3D12Resource>;
-
-    fn size(&self) -> Result<u64>;
 }
 
 impl D3D12TextureExt for ID3D12Resource {
@@ -218,29 +216,6 @@ impl D3D12TextureExt for ID3D12Resource {
         }
 
         texture.ok_or(Error::from_thread().into())
-    }
-
-    fn size(&self) -> Result<u64> {
-        let desc = unsafe { self.GetDesc() };
-        let mut size = 0;
-
-        unsafe {
-            let mut device: Option<ID3D12Device> = None;
-            self.GetDevice(&mut device)?;
-
-            device.unwrap().GetCopyableFootprints(
-                &desc,
-                0,
-                (desc.MipLevels * desc.DepthOrArraySize) as u32,
-                0,
-                None,
-                None,
-                None,
-                Some(&mut size),
-            );
-        }
-
-        Ok(size)
     }
 }
 
@@ -376,4 +351,9 @@ impl<T, const TYPE: i32> PsoSubobject<T, TYPE> {
             value,
         }
     }
+}
+
+pub fn align_up(value: u64, alignment: u64) -> u64 {
+    debug_assert!(alignment.is_power_of_two());
+    (value + alignment - 1) & !(alignment - 1)
 }

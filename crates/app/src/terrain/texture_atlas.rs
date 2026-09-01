@@ -3,16 +3,21 @@ use glam::UVec2;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
-use super::config::{ATLAS_PATCH_PIXEL_SIZE, ATLAS_SIZE};
+use super::config::{ATLAS_PATCH_COUNT, ATLAS_PATCH_PIXEL_SIZE, ATLAS_SIZE};
 use crate::FRAME_COUNT;
 use crate::d3d12_utils::{D3D12BufferExt, D3D12TextureExt, InterfaceExt};
 
+#[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct AtlasSlot(UVec2);
 
 impl AtlasSlot {
     pub fn new(x: u32, y: u32) -> Self {
         Self(UVec2::new(x, y))
+    }
+
+    pub fn invalid() -> Self {
+        Self::new(ATLAS_PATCH_COUNT, ATLAS_PATCH_COUNT)
     }
 
     pub fn coords(&self) -> UVec2 {
