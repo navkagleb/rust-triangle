@@ -344,7 +344,7 @@ impl Terrain {
     }
 
     pub fn update(&mut self, cpu_frame_index: u64, gpu_frame_index: u64, active_frame_index: u32) {
-        self.collect_generated_patches();
+        self.collect_generated_patches(cpu_frame_index);
 
         let qtree = PatchQuadTree::build(self.camera_pos, self.render_distance, self.lod_factor);
         let selection = qtree.select(&self.patch_cache);
@@ -362,12 +362,15 @@ impl Terrain {
             })
             .collect();
 
-        self.patches_to_render = selection.renderable;
         self.patch_generator.update_wanted_patches(&wanted_patches);
-
         self.patch_cache.evict_outside(&qtree);
+        self.patch_cache.mark_needed(
+            cpu_frame_index,
+            selection.renderable.iter().chain(selection.retained.iter()),
+        );
         self.patch_cache.completed_uploads(gpu_frame_index);
         self.patches_to_upload = self.patch_cache.prepare_uploads(cpu_frame_index);
+        self.patches_to_render = selection.renderable;
 
         self.write_indirection_texture_data(&self.patch_cache.collect_resident_patches());
         self.write_gpu_patch_buffer(active_frame_index);
@@ -456,9 +459,9 @@ impl Terrain {
         Vec2::new(world_pos.x / world_scale, world_pos.z / world_scale)
     }
 
-    fn collect_generated_patches(&mut self) {
+    fn collect_generated_patches(&mut self, cpu_frame_index: u64) {
         for generated in self.patch_generator.drain_generated() {
-            self.patch_cache.insert_generated(generated);
+            self.patch_cache.insert_generated(generated, cpu_frame_index);
         }
     }
 

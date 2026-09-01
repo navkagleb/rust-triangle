@@ -18,7 +18,7 @@ pub struct PatchSelection {
 }
 
 impl PatchSelection {
-    fn request(&mut self, patch: PatchKey, coverage_required: bool) {
+    fn push_missing(&mut self, patch: PatchKey, coverage_required: bool) {
         self.missing.push(MissingPatch {
             patch,
             coverage_required,
@@ -132,7 +132,7 @@ impl PatchQuadTree {
             for child in children {
                 match cache.availability(&child.patch) {
                     PatchAvailability::Missing => {
-                        selection.request(child.patch, false);
+                        selection.push_missing(child.patch, false);
                     }
                     PatchAvailability::Pending | PatchAvailability::Resident => {
                         selection.retained.insert(child.patch);
@@ -147,7 +147,7 @@ impl PatchQuadTree {
 
         match cache.availability(&node.patch) {
             PatchAvailability::Missing => {
-                selection.request(node.patch, true);
+                selection.push_missing(node.patch, true);
             }
             PatchAvailability::Pending => {
                 selection.retained.insert(node.patch);

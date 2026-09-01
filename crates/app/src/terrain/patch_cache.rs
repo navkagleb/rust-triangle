@@ -27,7 +27,7 @@ pub enum PatchAvailability {
 }
 
 pub struct PatchCache {
-    entries: HashMap<PatchKey, PatchState>,
+    entries: HashMap<PatchKey, CacheEntry>,
     available_atlas_slots: Vec<AtlasSlot>,
 }
 
@@ -40,32 +40,56 @@ impl PatchCache {
     }
 
     pub fn availability(&self, patch: &PatchKey) -> PatchAvailability {
-        match self.entries.get(patch) {
+        match self.entries.get(patch).map(|entry| &entry.state) {
             None => PatchAvailability::Missing,
             Some(PatchState::Generated(_) | PatchState::PendingUpload(_)) => PatchAvailability::Pending,
             Some(PatchState::Resident(_)) => PatchAvailability::Resident,
         }
     }
 
-    pub fn insert_generated(&mut self, generated: GeneratedPatch) {
-        self.entries
-            .insert(generated.patch, PatchState::Generated(generated.data));
+    pub fn mark_needed<'a, I>(&mut self, frame_index: u64, needed_patches: I)
+    where
+        I: IntoIterator<Item = &'a PatchKey>,
+    {
+        for patch in needed_patches {
+            if let Some(entry) = self.entries.get_mut(patch) {
+                entry.last_needed_frame = frame_index;
+            }
+        }
     }
 
-    pub fn prepare_uploads(&mut self, submitted_frame: u64) -> Vec<PatchUpload> {
+    pub fn insert_generated(&mut self, generated: GeneratedPatch, frame_index: u64) {
+        self.entries.insert(
+            generated.patch,
+            CacheEntry {
+                state: PatchState::Generated(generated.data),
+                last_needed_frame: frame_index,
+            },
+        );
+    }
+
+    pub fn prepare_uploads(&mut self, current_frame: u64) -> Vec<PatchUpload> {
+        let generated_count = self
+            .entries
+            .values()
+            .filter(|entry| matches!(entry.state, PatchState::Generated(_)))
+            .count();
+
+        self.evict(generated_count, current_frame);
+
         let mut uploads = Vec::new();
 
-        for state in &mut self.entries.values_mut() {
-            let PatchState::Generated(data) = state else {
+        for entry in &mut self.entries.values_mut() {
+            let PatchState::Generated(data) = &mut entry.state else {
                 continue;
             };
 
             let atlas_slot = self.available_atlas_slots.pop().unwrap();
             let data = std::mem::take(data);
 
-            *state = PatchState::PendingUpload(PatchUploadInfo {
+            entry.state = PatchState::PendingUpload(PatchUploadInfo {
                 atlas_slot,
-                submitted_frame,
+                submitted_frame: current_frame,
             });
 
             uploads.push(PatchUpload { atlas_slot, data });
@@ -75,13 +99,13 @@ impl PatchCache {
     }
 
     pub fn completed_uploads(&mut self, completed_frame: u64) {
-        for state in self.entries.values_mut() {
-            let PatchState::PendingUpload(upload_info) = state else {
+        for entry in self.entries.values_mut() {
+            let PatchState::PendingUpload(upload_info) = &entry.state else {
                 continue;
             };
 
             if upload_info.submitted_frame <= completed_frame {
-                *state = PatchState::Resident(upload_info.atlas_slot)
+                entry.state = PatchState::Resident(upload_info.atlas_slot)
             }
         }
     }
@@ -89,8 +113,8 @@ impl PatchCache {
     pub fn collect_resident_patches(&self) -> Vec<ResidentPatch> {
         self.entries
             .iter()
-            .filter_map(|(&patch, state)| {
-                if let PatchState::Resident(atlas_slot) = *state {
+            .filter_map(|(&patch, entry)| {
+                if let PatchState::Resident(atlas_slot) = entry.state {
                     return Some(ResidentPatch { patch, atlas_slot });
                 }
 
@@ -100,12 +124,12 @@ impl PatchCache {
     }
 
     pub fn evict_outside(&mut self, qtree: &PatchQuadTree) {
-        self.entries.retain(|patch, state| {
+        self.entries.retain(|patch, entry| {
             if qtree.contains_grid_index(patch.grid_index) {
                 return true;
             }
 
-            match state {
+            match &entry.state {
                 PatchState::Generated(_) => {}
                 PatchState::PendingUpload(upload_info) => self.available_atlas_slots.push(upload_info.atlas_slot),
                 PatchState::Resident(atlas_slot) => self.available_atlas_slots.push(*atlas_slot),
@@ -156,6 +180,46 @@ impl PatchCache {
         }
     }
 
+    fn evict(&mut self, required_slots: usize, current_frame: u64) {
+        let slots_to_free = required_slots.saturating_sub(self.available_atlas_slots.len());
+
+        if slots_to_free == 0 {
+            return;
+        }
+
+        let mut candidates: Vec<_> = self
+            .entries
+            .iter()
+            .filter_map(|(&patch, entry)| {
+                let PatchState::Resident(atlas_slot) = entry.state else {
+                    return None;
+                };
+
+                if entry.last_needed_frame == current_frame {
+                    return None;
+                }
+
+                Some(EvictionCandidate {
+                    patch,
+                    atlas_slot,
+                    last_needed_frame: entry.last_needed_frame,
+                })
+            })
+            .collect();
+
+        candidates.sort_by(|a, b| {
+            a.last_needed_frame
+                .cmp(&b.last_needed_frame)
+                // Smaller LOD index is finer, so evict finer patches first
+                .then_with(|| a.patch.lod_index.cmp(&b.patch.lod_index))
+        });
+
+        for candidate in candidates.into_iter().take(slots_to_free) {
+            self.entries.remove(&candidate.patch);
+            self.available_atlas_slots.push(candidate.atlas_slot);
+        }
+    }
+
     fn create_atlas_slots() -> Vec<AtlasSlot> {
         let mut slots = Vec::with_capacity((ATLAS_PATCH_COUNT * ATLAS_PATCH_COUNT) as usize);
 
@@ -169,6 +233,11 @@ impl PatchCache {
     }
 }
 
+struct CacheEntry {
+    state: PatchState,
+    last_needed_frame: u64,
+}
+
 enum PatchState {
     Generated(PatchData),
     PendingUpload(PatchUploadInfo),
@@ -178,4 +247,10 @@ enum PatchState {
 struct PatchUploadInfo {
     atlas_slot: AtlasSlot,
     submitted_frame: u64,
+}
+
+struct EvictionCandidate {
+    patch: PatchKey,
+    atlas_slot: AtlasSlot,
+    last_needed_frame: u64,
 }
