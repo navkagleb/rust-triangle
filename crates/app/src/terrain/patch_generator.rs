@@ -12,6 +12,7 @@ use super::patch_queue::PatchQueue;
 #[derive(Copy, Clone)]
 pub struct PatchPriority {
     coverage_required: bool,
+    lod_index: u32,
     distance_squared: f32,
     view_alignment: f32,
 }
@@ -19,6 +20,7 @@ pub struct PatchPriority {
 impl PartialEq for PatchPriority {
     fn eq(&self, other: &Self) -> bool {
         self.coverage_required == other.coverage_required
+            && self.lod_index == other.lod_index
             && self.distance_squared == other.distance_squared
             && self.view_alignment == other.view_alignment
     }
@@ -36,9 +38,11 @@ impl Ord for PatchPriority {
     fn cmp(&self, other: &Self) -> Ordering {
         self.coverage_required
             .cmp(&other.coverage_required)
-            // Smaller distance means higher priority.
-            .then_with(|| self.view_alignment.total_cmp(&other.view_alignment))
+            // Larger LOD means higher priority.
+            .then_with(|| self.lod_index.cmp(&other.lod_index))
             // Larger alignment means higher priority.
+            .then_with(|| self.view_alignment.total_cmp(&other.view_alignment))
+            // Smaller distance means higher priority.
             .then_with(|| other.distance_squared.total_cmp(&self.distance_squared))
     }
 }
@@ -62,6 +66,7 @@ impl WantedPatch {
             patch,
             priority: PatchPriority {
                 coverage_required,
+                lod_index: patch.lod_index,
                 distance_squared: offset.length_squared(),
                 view_alignment,
             },
