@@ -23,7 +23,10 @@ impl PatchQueue {
         }
     }
 
-    pub fn update_wanted_patches(&self, wanted_patches: &[WantedPatch]) {
+    pub fn update_wanted_patches<I>(&self, wanted_patches: I)
+    where
+        I: IntoIterator<Item = WantedPatch>,
+    {
         let is_empty = {
             let mut state = self.state.lock().unwrap();
 

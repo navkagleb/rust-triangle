@@ -6,7 +6,6 @@ use windows::Win32::Graphics::Direct3D12::D3D12_GPU_DESCRIPTOR_HANDLE;
 use super::config::ATLAS_PATCH_COUNT;
 use super::patch::{PatchData, PatchKey};
 use super::patch_generator::GeneratedPatch;
-use super::patch_quad_tree::PatchQuadTree;
 use super::texture_atlas::AtlasSlot;
 
 pub struct PatchUpload {
@@ -17,6 +16,11 @@ pub struct PatchUpload {
 pub struct ResidentPatch {
     pub patch: PatchKey,
     pub atlas_slot: AtlasSlot,
+}
+
+pub struct PatchCacheFrame {
+    pub uploads: Vec<PatchUpload>,
+    pub resident: Vec<ResidentPatch>,
 }
 
 #[derive(PartialEq, Eq)]
@@ -47,96 +51,58 @@ impl PatchCache {
         }
     }
 
-    pub fn mark_needed<'a, I>(&mut self, frame_index: u64, needed_patches: I)
+    pub fn update<'a, I>(&mut self, current_frame: u64, completed_frame: u64, needed_patches: I) -> PatchCacheFrame
     where
         I: IntoIterator<Item = &'a PatchKey>,
     {
-        for patch in needed_patches {
-            if let Some(entry) = self.entries.get_mut(patch) {
-                entry.last_needed_frame = frame_index;
+        self.mark_needed(current_frame, needed_patches);
+        let generated_count = self.update_states(current_frame, completed_frame);
+
+        self.evict_resident(generated_count, current_frame);
+
+        let mut cache_frame = PatchCacheFrame {
+            uploads: Vec::new(),
+            resident: Vec::new(),
+        };
+
+        for (&patch, entry) in &mut self.entries {
+            match &mut entry.state {
+                PatchState::Generated(data) => {
+                    if entry.last_needed_frame != current_frame {
+                        continue;
+                    }
+
+                    let atlas_slot = self.available_atlas_slots.pop().unwrap();
+                    let data = std::mem::take(data);
+
+                    entry.state = PatchState::PendingUpload(PatchUploadInfo {
+                        atlas_slot,
+                        submitted_frame: current_frame,
+                    });
+
+                    cache_frame.uploads.push(PatchUpload { atlas_slot, data });
+                }
+
+                PatchState::PendingUpload(_) => {}
+
+                PatchState::Resident(atlas_slot) => cache_frame.resident.push(ResidentPatch {
+                    patch,
+                    atlas_slot: *atlas_slot,
+                }),
             }
         }
+
+        cache_frame
     }
 
-    pub fn insert_generated(&mut self, generated: GeneratedPatch, frame_index: u64) {
+    pub fn insert_generated(&mut self, generated: GeneratedPatch) {
         self.entries.insert(
             generated.patch,
             CacheEntry {
                 state: PatchState::Generated(generated.data),
-                last_needed_frame: frame_index,
+                last_needed_frame: 0,
             },
         );
-    }
-
-    pub fn prepare_uploads(&mut self, current_frame: u64) -> Vec<PatchUpload> {
-        let generated_count = self
-            .entries
-            .values()
-            .filter(|entry| matches!(entry.state, PatchState::Generated(_)))
-            .count();
-
-        self.evict(generated_count, current_frame);
-
-        let mut uploads = Vec::new();
-
-        for entry in &mut self.entries.values_mut() {
-            let PatchState::Generated(data) = &mut entry.state else {
-                continue;
-            };
-
-            let atlas_slot = self.available_atlas_slots.pop().unwrap();
-            let data = std::mem::take(data);
-
-            entry.state = PatchState::PendingUpload(PatchUploadInfo {
-                atlas_slot,
-                submitted_frame: current_frame,
-            });
-
-            uploads.push(PatchUpload { atlas_slot, data });
-        }
-
-        uploads
-    }
-
-    pub fn completed_uploads(&mut self, completed_frame: u64) {
-        for entry in self.entries.values_mut() {
-            let PatchState::PendingUpload(upload_info) = &entry.state else {
-                continue;
-            };
-
-            if upload_info.submitted_frame <= completed_frame {
-                entry.state = PatchState::Resident(upload_info.atlas_slot)
-            }
-        }
-    }
-
-    pub fn collect_resident_patches(&self) -> Vec<ResidentPatch> {
-        self.entries
-            .iter()
-            .filter_map(|(&patch, entry)| {
-                if let PatchState::Resident(atlas_slot) = entry.state {
-                    return Some(ResidentPatch { patch, atlas_slot });
-                }
-
-                None
-            })
-            .collect()
-    }
-
-    pub fn evict_outside(&mut self, qtree: &PatchQuadTree) {
-        self.entries.retain(|patch, entry| {
-            if qtree.contains_grid_index(patch.grid_index) {
-                return true;
-            }
-
-            match &entry.state {
-                PatchState::Generated(_) => {}
-                PatchState::PendingUpload(upload_info) => self.available_atlas_slots.push(upload_info.atlas_slot),
-                PatchState::Resident(atlas_slot) => self.available_atlas_slots.push(*atlas_slot),
-            }
-
-            false
-        });
     }
 
     pub unsafe fn render_imgui(&self, height_atlas: D3D12_GPU_DESCRIPTOR_HANDLE) {
@@ -180,7 +146,56 @@ impl PatchCache {
         }
     }
 
-    fn evict(&mut self, required_slots: usize, current_frame: u64) {
+    fn mark_needed<'a, I>(&mut self, frame_index: u64, needed_patches: I)
+    where
+        I: IntoIterator<Item = &'a PatchKey>,
+    {
+        for patch in needed_patches {
+            if let Some(entry) = self.entries.get_mut(patch) {
+                entry.last_needed_frame = frame_index;
+            }
+        }
+    }
+
+    fn update_states(&mut self, current_frame: u64, completed_frame: u64) -> usize {
+        let mut entries_to_remove = Vec::new();
+        let mut generated_count = 0;
+
+        for (&patch, entry) in &mut self.entries {
+            match &entry.state {
+                PatchState::Generated(_) => {
+                    if entry.last_needed_frame == current_frame {
+                        generated_count += 1;
+                    } else {
+                        entries_to_remove.push(patch);
+                    }
+                }
+
+                PatchState::PendingUpload(upload) => {
+                    if upload.submitted_frame <= completed_frame {
+                        let atlas_slot = upload.atlas_slot;
+
+                        if entry.last_needed_frame == current_frame {
+                            entry.state = PatchState::Resident(atlas_slot)
+                        } else {
+                            self.available_atlas_slots.push(atlas_slot);
+                            entries_to_remove.push(patch);
+                        }
+                    }
+                }
+
+                PatchState::Resident(_) => {}
+            }
+        }
+
+        for patch in entries_to_remove {
+            self.entries.remove(&patch);
+        }
+
+        generated_count
+    }
+
+    fn evict_resident(&mut self, required_slots: usize, current_frame: u64) {
         let slots_to_free = required_slots.saturating_sub(self.available_atlas_slots.len());
 
         if slots_to_free == 0 {

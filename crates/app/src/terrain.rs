@@ -344,35 +344,32 @@ impl Terrain {
     }
 
     pub fn update(&mut self, cpu_frame_index: u64, gpu_frame_index: u64, active_frame_index: u32) {
-        self.collect_generated_patches(cpu_frame_index);
+        self.collect_generated_patches();
 
         let qtree = PatchQuadTree::build(self.camera_pos, self.render_distance, self.lod_factor);
+        // It's better to update the cache states before calling 'select' to avoid one-frame delay
         let selection = qtree.select(&self.patch_cache);
 
-        let wanted_patches: Vec<_> = selection
-            .missing
-            .into_iter()
-            .map(|missing| {
+        self.patch_generator
+            .update_wanted_patches(selection.missing.into_iter().map(|missing| {
                 WantedPatch::new(
                     missing.patch,
                     missing.coverage_required,
                     self.camera_pos,
                     self.camera_forward,
                 )
-            })
-            .collect();
+            }));
 
-        self.patch_generator.update_wanted_patches(&wanted_patches);
-        self.patch_cache.evict_outside(&qtree);
-        self.patch_cache.mark_needed(
+        let cache_frame = self.patch_cache.update(
             cpu_frame_index,
-            selection.renderable.iter().chain(selection.retained.iter()),
+            gpu_frame_index,
+            selection.renderable.iter().chain(&selection.retained),
         );
-        self.patch_cache.completed_uploads(gpu_frame_index);
-        self.patches_to_upload = self.patch_cache.prepare_uploads(cpu_frame_index);
+
+        self.patches_to_upload = cache_frame.uploads;
         self.patches_to_render = selection.renderable;
 
-        self.write_indirection_texture_data(&self.patch_cache.collect_resident_patches());
+        self.write_indirection_texture_data(&cache_frame.resident);
         self.write_gpu_patch_buffer(active_frame_index);
     }
 
@@ -459,9 +456,9 @@ impl Terrain {
         Vec2::new(world_pos.x / world_scale, world_pos.z / world_scale)
     }
 
-    fn collect_generated_patches(&mut self, cpu_frame_index: u64) {
+    fn collect_generated_patches(&mut self) {
         for generated in self.patch_generator.drain_generated() {
-            self.patch_cache.insert_generated(generated, cpu_frame_index);
+            self.patch_cache.insert_generated(generated);
         }
     }
 

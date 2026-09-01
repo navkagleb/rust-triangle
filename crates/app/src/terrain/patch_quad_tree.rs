@@ -28,23 +28,14 @@ impl PatchSelection {
 
 pub struct PatchQuadTree {
     root: TreeNode,
-    min_grid_index: IVec2,
-    max_grid_index: IVec2,
 }
 
 impl PatchQuadTree {
     pub fn build(camera_pos: Vec2, render_distance: u32, lod_factor: f32) -> Self {
         let mut root = Self::create_root(camera_pos, render_distance);
-
         Self::split_recursive(&mut root, camera_pos, lod_factor);
 
-        let grid_size = (render_distance * 2 / PATCH_TERRAIN_SIZE) as i32;
-
-        Self {
-            min_grid_index: root.patch.grid_index,
-            max_grid_index: root.patch.grid_index + grid_size,
-            root,
-        }
+        Self { root }
     }
 
     pub fn select(&self, cache: &PatchCache) -> PatchSelection {
@@ -57,10 +48,6 @@ impl PatchQuadTree {
         Self::select_node_recursive(&self.root, cache, &mut selection);
 
         selection
-    }
-
-    pub fn contains_grid_index(&self, grid_index: IVec2) -> bool {
-        grid_index.cmpge(self.min_grid_index).all() && grid_index.cmple(self.max_grid_index).all()
     }
 
     fn create_root(camera_pos: Vec2, render_distance: u32) -> TreeNode {
