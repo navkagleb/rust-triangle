@@ -347,10 +347,7 @@ impl Terrain {
         self.collect_generated_patches();
 
         let qtree = PatchQuadTree::build(self.camera_pos, self.render_distance, self.lod_factor);
-        let selection = qtree.select(
-            |patch| self.patch_cache.is_resident(patch),
-            |patch| !self.patch_cache.contains(patch),
-        );
+        let selection = qtree.select(&self.patch_cache);
 
         let wanted_patches: Vec<_> = selection
             .missing

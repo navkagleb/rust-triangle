@@ -19,6 +19,13 @@ pub struct ResidentPatch {
     pub atlas_slot: AtlasSlot,
 }
 
+#[derive(PartialEq, Eq)]
+pub enum PatchAvailability {
+    Missing,
+    Pending,
+    Resident,
+}
+
 pub struct PatchCache {
     entries: HashMap<PatchKey, PatchState>,
     available_atlas_slots: Vec<AtlasSlot>,
@@ -32,14 +39,12 @@ impl PatchCache {
         }
     }
 
-    pub fn is_resident(&self, patch: &PatchKey) -> bool {
-        self.entries
-            .get(patch)
-            .is_some_and(|status| matches!(status, PatchState::Resident(_)))
-    }
-
-    pub fn contains(&self, patch: &PatchKey) -> bool {
-        self.entries.contains_key(patch)
+    pub fn availability(&self, patch: &PatchKey) -> PatchAvailability {
+        match self.entries.get(patch) {
+            None => PatchAvailability::Missing,
+            Some(PatchState::Generated(_) | PatchState::PendingUpload(_)) => PatchAvailability::Pending,
+            Some(PatchState::Resident(_)) => PatchAvailability::Resident,
+        }
     }
 
     pub fn insert_generated(&mut self, generated: GeneratedPatch) {
