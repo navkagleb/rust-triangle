@@ -38,7 +38,6 @@ macro_rules! imgui_text {
 #[repr(u32)]
 enum GpuResource {
     ImGuiFont,
-    TerrainIndirectionTexture,
     TerrainHeightAtlas,
     TerrainGradientAtlas,
     TerrainPatchIndexBuffer,

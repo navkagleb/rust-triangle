@@ -3,7 +3,6 @@ mod gpu_types;
 mod patch;
 mod patch_cache;
 mod patch_generator;
-mod patch_indirection_texture;
 mod patch_quad_tree;
 mod patch_queue;
 mod terrain_imgui;
@@ -23,7 +22,6 @@ use gpu_types::{GpuTerrainConsts, GpuTerrainPatch};
 use patch::{PatchKey, PatchStitchMask};
 use patch_cache::{PatchCache, PatchUpload};
 use patch_generator::{PatchGenerator, WantedPatch};
-use patch_indirection_texture::PatchIndirectionTexture;
 use patch_quad_tree::PatchQuadTree;
 use texture_atlas::TextureAtlas;
 
@@ -56,8 +54,6 @@ pub struct Terrain {
     patch_buffer: ID3D12Resource,
     patch_buffer_item_count: u32,
     patch_buffer_ptr: *mut GpuTerrainPatch,
-
-    indirection_texture: PatchIndirectionTexture,
 
     height_atlas: TextureAtlas<f32>,
     gradient_atlas: TextureAtlas<Vec2>,
@@ -259,11 +255,6 @@ impl Terrain {
             patch_buffer_ptr: patch_buffer.map::<GpuTerrainPatch>()?,
             patch_buffer,
 
-            indirection_texture: PatchIndirectionTexture::new(
-                device,
-                resource_heap.get_cpu_handle(GpuResource::TerrainIndirectionTexture as u32),
-            )?,
-
             height_atlas: TextureAtlas::new(
                 device,
                 resource_heap.get_cpu_handle(GpuResource::TerrainHeightAtlas as u32),
@@ -317,23 +308,19 @@ impl Terrain {
                 )
             }));
 
-        let cache_frame = self.patch_cache.update(
+        let uploads = self.patch_cache.update(
             cpu_frame_index,
             gpu_frame_index,
             selection.renderable.iter().chain(&selection.retained),
         );
 
-        self.patches_to_upload = cache_frame.uploads;
+        self.patches_to_upload = uploads;
         self.patches_to_render = selection.renderable;
 
-        self.indirection_texture
-            .rebuild(self.camera_grid_index, &cache_frame.resident);
         self.write_gpu_patch_buffer(active_frame_index);
     }
 
     pub fn render(&self, cmd_list: &ID3D12GraphicsCommandList, camera: &Camera, active_frame_index: u32) {
-        self.indirection_texture.upload(cmd_list, active_frame_index);
-
         for upload in &self.patches_to_upload {
             self.height_atlas.copy_to(
                 cmd_list,
@@ -450,6 +437,10 @@ impl Terrain {
                 GpuTerrainPatch {
                     grid_index: patch.grid_index,
                     lod_index: patch.lod_index,
+                    atlas_slot: self
+                        .patch_cache
+                        .atlas_slot(patch)
+                        .unwrap_or_else(|| panic!("renderable patch {patch:?} must be resident in the cache")),
                     stitch_mask,
                 }
             })

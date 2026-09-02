@@ -352,8 +352,3 @@ impl<T, const TYPE: i32> PsoSubobject<T, TYPE> {
         }
     }
 }
-
-pub fn align_up(value: u64, alignment: u64) -> u64 {
-    debug_assert!(alignment.is_power_of_two());
-    (value + alignment - 1) & !(alignment - 1)
-}

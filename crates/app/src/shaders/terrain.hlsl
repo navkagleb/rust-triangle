@@ -27,6 +27,7 @@ struct TerrainConsts {
 
 struct TerrainPatch {
     int2 grid_index;
+    uint2 atlas_slot;
     uint lod_index;
     uint stitch_mask;
 };
@@ -66,10 +67,9 @@ float3 height_to_color(float h) {
     return snow;
 }
 
-static const uint INDIRECTION_TEXTURE_INDEX = 1;
-static const uint HEIGHT_ATLAS_INDEX = 2;
-static const uint GRADIENT_ATLAS_INDEX = 3;
-static const uint PATCH_INDEX_BUFFER_INDEX = 4;
+static const uint HEIGHT_ATLAS_INDEX = 1;
+static const uint GRADIENT_ATLAS_INDEX = 2;
+static const uint PATCH_INDEX_BUFFER_INDEX = 3;
 
 static const uint PATCH_LOD_COUNT = 6;
 static const uint PATCH_PIXEL_SIZE = 128;
@@ -116,7 +116,6 @@ float3 patch_color(TerrainPatch patch) {
 
 VsOutput process_vertex(uint vertex_id, uint instance_id) {
     const StructuredBuffer<TerrainPatch> patches = ResourceDescriptorHeap[consts.active_patch_buffer_index];
-    const Texture2D<uint2> indirection_texture = ResourceDescriptorHeap[INDIRECTION_TEXTURE_INDEX];
     const Texture2D<float> height_atlas = ResourceDescriptorHeap[HEIGHT_ATLAS_INDEX];
     const Texture2D<float2> gradient_atlas = ResourceDescriptorHeap[GRADIENT_ATLAS_INDEX];
 
@@ -143,12 +142,7 @@ VsOutput process_vertex(uint vertex_id, uint instance_id) {
     const float terrain_size = PATCH_TERRAIN_SIZE * 1 << patch.lod_index;
     const float2 terrain_xz = patch.grid_index * (int)PATCH_TERRAIN_SIZE + terrain_size * uv;
 
-    const uint lod_index = patch.lod_index;
-    const int2 relative_slot = (patch.grid_index >> lod_index) - (consts.camera_grid_index >> lod_index);
-    const int2 indirection_slot = relative_slot + (INDIRECTION_SLOT_COUNT >> lod_index) / 2;
-    const uint2 atlas_slot = indirection_texture.mips[lod_index][indirection_slot];
-    const uint2 atlas_texel_pos = atlas_slot * ATLAS_PATCH_PIXEL_SIZE + uint2(ix, iz);
-
+    const uint2 atlas_texel_pos = patch.atlas_slot * ATLAS_PATCH_PIXEL_SIZE + uint2(ix, iz);
     const float height = height_atlas[atlas_texel_pos];
     const float2 gradient = gradient_atlas[atlas_texel_pos];
 

@@ -13,16 +13,6 @@ pub struct PatchUpload {
     pub data: PatchData,
 }
 
-pub struct ResidentPatch {
-    pub patch: PatchKey,
-    pub atlas_slot: AtlasSlot,
-}
-
-pub struct PatchCacheFrame {
-    pub uploads: Vec<PatchUpload>,
-    pub resident: Vec<ResidentPatch>,
-}
-
 #[derive(PartialEq, Eq)]
 pub enum PatchAvailability {
     Missing,
@@ -51,48 +41,25 @@ impl PatchCache {
         }
     }
 
-    pub fn update<'a, I>(&mut self, current_frame: u64, completed_frame: u64, needed_patches: I) -> PatchCacheFrame
+    pub fn atlas_slot(&self, patch: &PatchKey) -> Option<AtlasSlot> {
+        let entry = self.entries.get(patch)?;
+
+        match entry.state {
+            PatchState::Resident(atlas_slot) => Some(atlas_slot),
+            _ => None,
+        }
+    }
+
+    pub fn update<'a, I>(&mut self, current_frame: u64, completed_frame: u64, needed_patches: I) -> Vec<PatchUpload>
     where
         I: IntoIterator<Item = &'a PatchKey>,
     {
         self.mark_needed(current_frame, needed_patches);
-        let generated_count = self.update_states(current_frame, completed_frame);
 
+        let generated_count = self.update_states(current_frame, completed_frame);
         self.evict_resident(generated_count, current_frame);
 
-        let mut cache_frame = PatchCacheFrame {
-            uploads: Vec::new(),
-            resident: Vec::new(),
-        };
-
-        for (&patch, entry) in &mut self.entries {
-            match &mut entry.state {
-                PatchState::Generated(data) => {
-                    if entry.last_needed_frame != current_frame {
-                        continue;
-                    }
-
-                    let atlas_slot = self.available_atlas_slots.pop().unwrap();
-                    let data = std::mem::take(data);
-
-                    entry.state = PatchState::PendingUpload(PatchUploadInfo {
-                        atlas_slot,
-                        submitted_frame: current_frame,
-                    });
-
-                    cache_frame.uploads.push(PatchUpload { atlas_slot, data });
-                }
-
-                PatchState::PendingUpload(_) => {}
-
-                PatchState::Resident(atlas_slot) => cache_frame.resident.push(ResidentPatch {
-                    patch,
-                    atlas_slot: *atlas_slot,
-                }),
-            }
-        }
-
-        cache_frame
+        self.prepare_uploads(current_frame)
     }
 
     pub fn insert_generated(&mut self, generated: GeneratedPatch) {
@@ -233,6 +200,34 @@ impl PatchCache {
             self.entries.remove(&candidate.patch);
             self.available_atlas_slots.push(candidate.atlas_slot);
         }
+    }
+
+    fn prepare_uploads(&mut self, current_frame: u64) -> Vec<PatchUpload> {
+        let mut uploads = Vec::new();
+
+        for entry in self.entries.values_mut() {
+            match &mut entry.state {
+                PatchState::Generated(data) => {
+                    if entry.last_needed_frame != current_frame {
+                        continue;
+                    }
+
+                    let atlas_slot = self.available_atlas_slots.pop().unwrap();
+                    let data = std::mem::take(data);
+
+                    entry.state = PatchState::PendingUpload(PatchUploadInfo {
+                        atlas_slot,
+                        submitted_frame: current_frame,
+                    });
+
+                    uploads.push(PatchUpload { atlas_slot, data });
+                }
+
+                PatchState::PendingUpload(_) | PatchState::Resident(_) => {}
+            }
+        }
+
+        uploads
     }
 
     fn create_atlas_slots() -> Vec<AtlasSlot> {

@@ -8,7 +8,6 @@ pub(super) const ATLAS_PATCH_PIXEL_SIZE: usize = PATCH_PIXEL_SIZE as usize + 1; 
 pub(super) const ATLAS_PATCH_PIXEL_SIZE_WITH_BORDER: usize = ATLAS_PATCH_PIXEL_SIZE + 2; // for gradient generation
 pub(super) const ATLAS_PATCH_COUNT: u32 = 32;
 pub(super) const ATLAS_SIZE: u32 = ATLAS_PATCH_PIXEL_SIZE as u32 * ATLAS_PATCH_COUNT;
-pub(super) const INDIRECTION_SLOT_COUNT: u32 = 512;
 
 pub(super) const PATCH_SIDE_QUAD_COUNT: u32 = PATCH_PIXEL_SIZE;
 pub(super) const PATCH_SIDE_VERTEX_COUNT: u32 = PATCH_PIXEL_SIZE + 1;
