@@ -50,6 +50,11 @@ impl PatchQuadTree {
         selection
     }
 
+    pub fn split_distance(lod_index: u32, lod_factor: f32) -> f32 {
+        assert_ne!(lod_index, 0);
+        PatchKey::terrain_size_for_lod(lod_index) as f32 * 0.5 * lod_factor
+    }
+
     fn create_root(camera_pos: Vec2, render_distance: u32) -> TreeNode {
         let root_terrain_size = PATCH_TERRAIN_SIZE * 2_u32.pow(PATCH_LOD_COUNT - 1);
         let root_lod_index = (render_distance * 2 / PATCH_TERRAIN_SIZE).ilog2();
@@ -92,12 +97,12 @@ impl PatchQuadTree {
             return false;
         }
 
-        let distance = camera_pos.distance(node.patch.terrain_center().as_vec2());
-        let split_distance = node.patch.terrain_size() as f32 * 0.5 * lod_factor;
+        let distance_to_camera = camera_pos.distance(node.patch.closest_point(camera_pos));
+        let split_distance = Self::split_distance(node.patch.lod_index, lod_factor);
 
         let is_virtual_root = node.patch.lod_index >= PATCH_LOD_COUNT;
 
-        is_virtual_root || distance < split_distance
+        is_virtual_root || distance_to_camera < split_distance
     }
 
     fn select_node_recursive(node: &TreeNode, cache: &PatchCache, selection: &mut PatchSelection) {

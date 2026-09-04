@@ -1,13 +1,14 @@
 use std::ptr::null_mut;
 
 use glam::{IVec2, Vec2, Vec3, Vec3Swizzles};
+use imgui_sys::*;
 
-use super::config::PATCH_TERRAIN_SIZE;
+use super::config::{PATCH_LOD_COUNT, PATCH_TERRAIN_SIZE};
 use super::patch_cache::PatchCache;
+use super::patch_quad_tree::PatchQuadTree;
 use crate::d3d12_utils::DescriptorHeap;
 use crate::terrain::Terrain;
 use crate::{GpuResource, imgui_text};
-use imgui_sys::*;
 
 impl Terrain {
     pub unsafe fn render_imgui(&mut self, descriptor_heap: &DescriptorHeap, camera_pos: &Vec3, camera_forward: &Vec3) {
@@ -217,7 +218,46 @@ impl Terrain {
                 ImDrawList_AddText(draw_list, ImVec2 { x, y }, 0xFFFFFFFF, text.as_ptr());
             }
 
+            // lod_index's split_distance is the threshold at which an LOD lod_index patch splits
+            // into LOD (lod_index - 1) children, so the circle bounds the LOD (lod_index - 1)
+            // region and must be colored accordingly. LOD 0 never splits, so it has no threshold.
+            for lod_index in 1..PATCH_LOD_COUNT {
+                let split_distance = PatchQuadTree::split_distance(lod_index, self.lod_factor);
+
+                ImDrawList_AddCircleEx(
+                    draw_list,
+                    ImVec2 {
+                        x: minimap_camera_pos.x,
+                        y: minimap_camera_pos.y,
+                    },
+                    split_distance * minimap_scale,
+                    im_color32(get_lod_color(lod_index - 1), 0xff),
+                    40,
+                    2.0,
+                );
+            }
+
             ImGui_End();
         }
     }
+}
+
+fn get_lod_color(lod_index: u32) -> Vec3 {
+    match lod_index % PATCH_LOD_COUNT {
+        0 => Vec3::new(0.10, 0.80, 0.20), // green
+        1 => Vec3::new(0.10, 0.45, 1.00), // blue
+        2 => Vec3::new(1.00, 0.80, 0.10), // yellow
+        3 => Vec3::new(1.00, 0.30, 0.10), // orange
+        4 => Vec3::new(0.75, 0.20, 1.00), // purple
+        5 => Vec3::new(0.10, 0.90, 0.90), // cyan
+        _ => Vec3::ZERO,
+    }
+}
+
+fn im_color32(color: Vec3, alpha: u8) -> u32 {
+    let r = (color.x.clamp(0.0, 1.0) * 255.0) as u32;
+    let g = (color.y.clamp(0.0, 1.0) * 255.0) as u32;
+    let b = (color.z.clamp(0.0, 1.0) * 255.0) as u32;
+
+    (u32::from(alpha) << 24) | (b << 16) | (g << 8) | r
 }
