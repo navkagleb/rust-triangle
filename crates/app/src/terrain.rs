@@ -31,6 +31,7 @@ pub struct Terrain {
 
     terrain_to_world_scale: f32,
     terrain_height_scale: f32,
+    morph_start_ratio: f32,
 
     solid_mode: bool,
     wireframe_mode: bool,
@@ -67,6 +68,7 @@ pub struct Terrain {
     // Debug
     minimap_offset: Vec2,
     minimap_zoom: f32,
+    minimap_display_morph_range: bool,
 }
 
 impl Terrain {
@@ -232,6 +234,7 @@ impl Terrain {
 
             terrain_to_world_scale: 1.0,
             terrain_height_scale: 120.0,
+            morph_start_ratio: 0.7,
 
             solid_mode: true,
             wireframe_mode: false,
@@ -276,6 +279,7 @@ impl Terrain {
 
             minimap_offset: Vec2::ZERO,
             minimap_zoom: 1.0,
+            minimap_display_morph_range: true,
         })
     }
 
@@ -440,7 +444,7 @@ impl Terrain {
                     atlas_slot: self
                         .patch_cache
                         .atlas_slot(patch)
-                        .unwrap_or_else(|| panic!("renderable patch {patch:?} must be resident in the cache")),
+                        .unwrap_or_else(|| panic!("renderable patch {:?} must be resident in the cache", patch)),
                     stitch_mask,
                 }
             })

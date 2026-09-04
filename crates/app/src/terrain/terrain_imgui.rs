@@ -24,6 +24,7 @@ impl Terrain {
             ImGui_InputFloat(c"LOD factor".as_ptr(), &mut self.lod_factor);
             ImGui_InputFloat(c"Terrain to world scale".as_ptr(), &mut self.terrain_to_world_scale);
             ImGui_InputFloat(c"Terrain height scale".as_ptr(), &mut self.terrain_height_scale);
+            ImGui_SliderFloat(c"Morph start ratio".as_ptr(), &mut self.morph_start_ratio, 0.0, 1.0);
 
             ImGui_NewLine();
             ImGui_Checkbox(c"Freeze camera".as_ptr(), &mut self.freeze_camera);
@@ -59,6 +60,9 @@ impl Terrain {
                 self.minimap_offset = Vec2::ZERO;
                 self.minimap_zoom = 1.0;
             }
+
+            ImGui_SameLine();
+            ImGui_Checkbox(c"Morph range".as_ptr(), &mut self.minimap_display_morph_range);
 
             ImGui_SameLine();
             imgui_text!("Render distance: {:.2}", self.render_distance);
@@ -218,23 +222,54 @@ impl Terrain {
                 ImDrawList_AddText(draw_list, ImVec2 { x, y }, 0xFFFFFFFF, text.as_ptr());
             }
 
-            // lod_index's split_distance is the threshold at which an LOD lod_index patch splits
-            // into LOD (lod_index - 1) children, so the circle bounds the LOD (lod_index - 1)
-            // region and must be colored accordingly. LOD 0 never splits, so it has no threshold.
-            for lod_index in 1..PATCH_LOD_COUNT {
-                let split_distance = PatchQuadTree::split_distance(lod_index, self.lod_factor);
+            if self.minimap_display_morph_range {
+                let minimap_freezed_camera_pos = minimap_center
+                    + self.world_to_terrain_pos(Vec3::new(self.camera_pos.x, 0.0, self.camera_pos.y)) * minimap_scale;
 
-                ImDrawList_AddCircleEx(
-                    draw_list,
-                    ImVec2 {
-                        x: minimap_camera_pos.x,
-                        y: minimap_camera_pos.y,
-                    },
-                    split_distance * minimap_scale,
-                    im_color32(get_lod_color(lod_index - 1), 0xff),
-                    40,
-                    2.0,
-                );
+                // lod_index's split_distance is the threshold at which an LOD lod_index patch splits
+                // into LOD (lod_index - 1) children, so the circle bounds the LOD (lod_index - 1)
+                // region and must be colored accordingly. LOD 0 never splits, so it has no threshold.
+                for lod_index in 1..PATCH_LOD_COUNT {
+                    let split_distance = PatchQuadTree::split_distance(lod_index, self.lod_factor);
+                    let morph_start_distance = split_distance * self.morph_start_ratio;
+
+                    let center = ImVec2 {
+                        x: minimap_freezed_camera_pos.x,
+                        y: minimap_freezed_camera_pos.y,
+                    };
+                    let color = get_lod_color(lod_index - 1);
+                    let segment_count = 40;
+
+                    // ImGui has no annulus primitive, so the morph band is a circle stroked at the
+                    // middle of the band with a thickness equal to its width, which expands
+                    // symmetrically to cover exactly morph_start_distance..split_distance.
+                    ImDrawList_AddCircleEx(
+                        draw_list,
+                        center,
+                        (morph_start_distance + split_distance) * 0.5 * minimap_scale,
+                        im_color32(color, 0x30),
+                        segment_count,
+                        (split_distance - morph_start_distance) * minimap_scale,
+                    );
+
+                    ImDrawList_AddCircleEx(
+                        draw_list,
+                        center,
+                        morph_start_distance * minimap_scale,
+                        im_color32(color, 0x80),
+                        segment_count,
+                        1.0,
+                    );
+
+                    ImDrawList_AddCircleEx(
+                        draw_list,
+                        center,
+                        split_distance * minimap_scale,
+                        im_color32(color, 0xff),
+                        segment_count,
+                        2.0,
+                    );
+                }
             }
 
             ImGui_End();
