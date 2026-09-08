@@ -29,7 +29,7 @@ pub struct Terrain {
     render_distance: u32,
     lod_factor: f32,
 
-    terrain_height_scale: f32,
+    height_scale: f32,
     morph_start_ratio: f32,
 
     solid_mode: bool,
@@ -37,7 +37,7 @@ pub struct Terrain {
     display_normals: bool,
     stitching_enabled: bool,
     pause_sun_animation: bool,
-    terrain_elapsed_time: f32,
+    elapsed_time: f32,
 
     freeze_camera: bool,
     camera_pos: Vec2,
@@ -230,7 +230,7 @@ impl Terrain {
             render_distance,
             lod_factor: 3.5,
 
-            terrain_height_scale: 120.0,
+            height_scale: 120.0,
             morph_start_ratio: 0.7,
 
             solid_mode: true,
@@ -238,7 +238,7 @@ impl Terrain {
             display_normals: false,
             stitching_enabled: true,
             pause_sun_animation: false,
-            terrain_elapsed_time: 0.0,
+            elapsed_time: 0.0,
 
             freeze_camera: false,
             camera_pos: Vec2::ZERO,
@@ -286,7 +286,7 @@ impl Terrain {
         }
 
         if !self.pause_sun_animation {
-            self.terrain_elapsed_time += dt;
+            self.elapsed_time += dt;
         }
     }
 
@@ -338,8 +338,8 @@ impl Terrain {
 
         let mut consts = GpuTerrainConsts {
             world_to_clip: camera.world_to_clip(),
-            terrain_height_scale: self.terrain_height_scale,
-            elapsed_time: self.terrain_elapsed_time,
+            height_scale: self.height_scale,
+            elapsed_time: self.elapsed_time,
             stitching_enabled: self.stitching_enabled.into(),
             active_patch_buffer_index: GpuResource::TerrainPatchBufferFirst as u32 + active_frame_index,
 

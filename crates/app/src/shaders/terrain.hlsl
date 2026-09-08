@@ -13,7 +13,7 @@ struct VsOutput {
 
 struct TerrainConsts {
     float4x4 world_to_clip;
-    float terrain_height_scale;
+    float height_scale;
     float elapsed_time;
     uint stitching_enabled;
     uint active_patch_buffer_index;
@@ -145,9 +145,9 @@ VsOutput process_vertex(uint vertex_id, uint instance_id) {
     const float2 gradient = gradient_atlas[atlas_texel_pos];
 
     // Terrain XZ is world XZ: one terrain unit is one world unit.
-    const float3 world_pos = float3(terrain_xz.x, height * consts.terrain_height_scale, terrain_xz.y);
+    const float3 world_pos = float3(terrain_xz.x, height * consts.height_scale, terrain_xz.y);
 
-    const float slope_scale = consts.terrain_height_scale;
+    const float slope_scale = consts.height_scale;
     const float3 normal = normalize(float3(-gradient.x * slope_scale, 1.0, -gradient.y * slope_scale));
 
     VsOutput output = (VsOutput)0;

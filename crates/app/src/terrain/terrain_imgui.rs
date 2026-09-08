@@ -22,7 +22,7 @@ impl Terrain {
             ImGui_NewLine();
             ImGui_InputInt(c"Render distance".as_ptr(), &mut self.render_distance as *mut u32 as _);
             ImGui_InputFloat(c"LOD factor".as_ptr(), &mut self.lod_factor);
-            ImGui_InputFloat(c"Terrain height scale".as_ptr(), &mut self.terrain_height_scale);
+            ImGui_InputFloat(c"Height scale".as_ptr(), &mut self.height_scale);
             ImGui_SliderFloat(c"Morph start ratio".as_ptr(), &mut self.morph_start_ratio, 0.0, 1.0);
 
             ImGui_NewLine();
