@@ -1,4 +1,3 @@
-use bitflags::bitflags;
 use glam::{IVec2, Vec2};
 
 use super::config::PATCH_TERRAIN_SIZE;
@@ -38,15 +37,4 @@ impl PatchKey {
 pub struct PatchData {
     pub heights: Vec<f32>,
     pub gradients: Vec<Vec2>,
-}
-
-bitflags! {
-    #[repr(transparent)]
-    #[derive(Clone, Copy, Debug)]
-    pub(super) struct PatchStitchMask: u32 {
-        const TOP = 1 << 0;
-        const BOTTOM = 1 << 1;
-        const LEFT = 1 << 2;
-        const RIGHT = 1 << 3;
-    }
 }

@@ -9,7 +9,7 @@ mod terrain_imgui;
 mod texture_atlas;
 
 use anyhow::Result;
-use glam::{IVec2, Vec2, Vec3, Vec3Swizzles, f32};
+use glam::{Vec2, Vec3, Vec3Swizzles, f32};
 use windows::Win32::Graphics::Direct3D::*;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -19,7 +19,7 @@ use crate::d3d12_utils::*;
 use crate::{BACK_BUFFER_FORMAT, DEPTH_BUFFER_FORMAT, FRAME_COUNT, GpuResource};
 use config::*;
 use gpu_types::{GpuTerrainConsts, GpuTerrainPatch};
-use patch::{PatchKey, PatchStitchMask};
+use patch::PatchKey;
 use patch_cache::{PatchCache, PatchUpload};
 use patch_generator::{PatchGenerator, WantedPatch};
 use patch_quad_tree::PatchQuadTree;
@@ -35,7 +35,6 @@ pub struct Terrain {
     solid_mode: bool,
     wireframe_mode: bool,
     display_normals: bool,
-    stitching_enabled: bool,
     pause_sun_animation: bool,
     elapsed_time: f32,
 
@@ -236,7 +235,6 @@ impl Terrain {
             solid_mode: true,
             wireframe_mode: false,
             display_normals: false,
-            stitching_enabled: true,
             pause_sun_animation: false,
             elapsed_time: 0.0,
 
@@ -340,7 +338,6 @@ impl Terrain {
             world_to_clip: camera.world_to_clip(),
             height_scale: self.height_scale,
             elapsed_time: self.elapsed_time,
-            stitching_enabled: self.stitching_enabled.into(),
             active_patch_buffer_index: GpuResource::TerrainPatchBufferFirst as u32 + active_frame_index,
 
             wireframe_pass: false.into(),
@@ -393,47 +390,16 @@ impl Terrain {
     }
 
     fn write_gpu_patch_buffer(&self, active_frame_index: u32) {
-        let is_neighbor_coarser = |node: &PatchKey, direction: IVec2| -> bool {
-            let probe = node.terrain_center() + direction * node.terrain_size() as i32;
-
-            let neighbor_lod_index = self
-                .patches_to_render
-                .iter()
-                .find(|p| (p.terrain_center() - probe).length_squared() < node.terrain_size().pow(2) as i32)
-                .map(|p| p.lod_index)
-                .unwrap_or(node.lod_index);
-
-            neighbor_lod_index > node.lod_index
-        };
-
         let gpu_patches: Vec<_> = self
             .patches_to_render
             .iter()
-            .map(|patch| {
-                let directions = [
-                    (PatchStitchMask::TOP, IVec2::NEG_Y),
-                    (PatchStitchMask::BOTTOM, IVec2::Y),
-                    (PatchStitchMask::LEFT, IVec2::NEG_X),
-                    (PatchStitchMask::RIGHT, IVec2::X),
-                ];
-
-                let mut stitch_mask = PatchStitchMask::empty();
-
-                for &(flag, direction) in &directions {
-                    if is_neighbor_coarser(patch, direction) {
-                        stitch_mask.insert(flag);
-                    }
-                }
-
-                GpuTerrainPatch {
-                    grid_index: patch.grid_index,
-                    lod_index: patch.lod_index,
-                    atlas_slot: self
-                        .patch_cache
-                        .atlas_slot(patch)
-                        .unwrap_or_else(|| panic!("renderable patch {:?} must be resident in the cache", patch)),
-                    stitch_mask,
-                }
+            .map(|patch| GpuTerrainPatch {
+                grid_index: patch.grid_index,
+                lod_index: patch.lod_index,
+                atlas_slot: self
+                    .patch_cache
+                    .atlas_slot(patch)
+                    .unwrap_or_else(|| panic!("renderable patch {:?} must be resident in the cache", patch)),
             })
             .collect();
 

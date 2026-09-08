@@ -30,7 +30,6 @@ impl Terrain {
             ImGui_Checkbox(c"Solid mode".as_ptr(), &mut self.solid_mode);
             ImGui_Checkbox(c"Wireframe mode".as_ptr(), &mut self.wireframe_mode);
             ImGui_Checkbox(c"Display normals".as_ptr(), &mut self.display_normals);
-            ImGui_Checkbox(c"Stitching".as_ptr(), &mut self.stitching_enabled);
             ImGui_Checkbox(c"Pause sun animation".as_ptr(), &mut self.pause_sun_animation);
 
             ImGui_NewLine();

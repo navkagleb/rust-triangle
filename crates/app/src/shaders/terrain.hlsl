@@ -15,7 +15,6 @@ struct TerrainConsts {
     float4x4 world_to_clip;
     float height_scale;
     float elapsed_time;
-    uint stitching_enabled;
     uint active_patch_buffer_index;
 
     // Debug
@@ -27,7 +26,6 @@ struct TerrainPatch {
     int2 grid_index;
     uint2 atlas_slot;
     uint lod_index;
-    uint stitch_mask;
 };
 
 ConstantBuffer<TerrainConsts> consts : register(b0, space1);
@@ -77,12 +75,6 @@ static const uint PATCH_VERTEX_COUNT = (PATCH_QUAD_COUNT + 1) * (PATCH_QUAD_COUN
 static const uint PATCH_TRIANGLE_COUNT = PATCH_QUAD_COUNT * PATCH_QUAD_COUNT * 2;
 
 static const uint ATLAS_PATCH_PIXEL_SIZE = PATCH_PIXEL_SIZE + 1; // for pixel overlap
-static const uint INDIRECTION_SLOT_COUNT = 512;
-
-static const uint TOP_STITCH_BIT = 1 << 0;
-static const uint BOTTOM_STITCH_BIT = 1 << 1;
-static const uint LEFT_STITCH_BIT = 1 << 2;
-static const uint RIGHT_STITCH_BIT = 1 << 3;
 
 float3 get_lod_color(uint lod_index) {
     switch (lod_index % PATCH_LOD_COUNT) {
@@ -121,20 +113,6 @@ VsOutput process_vertex(uint vertex_id, uint instance_id) {
 
     uint ix = vertex_id % (PATCH_QUAD_COUNT + 1);
     uint iz = vertex_id / (PATCH_QUAD_COUNT + 1);
-
-    if (consts.stitching_enabled) {
-        const uint mask = patch.stitch_mask;
-        const bool stitch_x = (iz == 0 && mask & TOP_STITCH_BIT) || (iz == PATCH_QUAD_COUNT && mask & BOTTOM_STITCH_BIT);
-        const bool stitch_z = (ix == 0 && mask & LEFT_STITCH_BIT) || (ix == PATCH_QUAD_COUNT && mask & RIGHT_STITCH_BIT);
-
-        if (stitch_x) {
-            ix = (ix / 2) * 2;
-        }
-
-        if (stitch_z) {
-            iz = (iz / 2) * 2;
-        }
-    }
 
     const float2 uv = float2(ix, iz) / (float)PATCH_QUAD_COUNT; // 0..1
     const float terrain_size = PATCH_TERRAIN_SIZE * 1 << patch.lod_index;
