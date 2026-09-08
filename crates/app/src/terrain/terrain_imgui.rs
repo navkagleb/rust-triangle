@@ -22,7 +22,6 @@ impl Terrain {
             ImGui_NewLine();
             ImGui_InputInt(c"Render distance".as_ptr(), &mut self.render_distance as *mut u32 as _);
             ImGui_InputFloat(c"LOD factor".as_ptr(), &mut self.lod_factor);
-            ImGui_InputFloat(c"Terrain to world scale".as_ptr(), &mut self.terrain_to_world_scale);
             ImGui_InputFloat(c"Terrain height scale".as_ptr(), &mut self.terrain_height_scale);
             ImGui_SliderFloat(c"Morph start ratio".as_ptr(), &mut self.morph_start_ratio, 0.0, 1.0);
 
@@ -148,7 +147,7 @@ impl Terrain {
             }
 
             let camera_color = 0xFF0000FF_u32;
-            let minimap_camera_pos = minimap_center + self.world_to_terrain_pos(*camera_pos) * minimap_scale;
+            let minimap_camera_pos = minimap_center + camera_pos.xz() * minimap_scale;
             let minimap_camera_forward_pos = minimap_camera_pos + camera_forward.xz().normalize() * 100.0;
 
             ImDrawList_AddCircleFilled(
@@ -223,8 +222,7 @@ impl Terrain {
             }
 
             if self.minimap_display_morph_range {
-                let minimap_freezed_camera_pos = minimap_center
-                    + self.world_to_terrain_pos(Vec3::new(self.camera_pos.x, 0.0, self.camera_pos.y)) * minimap_scale;
+                let minimap_freezed_camera_pos = minimap_center + self.camera_pos * minimap_scale;
 
                 // lod_index's split_distance is the threshold at which an LOD lod_index patch splits
                 // into LOD (lod_index - 1) children, so the circle bounds the LOD (lod_index - 1)

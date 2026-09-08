@@ -14,8 +14,6 @@ pub struct GpuTerrainPatch {
 #[repr(C)]
 pub struct GpuTerrainConsts {
     pub world_to_clip: Mat4,
-    pub camera_grid_index: IVec2,
-    pub terrain_to_world_scale: f32,
     pub terrain_height_scale: f32,
     pub elapsed_time: f32,
     pub stitching_enabled: u32,

@@ -29,7 +29,6 @@ pub struct Terrain {
     render_distance: u32,
     lod_factor: f32,
 
-    terrain_to_world_scale: f32,
     terrain_height_scale: f32,
     morph_start_ratio: f32,
 
@@ -43,7 +42,6 @@ pub struct Terrain {
     freeze_camera: bool,
     camera_pos: Vec2,
     camera_forward: Vec2,
-    camera_grid_index: IVec2,
 
     patch_generator: PatchGenerator,
     patch_cache: PatchCache,
@@ -232,7 +230,6 @@ impl Terrain {
             render_distance,
             lod_factor: 3.5,
 
-            terrain_to_world_scale: 1.0,
             terrain_height_scale: 120.0,
             morph_start_ratio: 0.7,
 
@@ -246,7 +243,6 @@ impl Terrain {
             freeze_camera: false,
             camera_pos: Vec2::ZERO,
             camera_forward: Vec2::Y,
-            camera_grid_index: IVec2::ZERO,
 
             patch_generator: PatchGenerator::new(),
             patch_cache: PatchCache::new(),
@@ -285,9 +281,8 @@ impl Terrain {
 
     pub fn update_camera(&mut self, camera_pos: &Vec3, camera_forward: &Vec3, dt: f32) {
         if !self.freeze_camera {
-            self.camera_pos = self.world_to_terrain_pos(*camera_pos);
+            self.camera_pos = camera_pos.xz();
             self.camera_forward = camera_forward.xz().normalize_or_zero();
-            self.camera_grid_index = self.camera_pos.as_ivec2() / PATCH_TERRAIN_SIZE as i32;
         }
 
         if !self.pause_sun_animation {
@@ -343,8 +338,6 @@ impl Terrain {
 
         let mut consts = GpuTerrainConsts {
             world_to_clip: camera.world_to_clip(),
-            camera_grid_index: self.camera_grid_index,
-            terrain_to_world_scale: self.terrain_to_world_scale,
             terrain_height_scale: self.terrain_height_scale,
             elapsed_time: self.terrain_elapsed_time,
             stitching_enabled: self.stitching_enabled.into(),
@@ -391,12 +384,6 @@ impl Terrain {
             }
             render_terrain(&self.wireframe_vertex_pso);
         }
-    }
-
-    fn world_to_terrain_pos(&self, world_pos: Vec3) -> Vec2 {
-        let world_scale = self.terrain_to_world_scale.max(0.0001);
-
-        Vec2::new(world_pos.x / world_scale, world_pos.z / world_scale)
     }
 
     fn collect_generated_patches(&mut self) {
