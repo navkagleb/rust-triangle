@@ -1,9 +1,8 @@
 use std::cmp::Ordering;
 use std::sync::Arc;
 
-use glam::Vec2;
-use noise::utils::{NoiseMapBuilder, PlaneMapBuilder};
-use noise::{Fbm, MultiFractal, Perlin};
+use glam::{DVec2, Vec2};
+use noise::{NoiseFn, Perlin};
 
 use super::config::*;
 use super::patch::{PatchData, PatchKey};
@@ -87,24 +86,19 @@ pub struct PatchGenerator {
 
 impl PatchGenerator {
     pub fn new() -> Self {
+        let noise = Arc::new(TerrainNoise::new(123));
         let queue = Arc::new(PatchQueue::new());
         let (completed_sender, completed_receiver) = std::sync::mpsc::channel::<GeneratedPatch>();
 
-        let fbm = Fbm::<Perlin>::new(123)
-            .set_octaves(8)
-            .set_frequency(1.0)
-            .set_lacunarity(2.0)
-            .set_persistence(0.5);
-
         let workers = (0..PATCH_GEN_THREAD_COUNT)
             .map(|_| {
+                let noise = Arc::clone(&noise);
                 let queue = Arc::clone(&queue);
                 let completed_sender = completed_sender.clone();
-                let fbm = fbm.clone();
 
                 std::thread::spawn(move || {
                     while let Some(patch) = queue.claim_blocking() {
-                        let generated = Self::generate_patch(&fbm, patch);
+                        let generated = Self::generate_patch(&noise, patch);
 
                         if queue.complete(patch) && completed_sender.send(generated).is_err() {
                             break;
@@ -132,10 +126,10 @@ impl PatchGenerator {
         self.completed_receiver.try_iter()
     }
 
-    fn generate_patch(fbm: &Fbm<Perlin>, patch: PatchKey) -> GeneratedPatch {
+    fn generate_patch(noise: &TerrainNoise, patch: PatchKey) -> GeneratedPatch {
         let instant = std::time::Instant::now();
 
-        let heights_with_border = Self::generate_heights_with_border(fbm, patch);
+        let heights_with_border = Self::generate_heights_with_border(noise, patch);
         let heights = Self::extract_patch_heights(&heights_with_border);
         let gradients = Self::generate_gradients(&heights_with_border, patch);
 
@@ -153,22 +147,22 @@ impl PatchGenerator {
         }
     }
 
-    fn generate_heights_with_border(fbm: &Fbm<Perlin>, patch: PatchKey) -> Vec<f32> {
-        let fbm_pos = patch.terrain_origin().as_dvec2() / NOISE_WORLD_SCALE * NOISE_SCALE;
-        let fbm_size = patch.terrain_size() as f64 / NOISE_WORLD_SCALE * NOISE_SCALE;
-        let fbm_pixel_size = fbm_size / PATCH_PIXEL_SIZE as f64;
+    fn generate_heights_with_border(noise: &TerrainNoise, patch: PatchKey) -> Vec<f32> {
+        let noise_origin = patch.terrain_origin().as_dvec2() / NOISE_WORLD_SCALE * NOISE_SCALE;
+        let noise_texel = patch.terrain_size() as f64 / PATCH_PIXEL_SIZE as f64 / NOISE_WORLD_SCALE * NOISE_SCALE;
+        let octave_count = (9 - patch.lod_index as usize).min(OCTAVE_COUNT);
 
-        PlaneMapBuilder::new(fbm)
-            .set_size(ATLAS_PATCH_PIXEL_SIZE_WITH_BORDER, ATLAS_PATCH_PIXEL_SIZE_WITH_BORDER)
-            .set_x_bounds(fbm_pos.x - fbm_pixel_size, fbm_pos.x + fbm_size + fbm_pixel_size * 2.0)
-            .set_y_bounds(fbm_pos.y - fbm_pixel_size, fbm_pos.y + fbm_size + fbm_pixel_size * 2.0)
-            .build()
-            .into_iter()
-            .map(|h| {
-                let h = h as f32 * 1.15 + 0.4;
-                h.clamp(0.0, 1.0)
-            })
-            .collect()
+        let mut heights = Vec::with_capacity(ATLAS_PATCH_PIXEL_SIZE_WITH_BORDER.pow(2));
+
+        for z in 0..ATLAS_PATCH_PIXEL_SIZE_WITH_BORDER {
+            for x in 0..ATLAS_PATCH_PIXEL_SIZE_WITH_BORDER {
+                // -1 skips the border texel, so index 1 lands exactly on the patch origin.
+                let offset = DVec2::new(x as f64 - 1.0, z as f64 - 1.0) * noise_texel;
+                heights.push(noise.height(noise_origin + offset, octave_count));
+            }
+        }
+
+        heights
     }
 
     fn extract_patch_heights(heights_with_border: &[f32]) -> Vec<f32> {
@@ -218,4 +212,69 @@ impl Drop for PatchGenerator {
             let _ = worker.join();
         }
     }
+}
+
+const OCTAVE_COUNT: usize = 8;
+const PERSISTENCE: f64 = 0.5;
+const LACUNARITY: f64 = 2.0;
+const MEADOW_BIAS: f32 = 1.0; // Higher values confine mountains to fewer, more exceptional regions
+const MEADOW_RELIEF: f32 = 0.25; // Fraction of the height range that meadow terrain is allowed to use
+
+pub struct TerrainNoise {
+    octaves: Vec<Perlin>,
+    // Always normalizes by the FULL octave amplitude sum, so summing fewer
+    // octaves is a strict low-pass of the same field, not a rescaled one.
+    inv_amplitude_sum: f64,
+}
+
+impl TerrainNoise {
+    pub fn new(seed: u32) -> Self {
+        let octaves = (0..OCTAVE_COUNT).map(|i| Perlin::new(seed + i as u32)).collect();
+        let amplitude_sum: f64 = (0..OCTAVE_COUNT).map(|i| PERSISTENCE.powi(i as i32)).sum();
+
+        Self {
+            octaves,
+            inv_amplitude_sum: 1.0 / amplitude_sum,
+        }
+    }
+
+    fn fbm(&self, mut p: DVec2, octave_count: usize) -> f64 {
+        let mut result = 0.0;
+        let mut amplitude = 1.0;
+
+        for perlin in &self.octaves[..octave_count.min(OCTAVE_COUNT)] {
+            result += perlin.get(p.to_array()) * amplitude;
+            amplitude *= PERSISTENCE;
+            p *= LACUNARITY;
+        }
+
+        result * self.inv_amplitude_sum
+    }
+
+    pub fn height(&self, p: DVec2, octave_count: usize) -> f32 {
+        // Large-scale elevation: where land is generally high or low.
+        let continent = self.fbm(p * 0.25, octave_count.min(4)) as f32;
+
+        // 0 = meadow, 1 = mountain. powf leaves full peaks alone (1^k == 1) while
+        // pulling the whole transition band toward meadow.
+        let mountainness = smoothstep(0.05, 0.45, continent).powf(MEADOW_BIAS);
+
+        // Gentle rolling fields: one octave fewer than the mountains, since the
+        // doubled frequency would otherwise sit right at Nyquist.
+        let meadow = (self.fbm(p * 2.0, octave_count.saturating_sub(1)) as f32 * 0.5 + 0.5).powf(1.5) * MEADOW_RELIEF;
+
+        // |fbm| folds the field into sharp crests; squaring sharpens them further.
+        let ridge = 1.0 - self.fbm(p, octave_count).abs() as f32;
+        let mountain = ridge * ridge;
+
+        let base = (continent * 0.5 + 0.5) * 0.35;
+        let detail = (meadow + (mountain - meadow) * mountainness) * 0.65;
+
+        base + detail // [0, 1]
+    }
+}
+
+fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
+    let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
 }

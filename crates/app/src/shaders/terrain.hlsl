@@ -33,34 +33,30 @@ ConstantBuffer<TerrainConsts> consts : register(b0, space1);
 SamplerState point_clamp_sampler : register(s0, space0);
 SamplerState linear_clamp_sampler : register(s0, space1);
 
+static const uint TERRAIN_BAND_COUNT = 7;
+
+// rgb = band color, w = the height the band is centered on
+// Keep w strictly increasing
+static const float4 TERRAIN_BANDS[TERRAIN_BAND_COUNT] = {
+    float4(0.00, 0.10, 0.40, 0.120), // deep water
+    float4(0.10, 0.30, 0.60, 0.155), // shallow water
+    float4(0.76, 0.70, 0.50, 0.175), // sand
+    float4(0.20, 0.55, 0.10, 0.210), // grass
+    float4(0.10, 0.35, 0.05, 0.340), // forest
+    float4(0.50, 0.45, 0.40, 0.580), // rock
+    float4(0.90, 0.95, 1.00, 0.800), // snow
+};
+
 float3 height_to_color(float h) {
-    float3 deep_water = float3(0.0, 0.1, 0.4);
-    float3 shallow = float3(0.1, 0.3, 0.6);
-    float3 sand = float3(0.76, 0.7, 0.5);
-    float3 grass = float3(0.2, 0.55, 0.1);
-    float3 forest = float3(0.1, 0.35, 0.05);
-    float3 rock = float3(0.5, 0.45, 0.4);
-    float3 snow = float3(0.9, 0.95, 1.0);
+    float3 color = TERRAIN_BANDS[0].rgb;
 
-    if (h < 0.20)
-        return lerp(deep_water, shallow, h / 0.2);
+    [unroll]
+    for (uint i = 1; i < TERRAIN_BAND_COUNT; ++i) {
+        const float t = smoothstep(TERRAIN_BANDS[i - 1].w, TERRAIN_BANDS[i].w, h);
+        color = lerp(color, TERRAIN_BANDS[i].rgb, t);
+    }
 
-    if (h < 0.25)
-        return lerp(shallow, sand, (h - 0.20) / 0.05);
-
-    if (h < 0.35)
-        return lerp(sand, grass, (h - 0.25) / 0.10);
-
-    if (h < 0.55)
-        return lerp(grass, forest, (h - 0.35) / 0.20);
-
-    if (h < 0.70)
-        return lerp(forest, rock, (h - 0.55) / 0.15);
-
-    if (h < 0.85)
-        return lerp(rock, snow, (h - 0.70) / 0.15);
-
-    return snow;
+    return color;
 }
 
 static const uint HEIGHT_ATLAS_INDEX = 1;

@@ -229,7 +229,7 @@ impl Terrain {
             render_distance,
             lod_factor: 3.5,
 
-            height_scale: 120.0,
+            height_scale: 400.0,
             morph_start_ratio: 0.7,
 
             solid_mode: true,
