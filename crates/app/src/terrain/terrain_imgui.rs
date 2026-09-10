@@ -1,11 +1,11 @@
 use std::ptr::null_mut;
 
-use glam::{IVec2, Vec2, Vec3, Vec3Swizzles};
+use glam::{Vec2, Vec3, Vec3Swizzles};
 use imgui_sys::*;
 
+use super::cache::Cache;
 use super::config::{PATCH_LOD_COUNT, PATCH_SIZE_IN_METERS, WORLD_SIZE_IN_METERS};
-use super::patch_cache::PatchCache;
-use super::patch_quad_tree::PatchQuadTree;
+use super::quad_tree::QuadTree;
 use crate::d3d12_utils::DescriptorHeap;
 use crate::terrain::Terrain;
 use crate::{GpuResource, imgui_text};
@@ -16,7 +16,7 @@ impl Terrain {
             ImGui_Begin(c"Terrain".as_ptr(), null_mut(), 0);
 
             if ImGui_Button(c"Clear cache".as_ptr()) {
-                self.patch_cache = PatchCache::new();
+                self.cache = Cache::new();
             }
 
             ImGui_NewLine();
@@ -44,7 +44,7 @@ impl Terrain {
 
             ImGui_End();
 
-            self.patch_cache
+            self.cache
                 .render_imgui(descriptor_heap.get_gpu_handle(GpuResource::TerrainHeightAtlas as u32));
 
             self.render_imgui_qtree(camera_pos, camera_forward)
@@ -59,9 +59,6 @@ impl Terrain {
                 self.minimap_offset = Vec2::ZERO;
                 self.minimap_zoom = 1.0;
             }
-
-            ImGui_SameLine();
-            ImGui_Checkbox(c"Morph range".as_ptr(), &mut self.minimap_display_morph_range);
 
             let minimap_pos = Vec2::new(ImGui_GetCursorScreenPos().x, ImGui_GetCursorScreenPos().y);
             let minimap_size = {
@@ -109,8 +106,8 @@ impl Terrain {
             let draw_list = ImGui_GetWindowDrawList();
 
             for patch in &self.patches_to_render {
-                let minimap_leaf_pos = minimap_center + patch.terrain_origin().as_vec2() * minimap_scale;
-                let minimap_leaf_size = patch.terrain_size() as f32 * minimap_scale;
+                let minimap_leaf_pos = minimap_center + patch.world_origin() * minimap_scale;
+                let minimap_leaf_size = patch.size_in_meters() as f32 * minimap_scale;
 
                 ImDrawList_AddRectEx(
                     draw_list,
@@ -128,7 +125,7 @@ impl Terrain {
                     0.5,
                 );
 
-                let label = std::ffi::CString::new(patch.lod_index.to_string()).unwrap();
+                let label = std::ffi::CString::new(patch.lod.to_string()).unwrap();
                 let label_size = ImGui_CalcTextSize(label.as_ptr());
 
                 if label_size.x >= minimap_leaf_size || label_size.y >= minimap_leaf_size {
@@ -174,75 +171,26 @@ impl Terrain {
                 camera_color,
             );
 
-            let start = self
-                .patches_to_render
-                .iter()
-                .map(|p| p.terrain_origin())
-                .fold(IVec2::MAX, |acc, p| acc.min(p));
-            let end = self
-                .patches_to_render
-                .iter()
-                .map(|p| p.terrain_origin() + p.terrain_size() as i32)
-                .fold(IVec2::MIN, |acc, p| acc.max(p));
+            let minimap_freezed_camera_pos = minimap_center + self.camera_pos.xz() * minimap_scale;
 
-            let corners = [
-                (minimap_pos, format!("X={:.0} Z={:.0}", start.x, start.y)),
-                (
-                    minimap_pos + Vec2::new(minimap_size, 0.0),
-                    format!("X={:.0} Z={:.0}", end.x, start.y),
-                ),
-                (
-                    minimap_pos + Vec2::new(0.0, minimap_size),
-                    format!("X={:.0} Z={:.0}", start.x, end.y),
-                ),
-                (
-                    minimap_pos + Vec2::new(minimap_size, minimap_size),
-                    format!("X={:.0} Z={:.0}", end.x, end.y),
-                ),
-            ];
+            for lod_index in 1..PATCH_LOD_COUNT {
+                let split_distance = QuadTree::split_distance(lod_index, self.lod_factor);
 
-            let padding = 4.0;
-            for (corner, label) in &corners {
-                let text = std::ffi::CString::new(label.as_str()).unwrap();
-                let text_size = ImGui_CalcTextSize(text.as_ptr());
-
-                let x = if corner.x == minimap_pos.x {
-                    corner.x + padding
-                } else {
-                    corner.x - text_size.x - padding
+                let center = ImVec2 {
+                    x: minimap_freezed_camera_pos.x,
+                    y: minimap_freezed_camera_pos.y,
                 };
+                let color = get_lod_color(lod_index - 1);
+                let segment_count = 40;
 
-                let y = if corner.y == minimap_pos.y {
-                    corner.y + padding
-                } else {
-                    corner.y - text_size.y - padding
-                };
-
-                ImDrawList_AddText(draw_list, ImVec2 { x, y }, 0xFFFFFFFF, text.as_ptr());
-            }
-
-            if self.minimap_display_morph_range {
-                let minimap_freezed_camera_pos = minimap_center + self.camera_pos * minimap_scale;
-
-                for lod_index in 1..PATCH_LOD_COUNT {
-                    let split_distance = PatchQuadTree::split_distance(lod_index, self.lod_factor);
-
-                    let center = ImVec2 {
-                        x: minimap_freezed_camera_pos.x,
-                        y: minimap_freezed_camera_pos.y,
-                    };
-                    let color = get_lod_color(lod_index - 1);
-                    let segment_count = 40;
-
-                    ImDrawList_AddCircleEx(
-                        draw_list,
-                        center,
-                        split_distance * minimap_scale,
-                        im_color32(color, 0xff),
-                        segment_count,
-                        2.0,
-                    );
-                }
+                ImDrawList_AddCircleEx(
+                    draw_list,
+                    center,
+                    split_distance * minimap_scale,
+                    im_color32(color, 0xff),
+                    segment_count,
+                    2.0,
+                );
             }
 
             ImGui_End();

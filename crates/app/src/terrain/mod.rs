@@ -1,10 +1,10 @@
+mod cache;
 mod config;
+mod generator;
 mod gpu_types;
 mod patch;
-mod patch_cache;
-mod patch_generator;
-mod patch_quad_tree;
-mod patch_queue;
+mod quad_tree;
+mod queue;
 mod terrain_imgui;
 mod texture_atlas;
 
@@ -17,12 +17,12 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use crate::camera::Camera;
 use crate::d3d12_utils::*;
 use crate::{BACK_BUFFER_FORMAT, DEPTH_BUFFER_FORMAT, FRAME_COUNT, GpuResource};
+use cache::{Cache, PatchUpload};
 use config::*;
+use generator::{Generator, WantedPatch};
 use gpu_types::{GpuTerrainConsts, GpuTerrainPatch};
 use patch::PatchKey;
-use patch_cache::{PatchCache, PatchUpload};
-use patch_generator::{PatchGenerator, WantedPatch};
-use patch_quad_tree::PatchQuadTree;
+use quad_tree::QuadTree;
 use texture_atlas::TextureAtlas;
 
 pub struct Terrain {
@@ -36,11 +36,12 @@ pub struct Terrain {
     elapsed_time: f32,
 
     freeze_camera: bool,
-    camera_pos: Vec2,
+    camera_pos: Vec3,
     camera_forward: Vec2,
 
-    patch_generator: PatchGenerator,
-    patch_cache: PatchCache,
+    quad_tree: QuadTree,
+    generator: Generator,
+    cache: Cache,
     patches_to_upload: Vec<PatchUpload>,
     patches_to_render: Vec<PatchKey>,
 
@@ -62,7 +63,6 @@ pub struct Terrain {
     // Debug
     minimap_offset: Vec2,
     minimap_zoom: f32,
-    minimap_display_morph_range: bool,
 }
 
 impl Terrain {
@@ -232,11 +232,12 @@ impl Terrain {
             elapsed_time: 0.0,
 
             freeze_camera: false,
-            camera_pos: Vec2::ZERO,
-            camera_forward: Vec2::Y,
+            camera_pos: Vec3::ZERO,
+            camera_forward: Vec2::ZERO,
 
-            patch_generator: PatchGenerator::new(),
-            patch_cache: PatchCache::new(),
+            quad_tree: QuadTree::new(),
+            generator: Generator::new(),
+            cache: Cache::new(),
             patches_to_upload: Vec::new(),
             patches_to_render: Vec::new(),
 
@@ -266,13 +267,12 @@ impl Terrain {
 
             minimap_offset: Vec2::ZERO,
             minimap_zoom: 1.0,
-            minimap_display_morph_range: true,
         })
     }
 
     pub fn update_camera(&mut self, camera_pos: &Vec3, camera_forward: &Vec3, dt: f32) {
         if !self.freeze_camera {
-            self.camera_pos = camera_pos.xz();
+            self.camera_pos = *camera_pos;
             self.camera_forward = camera_forward.xz().normalize_or_zero();
         }
 
@@ -284,21 +284,21 @@ impl Terrain {
     pub fn update(&mut self, cpu_frame_index: u64, gpu_frame_index: u64, active_frame_index: u32) {
         self.collect_generated_patches();
 
-        let qtree = PatchQuadTree::build(self.camera_pos, self.lod_factor);
-        // It's better to update the cache states before calling 'select' to avoid one-frame delay
-        let selection = qtree.select(&self.patch_cache);
+        let selection = self
+            .quad_tree
+            .select(self.camera_pos, self.height_scale, self.lod_factor, &self.cache);
 
-        self.patch_generator
+        self.generator
             .update_wanted_patches(selection.missing.into_iter().map(|missing| {
                 WantedPatch::new(
                     missing.patch,
                     missing.coverage_required,
-                    self.camera_pos,
+                    self.camera_pos.xz(),
                     self.camera_forward,
                 )
             }));
 
-        let uploads = self.patch_cache.update(
+        let uploads = self.cache.update(
             cpu_frame_index,
             gpu_frame_index,
             selection.renderable.iter().chain(&selection.retained),
@@ -377,8 +377,10 @@ impl Terrain {
     }
 
     fn collect_generated_patches(&mut self) {
-        for generated in self.patch_generator.drain_generated() {
-            self.patch_cache.insert_generated(generated);
+        for generated in self.generator.drain_generated() {
+            self.quad_tree
+                .set_height_range(&generated.patch, generated.data.height_range);
+            self.cache.insert_generated(generated);
         }
     }
 
@@ -387,12 +389,13 @@ impl Terrain {
             .patches_to_render
             .iter()
             .map(|patch| GpuTerrainPatch {
-                grid_index: patch.grid_index,
-                lod_index: patch.lod_index,
                 atlas_slot: self
-                    .patch_cache
+                    .cache
                     .atlas_slot(patch)
                     .unwrap_or_else(|| panic!("renderable patch {:?} must be resident in the cache", patch)),
+                x: patch.x,
+                z: patch.z,
+                lod: patch.lod,
             })
             .collect();
 

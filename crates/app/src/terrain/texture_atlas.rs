@@ -96,20 +96,22 @@ impl<T> TextureAtlas<T> {
     }
 
     pub fn copy_to(&self, cmd_list: &ID3D12GraphicsCommandList, active_frame_index: u32, slot: AtlasSlot, data: &[T]) {
+        let patch_size = ATLAS_PATCH_SIZE_IN_PIXELS as usize;
+
         let row_pitch = self.gpu_layout.Footprint.RowPitch as usize;
         let texel_size = size_of::<T>();
 
         let frame_offset = active_frame_index as usize * self.gpu_size as usize;
-        let patch_offset = slot.coords().y as usize * ATLAS_PATCH_SIZE_IN_PIXELS * row_pitch
-            + slot.coords().x as usize * ATLAS_PATCH_SIZE_IN_PIXELS * texel_size;
+        let patch_offset =
+            slot.coords().y as usize * patch_size * row_pitch + slot.coords().x as usize * patch_size * texel_size;
         let dst_patch_base = frame_offset + patch_offset;
 
-        for row in 0..ATLAS_PATCH_SIZE_IN_PIXELS {
+        for row in 0..patch_size {
             unsafe {
-                let src = data.as_ptr().add(row * ATLAS_PATCH_SIZE_IN_PIXELS);
+                let src = data.as_ptr().add(row * patch_size);
                 let dst = self.mapped_ptr.byte_add(dst_patch_base + row * row_pitch);
 
-                std::ptr::copy_nonoverlapping(src, dst, ATLAS_PATCH_SIZE_IN_PIXELS);
+                std::ptr::copy_nonoverlapping(src, dst, patch_size);
             }
         }
 

@@ -23,9 +23,10 @@ struct TerrainConsts {
 };
 
 struct TerrainPatch {
-    int2 grid_index;
     uint2 atlas_slot;
-    uint lod_index;
+    uint x;
+    uint z;
+    uint lod;
 };
 
 ConstantBuffer<TerrainConsts> consts : register(b0, space1);
@@ -63,17 +64,20 @@ static const uint HEIGHT_ATLAS_INDEX = 1;
 static const uint GRADIENT_ATLAS_INDEX = 2;
 static const uint PATCH_INDEX_BUFFER_INDEX = 3;
 
-static const uint PATCH_LOD_COUNT = 8; // must match config.rs
+static const uint PATCH_LOD_COUNT = 10; // must match config.rs
 static const uint PATCH_SIZE_IN_METERS = 64;
 static const uint PATCH_SIZE_IN_PIXELS = PATCH_SIZE_IN_METERS * 2;
+static const uint PATCH_COUNT_PER_SIDE = 1 << (PATCH_LOD_COUNT - 1);
+static const uint WORLD_SIZE_IN_METERS = PATCH_SIZE_IN_METERS * PATCH_COUNT_PER_SIDE;
+
 static const uint PATCH_QUAD_COUNT = PATCH_SIZE_IN_PIXELS;
 static const uint PATCH_VERTEX_COUNT = (PATCH_QUAD_COUNT + 1) * (PATCH_QUAD_COUNT + 1);
 static const uint PATCH_TRIANGLE_COUNT = PATCH_QUAD_COUNT * PATCH_QUAD_COUNT * 2;
 
 static const uint ATLAS_PATCH_SIZE_IN_PIXELS = PATCH_SIZE_IN_PIXELS + 1; // for pixel overlap
 
-float3 get_lod_color(uint lod_index) {
-    switch (lod_index % PATCH_LOD_COUNT) {
+float3 get_lod_color(uint lod) {
+    switch (lod % PATCH_LOD_COUNT) {
         case 0:
             return float3(0.10, 0.80, 0.20); // green
         case 1:
@@ -96,9 +100,8 @@ float3 get_lod_color(uint lod_index) {
 }
 
 float3 patch_color(TerrainPatch patch) {
-    const float3 lod_color = get_lod_color(patch.lod_index);
-    const int2 lod_grid_index = patch.grid_index >> patch.lod_index;
-    const bool is_odd_patch = ((lod_grid_index.x + lod_grid_index.y) & 1) != 0;
+    const float3 lod_color = get_lod_color(patch.lod);
+    const bool is_odd_patch = ((patch.x + patch.z) & 1) != 0;
     const float checker_factor = is_odd_patch ? 1.1 : 0.8;
 
     return saturate(lod_color * checker_factor);
@@ -110,20 +113,19 @@ VsOutput process_vertex(uint vertex_id, uint instance_id) {
     const Texture2D<float2> gradient_atlas = ResourceDescriptorHeap[GRADIENT_ATLAS_INDEX];
 
     const TerrainPatch patch = patches[instance_id];
-
-    uint ix = vertex_id % (PATCH_QUAD_COUNT + 1);
-    uint iz = vertex_id / (PATCH_QUAD_COUNT + 1);
+    const uint ix = vertex_id % (PATCH_QUAD_COUNT + 1);
+    const uint iz = vertex_id / (PATCH_QUAD_COUNT + 1);
 
     const float2 uv = float2(ix, iz) / (float)PATCH_QUAD_COUNT; // 0..1
-    const float terrain_size = PATCH_SIZE_IN_METERS * 1 << patch.lod_index;
-    const float2 terrain_xz = patch.grid_index * (int)PATCH_SIZE_IN_METERS + terrain_size * uv;
+    const float size_in_meters = PATCH_SIZE_IN_METERS * (1 << patch.lod);
+    const float world_x = patch.x * size_in_meters - WORLD_SIZE_IN_METERS * 0.5 + uv.x * size_in_meters;
+    const float world_z = patch.z * size_in_meters - WORLD_SIZE_IN_METERS * 0.5 + uv.y * size_in_meters;
 
     const uint2 atlas_texel_pos = patch.atlas_slot * ATLAS_PATCH_SIZE_IN_PIXELS + uint2(ix, iz);
     const float height = height_atlas[atlas_texel_pos];
     const float2 gradient = gradient_atlas[atlas_texel_pos];
 
-    // Terrain XZ is world XZ: one terrain unit is one world unit.
-    const float3 world_pos = float3(terrain_xz.x, height * consts.height_scale, terrain_xz.y);
+    const float3 world_pos = float3(world_x, height * consts.height_scale, world_z);
 
     const float slope_scale = consts.height_scale;
     const float3 normal = normalize(float3(-gradient.x * slope_scale, 1.0, -gradient.y * slope_scale));

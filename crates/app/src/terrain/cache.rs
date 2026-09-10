@@ -4,8 +4,8 @@ use imgui_sys::*;
 use windows::Win32::Graphics::Direct3D12::D3D12_GPU_DESCRIPTOR_HANDLE;
 
 use super::config::ATLAS_PATCH_COUNT_PER_SIDE;
+use super::generator::GeneratedPatch;
 use super::patch::{PatchData, PatchKey};
-use super::patch_generator::GeneratedPatch;
 use super::texture_atlas::AtlasSlot;
 
 pub struct PatchUpload {
@@ -20,12 +20,12 @@ pub enum PatchAvailability {
     Resident,
 }
 
-pub struct PatchCache {
-    entries: HashMap<PatchKey, CacheEntry>,
+pub struct Cache {
+    entries: HashMap<PatchKey, Entry>,
     available_atlas_slots: Vec<AtlasSlot>,
 }
 
-impl PatchCache {
+impl Cache {
     pub fn new() -> Self {
         Self {
             entries: HashMap::new(),
@@ -65,7 +65,7 @@ impl PatchCache {
     pub fn insert_generated(&mut self, generated: GeneratedPatch) {
         self.entries.insert(
             generated.patch,
-            CacheEntry {
+            Entry {
                 state: PatchState::Generated(generated.data),
                 last_needed_frame: 0,
             },
@@ -193,7 +193,7 @@ impl PatchCache {
             a.last_needed_frame
                 .cmp(&b.last_needed_frame)
                 // Smaller LOD index is finer, so evict finer patches first
-                .then_with(|| a.patch.lod_index.cmp(&b.patch.lod_index))
+                .then_with(|| a.patch.lod.cmp(&b.patch.lod))
         });
 
         for candidate in candidates.into_iter().take(slots_to_free) {
@@ -243,7 +243,7 @@ impl PatchCache {
     }
 }
 
-struct CacheEntry {
+struct Entry {
     state: PatchState,
     last_needed_frame: u64,
 }

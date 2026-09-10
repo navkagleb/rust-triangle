@@ -1,12 +1,13 @@
-use glam::{IVec2, Mat4};
+use glam::Mat4;
 
 use super::texture_atlas::AtlasSlot;
 
 #[repr(C)]
 pub struct GpuTerrainPatch {
-    pub grid_index: IVec2,
     pub atlas_slot: AtlasSlot,
-    pub lod_index: u32,
+    pub x: u32,
+    pub z: u32,
+    pub lod: u32,
 }
 
 #[repr(C)]

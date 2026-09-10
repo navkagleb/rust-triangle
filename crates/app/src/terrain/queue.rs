@@ -2,18 +2,18 @@ use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashSet};
 use std::sync::{Condvar, Mutex};
 
+use super::generator::{PatchPriority, WantedPatch};
 use super::patch::PatchKey;
-use super::patch_generator::{PatchPriority, WantedPatch};
 
-pub struct PatchQueue {
-    state: Mutex<QueueState>,
+pub struct Queue {
+    state: Mutex<State>,
     available: Condvar,
 }
 
-impl PatchQueue {
+impl Queue {
     pub fn new() -> Self {
         Self {
-            state: Mutex::new(QueueState {
+            state: Mutex::new(State {
                 pending: BinaryHeap::new(),
                 in_flight: HashSet::new(),
                 wanted: HashSet::new(),
@@ -44,7 +44,7 @@ impl PatchQueue {
                     continue;
                 }
 
-                state.pending.push(QueueEntry {
+                state.pending.push(Entry {
                     patch: wanted.patch,
                     priority: wanted.priority,
                 });
@@ -97,33 +97,33 @@ impl PatchQueue {
     }
 }
 
-struct QueueState {
-    pending: BinaryHeap<QueueEntry>,
+struct State {
+    pending: BinaryHeap<Entry>,
     in_flight: HashSet<PatchKey>,
     wanted: HashSet<PatchKey>,
     shutdown: bool,
 }
 
-struct QueueEntry {
+struct Entry {
     patch: PatchKey,
     priority: PatchPriority,
 }
 
-impl PartialEq for QueueEntry {
+impl PartialEq for Entry {
     fn eq(&self, other: &Self) -> bool {
         self.priority == other.priority
     }
 }
 
-impl Eq for QueueEntry {}
+impl Eq for Entry {}
 
-impl PartialOrd for QueueEntry {
+impl PartialOrd for Entry {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl Ord for QueueEntry {
+impl Ord for Entry {
     fn cmp(&self, other: &Self) -> Ordering {
         self.priority.cmp(&other.priority)
     }

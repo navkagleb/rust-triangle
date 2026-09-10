@@ -1,35 +1,32 @@
-use glam::{IVec2, Vec2};
+use glam::Vec2;
 
-use super::config::PATCH_SIZE_IN_METERS;
+use super::config::{PATCH_SIZE_IN_METERS, WORLD_SIZE_IN_METERS};
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct PatchKey {
-    pub grid_index: IVec2,
-    pub lod_index: u32,
+    pub x: u32,
+    pub z: u32,
+    pub lod: u32,
 }
 
 impl PatchKey {
-    pub fn terrain_origin(&self) -> IVec2 {
-        self.grid_index * PATCH_SIZE_IN_METERS as i32
+    pub fn new(x: u32, z: u32, lod: u32) -> Self {
+        Self { x, z, lod }
     }
 
-    pub fn terrain_size(&self) -> u32 {
-        Self::terrain_size_for_lod(self.lod_index)
+    pub fn world_origin(&self) -> Vec2 {
+        let size = self.size_in_meters() as f32;
+        let half_world = (WORLD_SIZE_IN_METERS / 2) as f32;
+
+        Vec2::new(self.x as f32, self.z as f32) * size - half_world
     }
 
-    pub fn terrain_size_for_lod(lod_index: u32) -> u32 {
-        PATCH_SIZE_IN_METERS * 2_u32.pow(lod_index)
+    pub fn size_in_meters(&self) -> u32 {
+        PATCH_SIZE_IN_METERS * (1 << self.lod)
     }
 
-    pub fn terrain_center(&self) -> IVec2 {
-        self.terrain_origin() + self.terrain_size() as i32 / 2
-    }
-
-    pub fn closest_point(&self, point: Vec2) -> Vec2 {
-        let origin = self.terrain_origin().as_vec2();
-        let size = self.terrain_size() as f32;
-
-        point.clamp(origin, origin + size)
+    pub fn world_center(&self) -> Vec2 {
+        self.world_origin() + self.size_in_meters() as f32 * 0.5
     }
 }
 
@@ -37,4 +34,5 @@ impl PatchKey {
 pub struct PatchData {
     pub heights: Vec<f32>,
     pub gradients: Vec<Vec2>,
+    pub height_range: Vec2,
 }

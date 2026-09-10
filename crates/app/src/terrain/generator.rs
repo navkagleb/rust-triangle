@@ -10,12 +10,12 @@ use super::config::{
     PATCH_WORKER_COUNT,
 };
 use super::patch::{PatchData, PatchKey};
-use super::patch_queue::PatchQueue;
+use super::queue::Queue;
 
 #[derive(Copy, Clone)]
 pub struct PatchPriority {
     coverage_required: bool,
-    lod_index: u32,
+    lod: u32,
     distance_squared: f32,
     view_alignment: f32,
 }
@@ -23,7 +23,7 @@ pub struct PatchPriority {
 impl PartialEq for PatchPriority {
     fn eq(&self, other: &Self) -> bool {
         self.coverage_required == other.coverage_required
-            && self.lod_index == other.lod_index
+            && self.lod == other.lod
             && self.distance_squared == other.distance_squared
             && self.view_alignment == other.view_alignment
     }
@@ -42,7 +42,7 @@ impl Ord for PatchPriority {
         self.coverage_required
             .cmp(&other.coverage_required)
             // Larger LOD means higher priority.
-            .then_with(|| self.lod_index.cmp(&other.lod_index))
+            .then_with(|| self.lod.cmp(&other.lod))
             // Larger alignment means higher priority.
             .then_with(|| self.view_alignment.total_cmp(&other.view_alignment))
             // Smaller distance means higher priority.
@@ -57,7 +57,7 @@ pub struct WantedPatch {
 
 impl WantedPatch {
     pub fn new(patch: PatchKey, coverage_required: bool, camera_pos: Vec2, camera_forward: Vec2) -> Self {
-        let patch_center = patch.terrain_center().as_vec2();
+        let patch_center = patch.world_center();
         let offset = patch_center - camera_pos;
         let view_alignment = if offset.length_squared() >= 0.0001 {
             camera_forward.dot(offset.normalize()).clamp(-1.0, 1.0)
@@ -69,7 +69,7 @@ impl WantedPatch {
             patch,
             priority: PatchPriority {
                 coverage_required,
-                lod_index: patch.lod_index,
+                lod: patch.lod,
                 distance_squared: offset.length_squared(),
                 view_alignment,
             },
@@ -82,22 +82,22 @@ pub struct GeneratedPatch {
     pub data: PatchData,
 }
 
-pub struct PatchGenerator {
+pub struct Generator {
     workers: Vec<std::thread::JoinHandle<()>>,
-    queue: Arc<PatchQueue>,
+    queue: Arc<Queue>,
     completed_receiver: std::sync::mpsc::Receiver<GeneratedPatch>,
 }
 
-impl PatchGenerator {
+impl Generator {
     pub fn new() -> Self {
         let noise = Arc::new(
             Fbm::<Perlin>::new(123)
-                .set_octaves(8)
+                .set_octaves(12)
                 .set_frequency(1.0)
                 .set_lacunarity(2.0)
                 .set_persistence(0.5),
         );
-        let queue = Arc::new(PatchQueue::new());
+        let queue = Arc::new(Queue::new());
         let (completed_sender, completed_receiver) = std::sync::mpsc::channel::<GeneratedPatch>();
 
         let workers = (0..PATCH_WORKER_COUNT)
@@ -150,10 +150,10 @@ impl PatchGenerator {
             });
 
         println!(
-            "Generated: index=[{:4}, {:4}], size={:4}, height=[{:.3}, {:.3}] ({:.2} ms)",
-            patch.grid_index.x,
-            patch.grid_index.y,
-            patch.terrain_size(),
+            "Generated: patch_key=[{:2}, {:3}, {:3}], height=[{:.3}, {:.3}] ({:.2} ms)",
+            patch.lod,
+            patch.x,
+            patch.z,
             min_height,
             max_height,
             instant.elapsed().as_secs_f32() * 1000.0
@@ -161,18 +161,22 @@ impl PatchGenerator {
 
         GeneratedPatch {
             patch,
-            data: PatchData { heights, gradients },
+            data: PatchData {
+                heights,
+                gradients,
+                height_range: Vec2::new(min_height, max_height),
+            },
         }
     }
 
     fn generate_heights_with_border(noise: &Fbm<Perlin>, patch: PatchKey) -> Vec<f32> {
-        let noise_origin = patch.terrain_origin().as_dvec2() / NOISE_WORLD_SCALE;
-        let noise_texel = patch.terrain_size() as f64 / PATCH_SIZE_IN_PIXELS as f64 / NOISE_WORLD_SCALE;
+        let noise_origin = patch.world_origin().as_dvec2() / NOISE_WORLD_SCALE;
+        let noise_texel = patch.size_in_meters() as f64 / PATCH_SIZE_IN_PIXELS as f64 / NOISE_WORLD_SCALE;
 
         PlaneMapBuilder::new(noise)
             .set_size(
-                ATLAS_PATCH_SIZE_IN_PIXELS_WITH_BORDER,
-                ATLAS_PATCH_SIZE_IN_PIXELS_WITH_BORDER,
+                ATLAS_PATCH_SIZE_IN_PIXELS_WITH_BORDER as usize,
+                ATLAS_PATCH_SIZE_IN_PIXELS_WITH_BORDER as usize,
             )
             .set_x_bounds(
                 noise_origin.x - noise_texel,
@@ -189,12 +193,14 @@ impl PatchGenerator {
     }
 
     fn extract_patch_heights(heights_with_border: &[f32]) -> Vec<f32> {
-        let mut heights = vec![0.0; ATLAS_PATCH_SIZE_IN_PIXELS.pow(2)];
+        let patch_size = ATLAS_PATCH_SIZE_IN_PIXELS as usize;
+        let patch_size_with_border = ATLAS_PATCH_SIZE_IN_PIXELS_WITH_BORDER as usize;
 
-        for z in 0..ATLAS_PATCH_SIZE_IN_PIXELS {
-            for x in 0..ATLAS_PATCH_SIZE_IN_PIXELS {
-                heights[z * ATLAS_PATCH_SIZE_IN_PIXELS + x] =
-                    heights_with_border[(z + 1) * ATLAS_PATCH_SIZE_IN_PIXELS_WITH_BORDER + (x + 1)];
+        let mut heights = vec![0.0; patch_size.pow(2)];
+
+        for z in 0..patch_size {
+            for x in 0..patch_size {
+                heights[z * patch_size + x] = heights_with_border[(z + 1) * patch_size_with_border + (x + 1)];
             }
         }
 
@@ -202,24 +208,26 @@ impl PatchGenerator {
     }
 
     fn generate_gradients(heights_with_border: &[f32], patch: PatchKey) -> Vec<Vec2> {
-        let texel_terrain_size = patch.terrain_size() as f32 / PATCH_SIZE_IN_PIXELS as f32;
+        let patch_size = ATLAS_PATCH_SIZE_IN_PIXELS as usize;
+        let patch_size_with_border = ATLAS_PATCH_SIZE_IN_PIXELS_WITH_BORDER as usize;
+        let noise_world_size = patch.size_in_meters() as f32 / PATCH_SIZE_IN_PIXELS as f32; // TODO: Name
 
-        let mut gradients = vec![Vec2::ZERO; ATLAS_PATCH_SIZE_IN_PIXELS.pow(2)];
+        let mut gradients = vec![Vec2::ZERO; patch_size.pow(2)];
 
-        for z in 0..ATLAS_PATCH_SIZE_IN_PIXELS {
-            for x in 0..ATLAS_PATCH_SIZE_IN_PIXELS {
+        for z in 0..patch_size {
+            for x in 0..patch_size {
                 let sx = x + 1;
                 let sz = z + 1;
 
-                let hl = heights_with_border[sz * ATLAS_PATCH_SIZE_IN_PIXELS_WITH_BORDER + (sx - 1)];
-                let hr = heights_with_border[sz * ATLAS_PATCH_SIZE_IN_PIXELS_WITH_BORDER + (sx + 1)];
-                let hb = heights_with_border[(sz - 1) * ATLAS_PATCH_SIZE_IN_PIXELS_WITH_BORDER + sx];
-                let ht = heights_with_border[(sz + 1) * ATLAS_PATCH_SIZE_IN_PIXELS_WITH_BORDER + sx];
+                let hl = heights_with_border[sz * patch_size_with_border + (sx - 1)];
+                let hr = heights_with_border[sz * patch_size_with_border + (sx + 1)];
+                let hb = heights_with_border[(sz - 1) * patch_size_with_border + sx];
+                let ht = heights_with_border[(sz + 1) * patch_size_with_border + sx];
 
-                let dhdx = (hl - hr) / (2.0 * texel_terrain_size);
-                let dhdz = (hb - ht) / (2.0 * texel_terrain_size);
+                let dhdx = (hl - hr) / (2.0 * noise_world_size);
+                let dhdz = (hb - ht) / (2.0 * noise_world_size);
 
-                gradients[z * ATLAS_PATCH_SIZE_IN_PIXELS + x] = Vec2::new(dhdx, dhdz);
+                gradients[z * patch_size + x] = Vec2::new(dhdx, dhdz);
             }
         }
 
@@ -227,7 +235,7 @@ impl PatchGenerator {
     }
 }
 
-impl Drop for PatchGenerator {
+impl Drop for Generator {
     fn drop(&mut self) {
         self.queue.shutdown();
 
