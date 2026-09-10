@@ -3,7 +3,7 @@ use std::ptr::null_mut;
 use glam::{IVec2, Vec2, Vec3, Vec3Swizzles};
 use imgui_sys::*;
 
-use super::config::{PATCH_LOD_COUNT, PATCH_TERRAIN_SIZE};
+use super::config::{PATCH_LOD_COUNT, PATCH_SIZE_IN_METERS, WORLD_SIZE_IN_METERS};
 use super::patch_cache::PatchCache;
 use super::patch_quad_tree::PatchQuadTree;
 use crate::d3d12_utils::DescriptorHeap;
@@ -20,7 +20,14 @@ impl Terrain {
             }
 
             ImGui_NewLine();
-            ImGui_InputInt(c"Render distance".as_ptr(), &mut self.render_distance as *mut u32 as _);
+            imgui_text!("World size: {}", WORLD_SIZE_IN_METERS);
+
+            for lod in 0..PATCH_LOD_COUNT {
+                let lod_size_in_meters = PATCH_SIZE_IN_METERS * (1 << lod);
+                imgui_text!("LOD {} size: {}", lod, lod_size_in_meters);
+            }
+
+            ImGui_NewLine();
             ImGui_InputFloat(c"LOD factor".as_ptr(), &mut self.lod_factor);
             ImGui_InputFloat(c"Height scale".as_ptr(), &mut self.height_scale);
             ImGui_SliderFloat(c"Morph start ratio".as_ptr(), &mut self.morph_start_ratio, 0.0, 1.0);
@@ -33,11 +40,6 @@ impl Terrain {
             ImGui_Checkbox(c"Pause sun animation".as_ptr(), &mut self.pause_sun_animation);
 
             ImGui_NewLine();
-
-            let render_count = (self.render_distance * 2) / PATCH_TERRAIN_SIZE;
-            imgui_text!("Max render side patches: {}", render_count);
-            imgui_text!("Max render squared patches: {}", render_count.pow(2));
-
             imgui_text!("Patches to upload: {}", self.patches_to_upload.len());
             imgui_text!("Patches to render: {}", self.patches_to_render.len());
 
@@ -61,9 +63,6 @@ impl Terrain {
 
             ImGui_SameLine();
             ImGui_Checkbox(c"Morph range".as_ptr(), &mut self.minimap_display_morph_range);
-
-            ImGui_SameLine();
-            imgui_text!("Render distance: {:.2}", self.render_distance);
 
             let minimap_pos = Vec2::new(ImGui_GetCursorScreenPos().x, ImGui_GetCursorScreenPos().y);
             let minimap_size = {
@@ -103,7 +102,7 @@ impl Terrain {
             }
 
             let minimap_center = minimap_pos + minimap_size * 0.5 + self.minimap_offset;
-            let minimap_scale = minimap_size / (self.render_distance as f32 * 2.0) * self.minimap_zoom;
+            let minimap_scale = minimap_size / WORLD_SIZE_IN_METERS as f32 * self.minimap_zoom;
 
             let draw_list = ImGui_GetWindowDrawList();
 
@@ -282,6 +281,8 @@ fn get_lod_color(lod_index: u32) -> Vec3 {
         3 => Vec3::new(1.00, 0.30, 0.10), // orange
         4 => Vec3::new(0.75, 0.20, 1.00), // purple
         5 => Vec3::new(0.10, 0.90, 0.90), // cyan
+        6 => Vec3::new(1.00, 0.40, 0.70), // pink
+        7 => Vec3::new(0.60, 0.60, 0.60), // grey
         _ => Vec3::ZERO,
     }
 }

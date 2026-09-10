@@ -3,7 +3,7 @@ use glam::UVec2;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
-use super::config::{ATLAS_PATCH_PIXEL_SIZE, ATLAS_SIZE};
+use super::config::{ATLAS_PATCH_SIZE_IN_PIXELS, ATLAS_SIZE_IN_PIXELS_PER_SIDE};
 use crate::FRAME_COUNT;
 use crate::d3d12_utils::{D3D12BufferExt, D3D12TextureExt, InterfaceExt};
 
@@ -37,7 +37,13 @@ impl<T> TextureAtlas<T> {
         format: DXGI_FORMAT,
         debug_name: &str,
     ) -> Result<TextureAtlas<T>> {
-        let texture = ID3D12Resource::new_texture_2d(device, format, ATLAS_SIZE, ATLAS_SIZE, 1)?;
+        let texture = ID3D12Resource::new_texture_2d(
+            device,
+            format,
+            ATLAS_SIZE_IN_PIXELS_PER_SIDE,
+            ATLAS_SIZE_IN_PIXELS_PER_SIDE,
+            1,
+        )?;
 
         let mut gpu_layout = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
         let mut gpu_size = 0;
@@ -94,16 +100,16 @@ impl<T> TextureAtlas<T> {
         let texel_size = size_of::<T>();
 
         let frame_offset = active_frame_index as usize * self.gpu_size as usize;
-        let patch_offset = slot.coords().y as usize * ATLAS_PATCH_PIXEL_SIZE * row_pitch
-            + slot.coords().x as usize * ATLAS_PATCH_PIXEL_SIZE * texel_size;
+        let patch_offset = slot.coords().y as usize * ATLAS_PATCH_SIZE_IN_PIXELS * row_pitch
+            + slot.coords().x as usize * ATLAS_PATCH_SIZE_IN_PIXELS * texel_size;
         let dst_patch_base = frame_offset + patch_offset;
 
-        for row in 0..ATLAS_PATCH_PIXEL_SIZE {
+        for row in 0..ATLAS_PATCH_SIZE_IN_PIXELS {
             unsafe {
-                let src = data.as_ptr().add(row * ATLAS_PATCH_PIXEL_SIZE);
+                let src = data.as_ptr().add(row * ATLAS_PATCH_SIZE_IN_PIXELS);
                 let dst = self.mapped_ptr.byte_add(dst_patch_base + row * row_pitch);
 
-                std::ptr::copy_nonoverlapping(src, dst, ATLAS_PATCH_PIXEL_SIZE);
+                std::ptr::copy_nonoverlapping(src, dst, ATLAS_PATCH_SIZE_IN_PIXELS);
             }
         }
 
@@ -114,8 +120,8 @@ impl<T> TextureAtlas<T> {
                     Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
                     Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
                 },
-                slot.coords().x * ATLAS_PATCH_PIXEL_SIZE as u32,
-                slot.coords().y * ATLAS_PATCH_PIXEL_SIZE as u32,
+                slot.coords().x * ATLAS_PATCH_SIZE_IN_PIXELS as u32,
+                slot.coords().y * ATLAS_PATCH_SIZE_IN_PIXELS as u32,
                 0,
                 &D3D12_TEXTURE_COPY_LOCATION {
                     pResource: std::mem::transmute_copy(&self.upload),
@@ -125,8 +131,8 @@ impl<T> TextureAtlas<T> {
                             Offset: dst_patch_base as u64,
                             Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
                                 Format: self.format,
-                                Width: ATLAS_PATCH_PIXEL_SIZE as u32,
-                                Height: ATLAS_PATCH_PIXEL_SIZE as u32,
+                                Width: ATLAS_PATCH_SIZE_IN_PIXELS as u32,
+                                Height: ATLAS_PATCH_SIZE_IN_PIXELS as u32,
                                 Depth: 1,
                                 RowPitch: row_pitch as u32,
                             },

@@ -1,17 +1,24 @@
-pub(super) const PATCH_GEN_THREAD_COUNT: usize = 8;
+pub const PATCH_WORKER_COUNT: u32 = 8;
 
-pub(super) const PATCH_LOD_COUNT: u32 = 6;
-pub(super) const PATCH_PIXEL_SIZE: u32 = 128;
-pub(super) const PATCH_TERRAIN_SIZE: u32 = PATCH_PIXEL_SIZE / 2;
+pub const PATCH_SIZE_IN_METERS: u32 = 64;
+pub const PATCH_SIZE_IN_PIXELS: u32 = PATCH_SIZE_IN_METERS * 2;
 
-pub(super) const ATLAS_PATCH_PIXEL_SIZE: usize = PATCH_PIXEL_SIZE as usize + 1; // for pixel overlap
-pub(super) const ATLAS_PATCH_PIXEL_SIZE_WITH_BORDER: usize = ATLAS_PATCH_PIXEL_SIZE + 2; // for gradient generation
-pub(super) const ATLAS_PATCH_COUNT: u32 = 32;
-pub(super) const ATLAS_SIZE: u32 = ATLAS_PATCH_PIXEL_SIZE as u32 * ATLAS_PATCH_COUNT;
+/// Root LOD: the world is 2^WORLD_LOD_INDEX LOD-0 patches per side.
+pub const WORLD_LOD_INDEX: u32 = 9;
 
-pub(super) const PATCH_SIDE_QUAD_COUNT: u32 = PATCH_PIXEL_SIZE;
-pub(super) const PATCH_SIDE_VERTEX_COUNT: u32 = PATCH_PIXEL_SIZE + 1;
-pub(super) const PATCH_INDEX_COUNT: u32 = PATCH_SIDE_QUAD_COUNT.pow(2) * 6;
+/// Coarsest LOD that actually renders. Above this, nodes always split
+pub const PATCH_LOD_COUNT: u32 = 8;
 
-pub(super) const NOISE_SCALE: f64 = 4.0;
-pub(super) const NOISE_WORLD_SCALE: f64 = 2048.0;
+pub const PATCH_COUNT_PER_SIDE: u32 = 1 << WORLD_LOD_INDEX;
+pub const WORLD_SIZE_IN_METERS: u32 = PATCH_SIZE_IN_METERS * PATCH_COUNT_PER_SIDE;
+
+pub const ATLAS_PATCH_SIZE_IN_PIXELS: usize = PATCH_SIZE_IN_PIXELS as usize + 1; // for pixel overlap
+pub const ATLAS_PATCH_SIZE_IN_PIXELS_WITH_BORDER: usize = ATLAS_PATCH_SIZE_IN_PIXELS + 2; // for gradient generation
+pub const ATLAS_PATCH_COUNT_PER_SIDE: u32 = 32;
+pub const ATLAS_SIZE_IN_PIXELS_PER_SIDE: u32 = ATLAS_PATCH_SIZE_IN_PIXELS as u32 * ATLAS_PATCH_COUNT_PER_SIDE;
+
+pub const PATCH_SIDE_QUAD_COUNT: u32 = PATCH_SIZE_IN_PIXELS;
+pub const PATCH_SIDE_VERTEX_COUNT: u32 = PATCH_SIZE_IN_PIXELS + 1;
+pub const PATCH_INDEX_COUNT: u32 = PATCH_SIDE_QUAD_COUNT.pow(2) * 6;
+
+pub const NOISE_WORLD_SCALE: f64 = WORLD_SIZE_IN_METERS as f64 / 4.0;

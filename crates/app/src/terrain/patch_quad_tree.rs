@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use glam::{IVec2, Vec2};
 
-use super::config::{PATCH_LOD_COUNT, PATCH_TERRAIN_SIZE};
+use super::config::{PATCH_LOD_COUNT, PATCH_SIZE_IN_METERS, WORLD_LOD_INDEX, WORLD_SIZE_IN_METERS};
 use super::patch::PatchKey;
 use super::patch_cache::{PatchAvailability, PatchCache};
 
@@ -31,8 +31,8 @@ pub struct PatchQuadTree {
 }
 
 impl PatchQuadTree {
-    pub fn build(camera_pos: Vec2, render_distance: u32, lod_factor: f32) -> Self {
-        let mut root = Self::create_root(camera_pos, render_distance);
+    pub fn build(camera_pos: Vec2, lod_factor: f32) -> Self {
+        let mut root = Self::create_root();
         Self::split_recursive(&mut root, camera_pos, lod_factor);
 
         Self { root }
@@ -55,17 +55,11 @@ impl PatchQuadTree {
         PatchKey::terrain_size_for_lod(lod_index) as f32 * 0.5 * lod_factor
     }
 
-    fn create_root(camera_pos: Vec2, render_distance: u32) -> TreeNode {
-        let root_terrain_size = PATCH_TERRAIN_SIZE * 2_u32.pow(PATCH_LOD_COUNT - 1);
-        let root_lod_index = (render_distance * 2 / PATCH_TERRAIN_SIZE).ilog2();
+    fn create_root() -> TreeNode {
+        let half_world_size = WORLD_SIZE_IN_METERS as i32 / 2;
+        let root_grid_index = IVec2::splat(-half_world_size / PATCH_SIZE_IN_METERS as i32);
 
-        let snapped_camera_terrain_pos =
-            (camera_pos / root_terrain_size as f32).round().as_ivec2() * root_terrain_size as i32;
-
-        let root_grid_index =
-            (snapped_camera_terrain_pos / PATCH_TERRAIN_SIZE as i32) - (render_distance / PATCH_TERRAIN_SIZE) as i32;
-
-        TreeNode::new(root_grid_index, root_lod_index)
+        TreeNode::new(root_grid_index, WORLD_LOD_INDEX)
     }
 
     fn split_recursive(node: &mut TreeNode, camera_pos: Vec2, lod_factor: f32) {

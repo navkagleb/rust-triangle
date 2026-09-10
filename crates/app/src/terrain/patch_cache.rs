@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use imgui_sys::*;
 use windows::Win32::Graphics::Direct3D12::D3D12_GPU_DESCRIPTOR_HANDLE;
 
-use super::config::ATLAS_PATCH_COUNT;
+use super::config::ATLAS_PATCH_COUNT_PER_SIDE;
 use super::patch::{PatchData, PatchKey};
 use super::patch_generator::GeneratedPatch;
 use super::texture_atlas::AtlasSlot;
@@ -94,7 +94,7 @@ impl PatchCache {
             );
 
             let draw_list = ImGui_GetWindowDrawList();
-            let slot_size = image_size / ATLAS_PATCH_COUNT as f32;
+            let slot_size = image_size / ATLAS_PATCH_COUNT_PER_SIDE as f32;
 
             for slot in &self.available_atlas_slots {
                 ImDrawList_AddCircleFilled(
@@ -231,10 +231,10 @@ impl PatchCache {
     }
 
     fn create_atlas_slots() -> Vec<AtlasSlot> {
-        let mut slots = Vec::with_capacity((ATLAS_PATCH_COUNT * ATLAS_PATCH_COUNT) as usize);
+        let mut slots = Vec::with_capacity((ATLAS_PATCH_COUNT_PER_SIDE * ATLAS_PATCH_COUNT_PER_SIDE) as usize);
 
-        for y in (0..ATLAS_PATCH_COUNT).rev() {
-            for x in (0..ATLAS_PATCH_COUNT).rev() {
+        for y in (0..ATLAS_PATCH_COUNT_PER_SIDE).rev() {
+            for x in (0..ATLAS_PATCH_COUNT_PER_SIDE).rev() {
                 slots.push(AtlasSlot::new(x, y));
             }
         }

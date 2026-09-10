@@ -26,7 +26,6 @@ use patch_quad_tree::PatchQuadTree;
 use texture_atlas::TextureAtlas;
 
 pub struct Terrain {
-    render_distance: u32,
     lod_factor: f32,
 
     height_scale: f32,
@@ -116,9 +115,7 @@ impl Terrain {
 
         patch_index_buffer.map_and_write(patch_indices.as_slice())?;
 
-        let render_distance = 4096;
-
-        let max_patch_count = ((render_distance * 2) / PATCH_TERRAIN_SIZE).pow(2); // should be somehow recalculated
+        let max_patch_count = PATCH_COUNT_PER_SIDE; // TODO
         let patch_buffer = ID3D12Resource::new_buffer(
             device,
             D3D12_HEAP_TYPE_UPLOAD,
@@ -226,10 +223,9 @@ impl Terrain {
             };
 
         Ok(Self {
-            render_distance,
-            lod_factor: 3.5,
+            lod_factor: 2.0,
 
-            height_scale: 400.0,
+            height_scale: 5000.0,
             morph_start_ratio: 0.7,
 
             solid_mode: true,
@@ -291,7 +287,7 @@ impl Terrain {
     pub fn update(&mut self, cpu_frame_index: u64, gpu_frame_index: u64, active_frame_index: u32) {
         self.collect_generated_patches();
 
-        let qtree = PatchQuadTree::build(self.camera_pos, self.render_distance, self.lod_factor);
+        let qtree = PatchQuadTree::build(self.camera_pos, self.lod_factor);
         // It's better to update the cache states before calling 'select' to avoid one-frame delay
         let selection = qtree.select(&self.patch_cache);
 

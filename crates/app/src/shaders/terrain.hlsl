@@ -38,13 +38,13 @@ static const uint TERRAIN_BAND_COUNT = 7;
 // rgb = band color, w = the height the band is centered on
 // Keep w strictly increasing
 static const float4 TERRAIN_BANDS[TERRAIN_BAND_COUNT] = {
-    float4(0.00, 0.10, 0.40, 0.120), // deep water
-    float4(0.10, 0.30, 0.60, 0.155), // shallow water
-    float4(0.76, 0.70, 0.50, 0.175), // sand
-    float4(0.20, 0.55, 0.10, 0.210), // grass
-    float4(0.10, 0.35, 0.05, 0.340), // forest
-    float4(0.50, 0.45, 0.40, 0.580), // rock
-    float4(0.90, 0.95, 1.00, 0.800), // snow
+    float4(0.00, 0.10, 0.40, 0.300), // deep water
+    float4(0.10, 0.30, 0.60, 0.350), // shallow water
+    float4(0.76, 0.70, 0.50, 0.400), // sand
+    float4(0.20, 0.55, 0.10, 0.450), // grass
+    float4(0.10, 0.35, 0.05, 0.500), // forest
+    float4(0.50, 0.45, 0.40, 0.600), // rock
+    float4(0.90, 0.95, 1.00, 0.700), // snow
 };
 
 float3 height_to_color(float h) {
@@ -63,14 +63,14 @@ static const uint HEIGHT_ATLAS_INDEX = 1;
 static const uint GRADIENT_ATLAS_INDEX = 2;
 static const uint PATCH_INDEX_BUFFER_INDEX = 3;
 
-static const uint PATCH_LOD_COUNT = 6;
-static const uint PATCH_PIXEL_SIZE = 128;
-static const uint PATCH_TERRAIN_SIZE = PATCH_PIXEL_SIZE / 2;
-static const uint PATCH_QUAD_COUNT = PATCH_PIXEL_SIZE;
+static const uint PATCH_LOD_COUNT = 8; // must match config.rs
+static const uint PATCH_SIZE_IN_METERS = 64;
+static const uint PATCH_SIZE_IN_PIXELS = PATCH_SIZE_IN_METERS * 2;
+static const uint PATCH_QUAD_COUNT = PATCH_SIZE_IN_PIXELS;
 static const uint PATCH_VERTEX_COUNT = (PATCH_QUAD_COUNT + 1) * (PATCH_QUAD_COUNT + 1);
 static const uint PATCH_TRIANGLE_COUNT = PATCH_QUAD_COUNT * PATCH_QUAD_COUNT * 2;
 
-static const uint ATLAS_PATCH_PIXEL_SIZE = PATCH_PIXEL_SIZE + 1; // for pixel overlap
+static const uint ATLAS_PATCH_SIZE_IN_PIXELS = PATCH_SIZE_IN_PIXELS + 1; // for pixel overlap
 
 float3 get_lod_color(uint lod_index) {
     switch (lod_index % PATCH_LOD_COUNT) {
@@ -86,6 +86,10 @@ float3 get_lod_color(uint lod_index) {
             return float3(0.75, 0.20, 1.00); // purple
         case 5:
             return float3(0.10, 0.90, 0.90); // cyan
+        case 6:
+            return float3(1.00, 0.40, 0.70); // pink
+        case 7:
+            return float3(0.60, 0.60, 0.60); // grey
     }
 
     return 0.0;
@@ -111,10 +115,10 @@ VsOutput process_vertex(uint vertex_id, uint instance_id) {
     uint iz = vertex_id / (PATCH_QUAD_COUNT + 1);
 
     const float2 uv = float2(ix, iz) / (float)PATCH_QUAD_COUNT; // 0..1
-    const float terrain_size = PATCH_TERRAIN_SIZE * 1 << patch.lod_index;
-    const float2 terrain_xz = patch.grid_index * (int)PATCH_TERRAIN_SIZE + terrain_size * uv;
+    const float terrain_size = PATCH_SIZE_IN_METERS * 1 << patch.lod_index;
+    const float2 terrain_xz = patch.grid_index * (int)PATCH_SIZE_IN_METERS + terrain_size * uv;
 
-    const uint2 atlas_texel_pos = patch.atlas_slot * ATLAS_PATCH_PIXEL_SIZE + uint2(ix, iz);
+    const uint2 atlas_texel_pos = patch.atlas_slot * ATLAS_PATCH_SIZE_IN_PIXELS + uint2(ix, iz);
     const float height = height_atlas[atlas_texel_pos];
     const float2 gradient = gradient_atlas[atlas_texel_pos];
 

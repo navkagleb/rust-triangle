@@ -1,6 +1,6 @@
 use glam::{IVec2, Vec2};
 
-use super::config::PATCH_TERRAIN_SIZE;
+use super::config::PATCH_SIZE_IN_METERS;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct PatchKey {
@@ -10,7 +10,7 @@ pub struct PatchKey {
 
 impl PatchKey {
     pub fn terrain_origin(&self) -> IVec2 {
-        self.grid_index * PATCH_TERRAIN_SIZE as i32
+        self.grid_index * PATCH_SIZE_IN_METERS as i32
     }
 
     pub fn terrain_size(&self) -> u32 {
@@ -18,7 +18,7 @@ impl PatchKey {
     }
 
     pub fn terrain_size_for_lod(lod_index: u32) -> u32 {
-        PATCH_TERRAIN_SIZE * 2_u32.pow(lod_index)
+        PATCH_SIZE_IN_METERS * 2_u32.pow(lod_index)
     }
 
     pub fn terrain_center(&self) -> IVec2 {
