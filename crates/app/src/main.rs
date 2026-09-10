@@ -54,20 +54,36 @@ struct InputState {
     mouse_dx: i32,
     mouse_dy: i32,
     right_mouse_down: bool,
+    mouse_wheel_delta: i32,
+}
+
+impl InputState {
+    fn reset(&mut self) {
+        self.mouse_dx = 0;
+        self.mouse_dy = 0;
+        self.mouse_wheel_delta = 0;
+    }
+}
+
+impl Default for InputState {
+    fn default() -> Self {
+        Self {
+            keys: [false; 256],
+            mouse_x: 0,
+            mouse_y: 0,
+            mouse_dx: 0,
+            mouse_dy: 0,
+            right_mouse_down: false,
+            mouse_wheel_delta: 0,
+        }
+    }
 }
 
 fn main() -> Result<()> {
-    let mut camera = camera::Camera::new(Vec3::new(0.0, 100.0, 0.0));
+    let mut camera = camera::Camera::new(Vec3::new(0.0, 4000.0, 0.0));
     let mut camera_controller = camera::CameraController::default();
 
-    let mut input = InputState {
-        keys: [false; 256],
-        mouse_x: 0,
-        mouse_y: 0,
-        mouse_dx: 0,
-        mouse_dy: 0,
-        right_mouse_down: false,
-    };
+    let mut input = InputState::default();
 
     unsafe {
         let class_atom = RegisterClassA(&WNDCLASSA {
@@ -421,6 +437,8 @@ fn main() -> Result<()> {
         let mut frame_timer = FrameTimer::new();
 
         loop {
+            input.reset();
+
             {
                 let mut message = MSG::default();
                 let mut is_done = false;
@@ -446,9 +464,6 @@ fn main() -> Result<()> {
 
             {
                 camera_controller.control(dt, &input, &mut camera);
-
-                input.mouse_dx = 0;
-                input.mouse_dy = 0;
             }
 
             terrain.update_camera(camera.position(), camera.forward(), dt);
@@ -523,11 +538,7 @@ fn main() -> Result<()> {
                     imgui_text!("Host VRAM: {} mb", host_mem.CurrentUsage / (1024 * 1024));
 
                     ImGui_NewLine();
-                    ImGui_SeparatorText(c"Camera".as_ptr());
-                    imgui_text!("Position: {:.2}", camera.position());
-                    imgui_text!("Yaw:  {:>7.2}", camera_controller.yaw());
-                    imgui_text!("Pitch: {:>6.2}", camera_controller.pitch());
-                    ImGui_DragFloat(c"Speed".as_ptr(), &mut camera_controller.speed);
+                    imgui_text!("Camera position: {:.2}", camera.position());
                 }
                 ImGui_End();
 
@@ -664,6 +675,12 @@ extern "system" fn handle_window_message(window_handle: HWND, message: u32, wpar
         }
         WM_RBUTTONUP => {
             input.right_mouse_down = false;
+            LRESULT::default()
+        }
+        WM_MOUSEWHEEL => {
+            let delta = ((wparam.0 >> 16) & 0xffff) as u16 as i16;
+            input.mouse_wheel_delta = (delta as f32 / 120.0) as i32;
+
             LRESULT::default()
         }
         WM_DESTROY => {

@@ -1,10 +1,16 @@
 use glam::{Mat4, Vec3};
-use windows::Win32::UI::Input::KeyboardAndMouse::{VK_SHIFT, VK_SPACE};
+use windows::Win32::UI::Input::KeyboardAndMouse::VK_SPACE;
 
 use crate::{HEIGHT, InputState, WIDTH};
 
+const DEFAULT_FOV: f32 = 90.0;
+const DEFAULD_NEAR_Z: f32 = 0.1;
+
 const MOUSE_SENSITIVITY: f32 = 0.5;
-const SPEED_MULTIPLIER: f32 = 10.0;
+const DEFAULT_CAMERA_SPEED: f32 = 50.0;
+const MIN_CAMERA_SPEED: f32 = 0.25;
+const MAX_CAMERA_SPEED: f32 = 4000.0;
+const WHEEL_SPEED_FACTOR: f32 = 1.25;
 
 pub struct Camera {
     position: Vec3,
@@ -15,15 +21,13 @@ pub struct Camera {
 
 impl Camera {
     pub fn new(position: Vec3) -> Self {
-        let fov_y = 90_f32.to_radians();
         let aspect_ratio = WIDTH as f32 / HEIGHT as f32;
-        let near_z = 0.1;
 
         Self {
             position,
             forward: Vec3::Y,
             world_to_view: Mat4::IDENTITY,
-            view_to_clip: Mat4::perspective_infinite_reverse_lh(fov_y, aspect_ratio, near_z),
+            view_to_clip: Mat4::perspective_infinite_reverse_lh(DEFAULT_FOV.to_radians(), aspect_ratio, DEFAULD_NEAR_Z),
         }
     }
 
@@ -41,8 +45,7 @@ impl Camera {
 }
 
 pub struct CameraController {
-    pub speed: f32,
-
+    speed: f32,
     yaw: f32,
     pitch: f32,
 }
@@ -55,66 +58,69 @@ impl CameraController {
 
             self.yaw = self.yaw.rem_euclid(360.0);
             self.pitch = self.pitch.clamp(-89.0, 89.0);
+
+            if input.mouse_wheel_delta != 0 {
+                self.speed *= WHEEL_SPEED_FACTOR.powf(input.mouse_wheel_delta as f32);
+                self.speed = self.speed.clamp(MIN_CAMERA_SPEED, MAX_CAMERA_SPEED);
+            }
         }
 
-        let yaw_rad = self.yaw.to_radians();
-        let pitch_rad = self.pitch.to_radians();
+        let forward = self.forward();
+        let right = Vec3::Y.cross(forward).normalize();
 
-        let forward = {
-            let dir = Vec3::new(
-                yaw_rad.cos() * pitch_rad.cos(),
-                pitch_rad.sin(),
-                yaw_rad.sin() * pitch_rad.cos(),
-            );
-            dir.normalize()
-        };
-
-        let mut speed = self.speed * dt;
-        if input.keys[VK_SHIFT.0 as usize] {
-            speed *= SPEED_MULTIPLIER;
-        }
+        let mut movement = Vec3::ZERO;
 
         if input.keys[b'W' as usize] {
-            camera.position += forward * speed;
+            movement += forward;
         }
 
         if input.keys[b'S' as usize] {
-            camera.position -= forward * speed;
+            movement -= forward;
         }
 
         if input.keys[b'A' as usize] {
-            camera.position += forward.cross(Vec3::Y).normalize() * speed;
+            movement -= right;
         }
 
         if input.keys[b'D' as usize] {
-            camera.position -= forward.cross(Vec3::Y).normalize() * speed;
+            movement += right;
         }
 
         if input.keys[VK_SPACE.0 as usize] {
-            camera.position.y += speed;
+            movement += Vec3::Y;
         }
 
         if input.keys[b'C' as usize] {
-            camera.position.y -= speed;
+            movement -= Vec3::Y;
+        }
+
+        if movement.length_squared() > 0.0 {
+            movement = movement.normalize();
+            camera.position += movement * self.speed * dt;
         }
 
         camera.forward = forward;
         camera.world_to_view = Mat4::look_to_lh(camera.position, forward, Vec3::Y);
     }
 
-    pub fn yaw(&self) -> f32 {
-        self.yaw
-    }
+    fn forward(&self) -> Vec3 {
+        let yaw_rad = self.yaw.to_radians();
+        let pitch_rad = self.pitch.to_radians();
 
-    pub fn pitch(&self) -> f32 {
-        self.pitch
+        let forward = Vec3::new(
+            yaw_rad.cos() * pitch_rad.cos(),
+            pitch_rad.sin(),
+            yaw_rad.sin() * pitch_rad.cos(),
+        );
+
+        forward.normalize()
     }
 }
 
 impl Default for CameraController {
     fn default() -> Self {
         Self {
-            speed: 50.0,
+            speed: DEFAULT_CAMERA_SPEED, // meters per sec
             yaw: -90.0,
             pitch: 0.0,
         }
