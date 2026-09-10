@@ -27,9 +27,7 @@ use texture_atlas::TextureAtlas;
 
 pub struct Terrain {
     lod_factor: f32,
-
     height_scale: f32,
-    morph_start_ratio: f32,
 
     solid_mode: bool,
     wireframe_mode: bool,
@@ -226,7 +224,6 @@ impl Terrain {
             lod_factor: 2.0,
 
             height_scale: 5000.0,
-            morph_start_ratio: 0.7,
 
             solid_mode: true,
             wireframe_mode: false,

@@ -30,7 +30,6 @@ impl Terrain {
             ImGui_NewLine();
             ImGui_InputFloat(c"LOD factor".as_ptr(), &mut self.lod_factor);
             ImGui_InputFloat(c"Height scale".as_ptr(), &mut self.height_scale);
-            ImGui_SliderFloat(c"Morph start ratio".as_ptr(), &mut self.morph_start_ratio, 0.0, 1.0);
 
             ImGui_NewLine();
             ImGui_Checkbox(c"Freeze camera".as_ptr(), &mut self.freeze_camera);
@@ -94,12 +93,15 @@ impl Terrain {
                     let mouse_relative_pos = mouse_pos - (minimap_pos + minimap_size * 0.5 + self.minimap_offset);
 
                     let prev_zoom = self.minimap_zoom;
-                    self.minimap_zoom = (self.minimap_zoom * (1.0 + scroll * 0.1)).clamp(0.1, 10.0);
+                    self.minimap_zoom = (self.minimap_zoom * (1.0 + scroll * 0.1)).clamp(1.0, 100.0);
 
                     let zoom_factor = self.minimap_zoom / prev_zoom;
                     self.minimap_offset += mouse_relative_pos - mouse_relative_pos * zoom_factor;
                 }
             }
+
+            let max_minimap_offset = Vec2::splat(minimap_size * (self.minimap_zoom - 1.0) * 0.5);
+            self.minimap_offset = self.minimap_offset.clamp(-max_minimap_offset, max_minimap_offset);
 
             let minimap_center = minimap_pos + minimap_size * 0.5 + self.minimap_offset;
             let minimap_scale = minimap_size / WORLD_SIZE_IN_METERS as f32 * self.minimap_zoom;
@@ -222,12 +224,8 @@ impl Terrain {
             if self.minimap_display_morph_range {
                 let minimap_freezed_camera_pos = minimap_center + self.camera_pos * minimap_scale;
 
-                // lod_index's split_distance is the threshold at which an LOD lod_index patch splits
-                // into LOD (lod_index - 1) children, so the circle bounds the LOD (lod_index - 1)
-                // region and must be colored accordingly. LOD 0 never splits, so it has no threshold.
                 for lod_index in 1..PATCH_LOD_COUNT {
                     let split_distance = PatchQuadTree::split_distance(lod_index, self.lod_factor);
-                    let morph_start_distance = split_distance * self.morph_start_ratio;
 
                     let center = ImVec2 {
                         x: minimap_freezed_camera_pos.x,
@@ -235,27 +233,6 @@ impl Terrain {
                     };
                     let color = get_lod_color(lod_index - 1);
                     let segment_count = 40;
-
-                    // ImGui has no annulus primitive, so the morph band is a circle stroked at the
-                    // middle of the band with a thickness equal to its width, which expands
-                    // symmetrically to cover exactly morph_start_distance..split_distance.
-                    ImDrawList_AddCircleEx(
-                        draw_list,
-                        center,
-                        (morph_start_distance + split_distance) * 0.5 * minimap_scale,
-                        im_color32(color, 0x30),
-                        segment_count,
-                        (split_distance - morph_start_distance) * minimap_scale,
-                    );
-
-                    ImDrawList_AddCircleEx(
-                        draw_list,
-                        center,
-                        morph_start_distance * minimap_scale,
-                        im_color32(color, 0x80),
-                        segment_count,
-                        1.0,
-                    );
 
                     ImDrawList_AddCircleEx(
                         draw_list,
