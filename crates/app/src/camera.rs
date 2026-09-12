@@ -1,5 +1,4 @@
 use glam::{Mat4, Vec3};
-use windows::Win32::UI::Input::KeyboardAndMouse::VK_SPACE;
 
 use crate::{HEIGHT, InputState, WIDTH};
 
@@ -65,8 +64,9 @@ impl CameraController {
             }
         }
 
+        let up = Vec3::Y;
         let forward = self.forward();
-        let right = Vec3::Y.cross(forward).normalize();
+        let right = up.cross(forward).normalize();
 
         let mut movement = Vec3::ZERO;
 
@@ -86,12 +86,12 @@ impl CameraController {
             movement += right;
         }
 
-        if input.keys[VK_SPACE.0 as usize] {
-            movement += Vec3::Y;
+        if input.keys[b'E' as usize] {
+            movement += up;
         }
 
-        if input.keys[b'C' as usize] {
-            movement -= Vec3::Y;
+        if input.keys[b'Q' as usize] {
+            movement -= up;
         }
 
         if movement.length_squared() > 0.0 {
@@ -100,7 +100,7 @@ impl CameraController {
         }
 
         camera.forward = forward;
-        camera.world_to_view = Mat4::look_to_lh(camera.position, forward, Vec3::Y);
+        camera.world_to_view = Mat4::look_to_lh(camera.position, forward, up);
     }
 
     fn forward(&self) -> Vec3 {
