@@ -260,7 +260,15 @@ impl Terrain {
         })
     }
 
-    pub fn update_camera(&mut self, camera_pos: &Vec3, camera_forward: &Vec3, dt: f32) {
+    pub fn update(
+        &mut self,
+        camera_pos: &Vec3,
+        camera_forward: &Vec3,
+        dt: f32,
+        cpu_frame_index: u64,
+        gpu_frame_index: u64,
+        active_frame_index: u32,
+    ) {
         if !self.freeze_camera {
             self.camera_pos = *camera_pos;
             self.camera_forward = camera_forward.xz().normalize_or_zero();
@@ -269,9 +277,7 @@ impl Terrain {
         if !self.pause_sun_animation {
             self.elapsed_time += dt;
         }
-    }
 
-    pub fn update(&mut self, cpu_frame_index: u64, gpu_frame_index: u64, active_frame_index: u32) {
         self.collect_generated_patches();
 
         self.quad_tree.select(

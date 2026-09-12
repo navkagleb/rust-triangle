@@ -434,6 +434,7 @@ fn main() -> Result<()> {
 
         let mut cpu_frame_index = 0;
         let mut gpu_frame_index = 0;
+        let mut active_frame_index = 0;
         let mut frame_timer = FrameTimer::new();
 
         loop {
@@ -462,14 +463,20 @@ fn main() -> Result<()> {
             // Update
             let (dt, fps) = frame_timer.tick();
 
-            {
-                camera_controller.control(dt, &input, &mut camera);
-            }
+            camera_controller.control(dt, &input, &mut camera);
 
-            terrain.update_camera(camera.position(), camera.forward(), dt);
+            let t = Instant::now();
+            terrain.update(
+                camera.pos(),
+                camera.forward(),
+                dt,
+                cpu_frame_index,
+                gpu_frame_index,
+                active_frame_index,
+            );
+            let terrain_update_ms = t.elapsed().as_secs_f32() * 1000.0;
 
             // Render
-            let active_frame_index = swap_chain.GetCurrentBackBufferIndex();
             let cmd_allocator = &cmd_allocators[active_frame_index as usize];
 
             cmd_allocator.Reset()?;
@@ -507,10 +514,6 @@ fn main() -> Result<()> {
             cmd_list.SetGraphicsRootSignature(&root_signature);
 
             let t = Instant::now();
-            terrain.update(cpu_frame_index, gpu_frame_index, active_frame_index);
-            let terrain_update_ms = t.elapsed().as_secs_f32() * 1000.0;
-
-            let t = Instant::now();
             terrain.render(&cmd_list, &camera, active_frame_index);
             let terrain_render_ms = t.elapsed().as_secs_f32() * 1000.0;
 
@@ -538,7 +541,7 @@ fn main() -> Result<()> {
                     imgui_text!("Host VRAM: {} mb", host_mem.CurrentUsage / (1024 * 1024));
 
                     ImGui_NewLine();
-                    imgui_text!("Camera position: {:.2}", camera.position());
+                    imgui_text!("Camera position: {:.2}", camera.pos());
                 }
                 ImGui_End();
 
@@ -551,7 +554,7 @@ fn main() -> Result<()> {
                 }
                 ImGui_End();
 
-                terrain.render_imgui(&resource_heap, camera.position(), camera.forward());
+                terrain.render_imgui(&resource_heap, camera.pos(), camera.forward());
 
                 // ImGui_ShowDemoWindow(std::ptr::null_mut());
                 ImGui_Render();
@@ -585,6 +588,8 @@ fn main() -> Result<()> {
 
                 gpu_frame_index = fence.GetCompletedValue();
             }
+
+            active_frame_index = swap_chain.GetCurrentBackBufferIndex();
         }
 
         wait_for_gpu(&fence, fence_event, cpu_frame_index)?;

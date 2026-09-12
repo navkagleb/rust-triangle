@@ -12,26 +12,26 @@ const MAX_CAMERA_SPEED: f32 = 4000.0;
 const WHEEL_SPEED_FACTOR: f32 = 1.25;
 
 pub struct Camera {
-    position: Vec3,
+    pos: Vec3,
     forward: Vec3,
     world_to_view: Mat4,
     view_to_clip: Mat4,
 }
 
 impl Camera {
-    pub fn new(position: Vec3) -> Self {
+    pub fn new(pos: Vec3) -> Self {
         let aspect_ratio = WIDTH as f32 / HEIGHT as f32;
 
         Self {
-            position,
+            pos,
             forward: Vec3::Y,
             world_to_view: Mat4::IDENTITY,
             view_to_clip: Mat4::perspective_infinite_reverse_lh(DEFAULT_FOV.to_radians(), aspect_ratio, DEFAULD_NEAR_Z),
         }
     }
 
-    pub fn position(&self) -> &Vec3 {
-        &self.position
+    pub fn pos(&self) -> &Vec3 {
+        &self.pos
     }
 
     pub fn forward(&self) -> &Vec3 {
@@ -96,11 +96,11 @@ impl CameraController {
 
         if movement.length_squared() > 0.0 {
             movement = movement.normalize();
-            camera.position += movement * self.speed * dt;
+            camera.pos += movement * self.speed * dt;
         }
 
         camera.forward = forward;
-        camera.world_to_view = Mat4::look_to_lh(camera.position, forward, up);
+        camera.world_to_view = Mat4::look_to_lh(camera.pos, forward, up);
     }
 
     fn forward(&self) -> Vec3 {
