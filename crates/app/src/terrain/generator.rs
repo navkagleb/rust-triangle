@@ -9,7 +9,7 @@ use super::config::{
     ATLAS_PATCH_SIZE_IN_PIXELS, ATLAS_PATCH_SIZE_IN_PIXELS_WITH_BORDER, NOISE_WORLD_SCALE, PATCH_SIZE_IN_PIXELS,
     PATCH_WORKER_COUNT,
 };
-use super::patch::{PatchData, PatchKey};
+use super::patch::{PatchCoord, PatchPayload};
 use super::queue::Queue;
 
 #[derive(Copy, Clone)]
@@ -51,13 +51,13 @@ impl Ord for PatchPriority {
 }
 
 pub struct WantedPatch {
-    pub(super) patch: PatchKey,
-    pub(super) priority: PatchPriority,
+    pub coord: PatchCoord,
+    pub priority: PatchPriority,
 }
 
 impl WantedPatch {
-    pub fn new(patch: PatchKey, coverage_required: bool, camera_pos: Vec2, camera_forward: Vec2) -> Self {
-        let patch_center = patch.world_center();
+    pub fn new(coord: PatchCoord, coverage_required: bool, camera_pos: Vec2, camera_forward: Vec2) -> Self {
+        let patch_center = coord.world_center();
         let offset = patch_center - camera_pos;
         let view_alignment = if offset.length_squared() >= 0.0001 {
             camera_forward.dot(offset.normalize()).clamp(-1.0, 1.0)
@@ -66,10 +66,10 @@ impl WantedPatch {
         };
 
         Self {
-            patch,
+            coord,
             priority: PatchPriority {
                 coverage_required,
-                lod: patch.lod,
+                lod: coord.lod,
                 distance_squared: offset.length_squared(),
                 view_alignment,
             },
@@ -78,8 +78,9 @@ impl WantedPatch {
 }
 
 pub struct GeneratedPatch {
-    pub patch: PatchKey,
-    pub data: PatchData,
+    pub coord: PatchCoord,
+    pub payload: PatchPayload,
+    pub height_range: Vec2,
 }
 
 pub struct Generator {
@@ -107,10 +108,10 @@ impl Generator {
                 let completed_sender = completed_sender.clone();
 
                 std::thread::spawn(move || {
-                    while let Some(patch) = queue.claim_blocking() {
-                        let generated = Self::generate_patch(&noise, patch);
+                    while let Some(coord) = queue.claim_blocking() {
+                        let generated = Self::generate_patch(&noise, coord);
 
-                        if queue.complete(patch) && completed_sender.send(generated).is_err() {
+                        if queue.complete(coord) && completed_sender.send(generated).is_err() {
                             break;
                         }
                     }
@@ -136,12 +137,12 @@ impl Generator {
         self.completed_receiver.try_iter()
     }
 
-    fn generate_patch(noise: &Fbm<Perlin>, patch: PatchKey) -> GeneratedPatch {
+    fn generate_patch(noise: &Fbm<Perlin>, coord: PatchCoord) -> GeneratedPatch {
         let instant = std::time::Instant::now();
 
-        let heights_with_border = Self::generate_heights_with_border(noise, patch);
+        let heights_with_border = Self::generate_heights_with_border(noise, coord);
         let heights = Self::extract_patch_heights(&heights_with_border);
-        let gradients = Self::generate_gradients(&heights_with_border, patch);
+        let gradients = Self::generate_gradients(&heights_with_border, coord);
 
         let (min_height, max_height) = heights_with_border
             .iter()
@@ -150,28 +151,25 @@ impl Generator {
             });
 
         println!(
-            "Generated: patch_key=[{:2}, {:3}, {:3}], height=[{:.3}, {:.3}] ({:.2} ms)",
-            patch.lod,
-            patch.x,
-            patch.z,
+            "Generated: coord=[{:2}, {:3}, {:3}], height=[{:.3}, {:.3}] ({:.2} ms)",
+            coord.lod,
+            coord.x,
+            coord.z,
             min_height,
             max_height,
             instant.elapsed().as_secs_f32() * 1000.0
         );
 
         GeneratedPatch {
-            patch,
-            data: PatchData {
-                heights,
-                gradients,
-                height_range: Vec2::new(min_height, max_height),
-            },
+            coord,
+            payload: PatchPayload { heights, gradients },
+            height_range: Vec2::new(min_height, max_height),
         }
     }
 
-    fn generate_heights_with_border(noise: &Fbm<Perlin>, patch: PatchKey) -> Vec<f32> {
-        let noise_origin = patch.world_origin().as_dvec2() / NOISE_WORLD_SCALE;
-        let noise_texel = patch.size_in_meters() as f64 / PATCH_SIZE_IN_PIXELS as f64 / NOISE_WORLD_SCALE;
+    fn generate_heights_with_border(noise: &Fbm<Perlin>, coord: PatchCoord) -> Vec<f32> {
+        let noise_origin = coord.world_origin().as_dvec2() / NOISE_WORLD_SCALE;
+        let noise_per_texel = coord.size_in_meters() as f64 / PATCH_SIZE_IN_PIXELS as f64 / NOISE_WORLD_SCALE;
 
         PlaneMapBuilder::new(noise)
             .set_size(
@@ -179,12 +177,12 @@ impl Generator {
                 ATLAS_PATCH_SIZE_IN_PIXELS_WITH_BORDER as usize,
             )
             .set_x_bounds(
-                noise_origin.x - noise_texel,
-                noise_origin.x + (PATCH_SIZE_IN_PIXELS + 2) as f64 * noise_texel,
+                noise_origin.x - noise_per_texel,
+                noise_origin.x + (PATCH_SIZE_IN_PIXELS + 2) as f64 * noise_per_texel,
             )
             .set_y_bounds(
-                noise_origin.y - noise_texel,
-                noise_origin.y + (PATCH_SIZE_IN_PIXELS + 2) as f64 * noise_texel,
+                noise_origin.y - noise_per_texel,
+                noise_origin.y + (PATCH_SIZE_IN_PIXELS + 2) as f64 * noise_per_texel,
             )
             .build()
             .into_iter()
@@ -193,41 +191,47 @@ impl Generator {
     }
 
     fn extract_patch_heights(heights_with_border: &[f32]) -> Vec<f32> {
-        let patch_size = ATLAS_PATCH_SIZE_IN_PIXELS as usize;
-        let patch_size_with_border = ATLAS_PATCH_SIZE_IN_PIXELS_WITH_BORDER as usize;
+        let texels_per_side = ATLAS_PATCH_SIZE_IN_PIXELS as usize;
+        let bordered_texels_per_side = ATLAS_PATCH_SIZE_IN_PIXELS_WITH_BORDER as usize;
 
-        let mut heights = vec![0.0; patch_size.pow(2)];
+        let mut heights = vec![0.0; texels_per_side.pow(2)];
 
-        for z in 0..patch_size {
-            for x in 0..patch_size {
-                heights[z * patch_size + x] = heights_with_border[(z + 1) * patch_size_with_border + (x + 1)];
+        for z in 0..texels_per_side {
+            for x in 0..texels_per_side {
+                heights[z * texels_per_side + x] = heights_with_border[(z + 1) * bordered_texels_per_side + (x + 1)];
             }
         }
 
         heights
     }
 
-    fn generate_gradients(heights_with_border: &[f32], patch: PatchKey) -> Vec<Vec2> {
-        let patch_size = ATLAS_PATCH_SIZE_IN_PIXELS as usize;
-        let patch_size_with_border = ATLAS_PATCH_SIZE_IN_PIXELS_WITH_BORDER as usize;
-        let noise_world_size = patch.size_in_meters() as f32 / PATCH_SIZE_IN_PIXELS as f32; // TODO: Name
+    fn generate_gradients(heights_with_border: &[f32], coord: PatchCoord) -> Vec<Vec2> {
+        let texels_per_side = ATLAS_PATCH_SIZE_IN_PIXELS as usize;
+        let bordered_texels_per_side = ATLAS_PATCH_SIZE_IN_PIXELS_WITH_BORDER as usize;
 
-        let mut gradients = vec![Vec2::ZERO; patch_size.pow(2)];
+        // World distance between two neighbouring height samples - the `dx` of the central
+        // difference below. Grows with LOD: coarser patches cover more ground per texel.
+        let meters_per_texel = coord.size_in_meters() as f32 / PATCH_SIZE_IN_PIXELS as f32;
 
-        for z in 0..patch_size {
-            for x in 0..patch_size {
+        let mut gradients = vec![Vec2::ZERO; texels_per_side.pow(2)];
+
+        for z in 0..texels_per_side {
+            for x in 0..texels_per_side {
                 let sx = x + 1;
                 let sz = z + 1;
 
-                let hl = heights_with_border[sz * patch_size_with_border + (sx - 1)];
-                let hr = heights_with_border[sz * patch_size_with_border + (sx + 1)];
-                let hb = heights_with_border[(sz - 1) * patch_size_with_border + sx];
-                let ht = heights_with_border[(sz + 1) * patch_size_with_border + sx];
+                let hl = heights_with_border[sz * bordered_texels_per_side + (sx - 1)];
+                let hr = heights_with_border[sz * bordered_texels_per_side + (sx + 1)];
+                let hb = heights_with_border[(sz - 1) * bordered_texels_per_side + sx];
+                let ht = heights_with_border[(sz + 1) * bordered_texels_per_side + sx];
 
-                let dhdx = (hl - hr) / (2.0 * noise_world_size);
-                let dhdz = (hb - ht) / (2.0 * noise_world_size);
+                // Store the horizontal part of the surface normal, `(-dh/dx, -dh/dz)`,
+                // so the shader can use it as `(xz.x, 1, xz.y)` with no sign flips.
+                // That is why these differences read backwards for a derivative.
+                let normal_x = (hl - hr) / (2.0 * meters_per_texel);
+                let normal_z = (hb - ht) / (2.0 * meters_per_texel);
 
-                gradients[z * patch_size + x] = Vec2::new(dhdx, dhdz);
+                gradients[z * texels_per_side + x] = Vec2::new(normal_x, normal_z);
             }
         }
 

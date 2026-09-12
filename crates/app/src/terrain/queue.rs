@@ -3,7 +3,7 @@ use std::collections::{BinaryHeap, HashSet};
 use std::sync::{Condvar, Mutex};
 
 use super::generator::{PatchPriority, WantedPatch};
-use super::patch::PatchKey;
+use super::patch::PatchCoord;
 
 pub struct Queue {
     state: Mutex<State>,
@@ -38,14 +38,14 @@ impl Queue {
             state.wanted.clear();
 
             for wanted in wanted_patches {
-                state.wanted.insert(wanted.patch);
+                state.wanted.insert(wanted.coord);
 
-                if state.in_flight.contains(&wanted.patch) {
+                if state.in_flight.contains(&wanted.coord) {
                     continue;
                 }
 
                 state.pending.push(Entry {
-                    patch: wanted.patch,
+                    coord: wanted.coord,
                     priority: wanted.priority,
                 });
             }
@@ -58,7 +58,7 @@ impl Queue {
         }
     }
 
-    pub fn claim_blocking(&self) -> Option<PatchKey> {
+    pub fn claim_blocking(&self) -> Option<PatchCoord> {
         let mut state = self.state.lock().unwrap();
 
         loop {
@@ -67,8 +67,8 @@ impl Queue {
             }
 
             while let Some(entry) = state.pending.pop() {
-                if state.in_flight.insert(entry.patch) {
-                    return Some(entry.patch);
+                if state.in_flight.insert(entry.coord) {
+                    return Some(entry.coord);
                 }
             }
 
@@ -76,12 +76,12 @@ impl Queue {
         }
     }
 
-    pub fn complete(&self, patch: PatchKey) -> bool {
+    pub fn complete(&self, coord: PatchCoord) -> bool {
         let mut state = self.state.lock().unwrap();
-        let present = state.in_flight.remove(&patch);
+        let present = state.in_flight.remove(&coord);
         debug_assert!(present);
 
-        state.wanted.contains(&patch)
+        state.wanted.contains(&coord)
     }
 
     pub fn shutdown(&self) {
@@ -99,13 +99,13 @@ impl Queue {
 
 struct State {
     pending: BinaryHeap<Entry>,
-    in_flight: HashSet<PatchKey>,
-    wanted: HashSet<PatchKey>,
+    in_flight: HashSet<PatchCoord>,
+    wanted: HashSet<PatchCoord>,
     shutdown: bool,
 }
 
 struct Entry {
-    patch: PatchKey,
+    coord: PatchCoord,
     priority: PatchPriority,
 }
 

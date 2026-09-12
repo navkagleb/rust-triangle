@@ -8,7 +8,7 @@ use crate::FRAME_COUNT;
 use crate::d3d12_utils::{D3D12BufferExt, D3D12TextureExt, InterfaceExt};
 
 #[repr(transparent)]
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct AtlasSlot(UVec2);
 
 impl AtlasSlot {
@@ -122,8 +122,8 @@ impl<T> TextureAtlas<T> {
                     Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
                     Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
                 },
-                slot.coords().x * ATLAS_PATCH_SIZE_IN_PIXELS as u32,
-                slot.coords().y * ATLAS_PATCH_SIZE_IN_PIXELS as u32,
+                slot.coords().x * ATLAS_PATCH_SIZE_IN_PIXELS,
+                slot.coords().y * ATLAS_PATCH_SIZE_IN_PIXELS,
                 0,
                 &D3D12_TEXTURE_COPY_LOCATION {
                     pResource: std::mem::transmute_copy(&self.upload),
@@ -133,8 +133,8 @@ impl<T> TextureAtlas<T> {
                             Offset: dst_patch_base as u64,
                             Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
                                 Format: self.format,
-                                Width: ATLAS_PATCH_SIZE_IN_PIXELS as u32,
-                                Height: ATLAS_PATCH_SIZE_IN_PIXELS as u32,
+                                Width: ATLAS_PATCH_SIZE_IN_PIXELS,
+                                Height: ATLAS_PATCH_SIZE_IN_PIXELS,
                                 Depth: 1,
                                 RowPitch: row_pitch as u32,
                             },

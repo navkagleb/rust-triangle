@@ -64,7 +64,7 @@ static const uint HEIGHT_ATLAS_INDEX = 1;
 static const uint GRADIENT_ATLAS_INDEX = 2;
 static const uint PATCH_INDEX_BUFFER_INDEX = 3;
 
-static const uint PATCH_LOD_COUNT = 10; // must match config.rs
+static const uint PATCH_LOD_COUNT = 11; // must match config.rs
 static const uint PATCH_SIZE_IN_METERS = 64;
 static const uint PATCH_SIZE_IN_PIXELS = PATCH_SIZE_IN_METERS * 2;
 static const uint PATCH_COUNT_PER_SIDE = 1 << (PATCH_LOD_COUNT - 1);
@@ -76,6 +76,7 @@ static const uint PATCH_TRIANGLE_COUNT = PATCH_QUAD_COUNT * PATCH_QUAD_COUNT * 2
 
 static const uint ATLAS_PATCH_SIZE_IN_PIXELS = PATCH_SIZE_IN_PIXELS + 1; // for pixel overlap
 
+// Mirrors `get_lod_color` in terrain/renderer.rs
 float3 get_lod_color(uint lod) {
     switch (lod % PATCH_LOD_COUNT) {
         case 0:
@@ -94,6 +95,12 @@ float3 get_lod_color(uint lod) {
             return float3(1.00, 0.40, 0.70); // pink
         case 7:
             return float3(0.60, 0.60, 0.60); // grey
+        case 8:
+            return float3(0.95, 0.15, 0.15); // red
+        case 9:
+            return float3(0.00, 0.55, 0.50); // teal
+        case 10:
+            return float3(0.85, 0.65, 0.40); // tan
     }
 
     return 0.0;
@@ -128,7 +135,7 @@ VsOutput process_vertex(uint vertex_id, uint instance_id) {
     const float3 world_pos = float3(world_x, height * consts.height_scale, world_z);
 
     const float slope_scale = consts.height_scale;
-    const float3 normal = normalize(float3(-gradient.x * slope_scale, 1.0, -gradient.y * slope_scale));
+    const float3 normal = normalize(float3(gradient.x * slope_scale, 1.0, gradient.y * slope_scale));
 
     VsOutput output = (VsOutput)0;
     output.clip_pos = mul(consts.world_to_clip, float4(world_pos, 1.0));
