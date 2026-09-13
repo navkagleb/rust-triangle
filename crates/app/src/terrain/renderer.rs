@@ -18,12 +18,12 @@ use crate::{BACK_BUFFER_FORMAT, DEPTH_BUFFER_FORMAT, FRAME_COUNT, GpuResource, i
 pub struct Terrain {
     lod_factor: f32,
     height_scale: f32,
+    sun_altitude: f32,
+    sun_azimuth: f32,
 
     solid_mode: bool,
     wireframe_mode: bool,
     display_normals: bool,
-    pause_sun_animation: bool,
-    elapsed_time: f32,
 
     freeze_camera: bool,
     camera_pos: Vec3,
@@ -212,14 +212,13 @@ impl Terrain {
 
         Ok(Self {
             lod_factor: 2.0,
-
             height_scale: 5000.0,
+            sun_altitude: 45_f32.to_radians(),
+            sun_azimuth: 90_f32.to_radians(),
 
             solid_mode: true,
             wireframe_mode: false,
             display_normals: false,
-            pause_sun_animation: false,
-            elapsed_time: 0.0,
 
             freeze_camera: false,
             camera_pos: Vec3::ZERO,
@@ -264,7 +263,6 @@ impl Terrain {
         &mut self,
         camera_pos: &Vec3,
         camera_forward: &Vec3,
-        dt: f32,
         cpu_frame_index: u64,
         gpu_frame_index: u64,
         active_frame_index: u32,
@@ -272,10 +270,6 @@ impl Terrain {
         if !self.freeze_camera {
             self.camera_pos = *camera_pos;
             self.camera_forward = camera_forward.xz().normalize_or_zero();
-        }
-
-        if !self.pause_sun_animation {
-            self.elapsed_time += dt;
         }
 
         self.collect_generated_patches();
@@ -324,8 +318,8 @@ impl Terrain {
 
         let mut consts = GpuTerrainConsts {
             world_to_clip: camera.world_to_clip(),
+            sun_dir: self.sun_dir(),
             height_scale: self.height_scale,
-            elapsed_time: self.elapsed_time,
             active_patch_buffer_index: GpuResource::TerrainPatchBufferFirst as u32 + active_frame_index,
 
             wireframe_pass: false.into(),
@@ -390,13 +384,29 @@ impl Terrain {
             ImGui_NewLine();
             ImGui_InputFloat(c"LOD factor".as_ptr(), &mut self.lod_factor);
             ImGui_InputFloat(c"Height scale".as_ptr(), &mut self.height_scale);
+            ImGui_SliderAngleEx(
+                c"Sun altitude".as_ptr(),
+                &mut self.sun_altitude,
+                -90.0,
+                90.0,
+                c"%.3f".as_ptr(),
+                0,
+            );
+            ImGui_SliderAngleEx(
+                c"Sun azimuth".as_ptr(),
+                &mut self.sun_azimuth,
+                0.0,
+                360.0,
+                c"%.3f".as_ptr(),
+                0,
+            );
+            imgui_text!("Sun dir: {:.2}", self.sun_dir());
 
             ImGui_NewLine();
             ImGui_Checkbox(c"Freeze camera".as_ptr(), &mut self.freeze_camera);
             ImGui_Checkbox(c"Solid mode".as_ptr(), &mut self.solid_mode);
             ImGui_Checkbox(c"Wireframe mode".as_ptr(), &mut self.wireframe_mode);
             ImGui_Checkbox(c"Display normals".as_ptr(), &mut self.display_normals);
-            ImGui_Checkbox(c"Pause sun animation".as_ptr(), &mut self.pause_sun_animation);
 
             ImGui_NewLine();
             imgui_text!("Patches to upload: {}", self.patches_to_upload.len());
@@ -440,6 +450,14 @@ impl Terrain {
                 gpu_patches.len(),
             );
         }
+    }
+
+    fn sun_dir(&self) -> Vec3 {
+        Vec3::new(
+            self.sun_altitude.cos() * self.sun_azimuth.cos(),
+            self.sun_altitude.sin(),
+            self.sun_altitude.cos() * self.sun_azimuth.sin(),
+        )
     }
 
     fn render_imgui_qtree(&mut self, camera_pos: &Vec3, camera_forward: &Vec3) {

@@ -13,8 +13,8 @@ struct VsOutput {
 
 struct TerrainConsts {
     float4x4 world_to_clip;
+    float3 sun_dir;
     float height_scale;
-    float elapsed_time;
     uint active_patch_buffer_index;
 
     // Debug
@@ -183,16 +183,7 @@ float4 ps_main(VsOutput input) : SV_Target {
     if (consts.display_normals)
         return float4(input.normal * 0.5 + 0.5, 1.0);
 
-    const float sun_speed = 0.5;
-    const float sun_angle = consts.elapsed_time * sun_speed;
-
-    const float3 sun_light_dir = normalize(float3(
-        cos(sun_angle),
-        1.5,
-        sin(sun_angle)
-    ));
-
-    const float ndotl = saturate(dot(normalize(input.normal), sun_light_dir));
+    const float ndotl = saturate(dot(normalize(input.normal), consts.sun_dir));
     const float3 ambient = 0.1;
     const float3 color = height_to_color(input.height) * ndotl + ambient;
 

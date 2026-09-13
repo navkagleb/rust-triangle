@@ -1,4 +1,4 @@
-use glam::Mat4;
+use glam::{Mat4, Vec3};
 
 use super::texture_atlas::AtlasSlot;
 
@@ -13,8 +13,8 @@ pub struct GpuTerrainPatch {
 #[repr(C)]
 pub struct GpuTerrainConsts {
     pub world_to_clip: Mat4,
+    pub sun_dir: Vec3,
     pub height_scale: f32,
-    pub elapsed_time: f32,
     pub active_patch_buffer_index: u32,
 
     // Debug

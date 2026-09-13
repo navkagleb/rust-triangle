@@ -469,7 +469,6 @@ fn main() -> Result<()> {
             terrain.update(
                 camera.pos(),
                 camera.forward(),
-                dt,
                 cpu_frame_index,
                 gpu_frame_index,
                 active_frame_index,
