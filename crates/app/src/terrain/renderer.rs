@@ -13,7 +13,7 @@ use super::quad_tree::{PatchSelection, QuadTree};
 use super::texture_atlas::TextureAtlas;
 use crate::camera::Camera;
 use crate::d3d12_utils::*;
-use crate::{BACK_BUFFER_FORMAT, DEPTH_BUFFER_FORMAT, FRAME_COUNT, GpuResource, imgui_text};
+use crate::{BACK_BUFFER_FORMAT, DEPTH_BUFFER_FORMAT, FRAME_COUNT, GpuResource, cs};
 
 pub struct Terrain {
     lod_factor: f32,
@@ -374,11 +374,10 @@ impl Terrain {
             }
 
             ImGui_NewLine();
-            imgui_text!("World size: {}", WORLD_SIZE_IN_METERS);
+            ImGui_Text(cs!("World size: {}", WORLD_SIZE_IN_METERS));
 
             for lod in 0..PATCH_LOD_COUNT {
-                let lod_size_in_meters = PATCH_SIZE_IN_METERS * (1 << lod);
-                imgui_text!("LOD {} size: {}", lod, lod_size_in_meters);
+                ImGui_Text(cs!("LOD {} size: {}", lod, PATCH_SIZE_IN_METERS * (1 << lod)));
             }
 
             ImGui_NewLine();
@@ -400,7 +399,7 @@ impl Terrain {
                 c"%.3f".as_ptr(),
                 0,
             );
-            imgui_text!("Sun dir: {:.2}", self.sun_dir());
+            ImGui_Text(cs!("Sun dir: {:.2}", self.sun_dir()));
 
             ImGui_NewLine();
             ImGui_Checkbox(c"Freeze camera".as_ptr(), &mut self.freeze_camera);
@@ -409,8 +408,8 @@ impl Terrain {
             ImGui_Checkbox(c"Display normals".as_ptr(), &mut self.display_normals);
 
             ImGui_NewLine();
-            imgui_text!("Patches to upload: {}", self.patches_to_upload.len());
-            imgui_text!("Patches to render: {}", self.selection.renderable.len());
+            ImGui_Text(cs!("Patches to upload: {}", self.patches_to_upload.len()));
+            ImGui_Text(cs!("Patches to render: {}", self.selection.renderable.len()));
 
             ImGui_End();
 

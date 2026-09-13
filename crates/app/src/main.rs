@@ -29,9 +29,12 @@ const BACK_BUFFER_FORMAT: DXGI_FORMAT = DXGI_FORMAT_R8G8B8A8_UNORM;
 const DEPTH_BUFFER_FORMAT: DXGI_FORMAT = DXGI_FORMAT_D32_FLOAT;
 
 #[macro_export]
-macro_rules! imgui_text {
-    ($($arg:tt)*) => {
-        ImGui_TextUnformatted(std::ffi::CString::new(format!($($arg)*)).unwrap().as_ptr())
+macro_rules! cs {
+    ($fmt:literal) => {
+        concat!($fmt, "\0").as_ptr() as *const std::ffi::c_char
+    };
+    ($fmt:literal, $($arg:tt)+) => {
+        std::ffi::CString::new(format!($fmt, $($arg)+)).unwrap().as_ptr()
     };
 }
 
@@ -523,7 +526,7 @@ fn main() -> Result<()> {
 
                 ImGui_Begin(c"App".as_ptr(), std::ptr::null_mut(), 0);
                 {
-                    imgui_text!("FPS: {} ({:.2} ms)", fps, dt * 1000.0);
+                    ImGui_Text(cs!("FPS: {} ({:.2} ms)", fps, dt * 1000.0));
 
                     let mut local_mem = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
                     let mut host_mem = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
@@ -531,25 +534,20 @@ fn main() -> Result<()> {
                     adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut local_mem)?;
                     adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &mut host_mem)?;
 
-                    imgui_text!(
+                    ImGui_Text(cs!(
                         "Local VRAM: {} / {} mb",
                         local_mem.CurrentUsage / (1024 * 1024),
                         local_mem.Budget / (1024 * 1024)
-                    );
+                    ));
 
-                    imgui_text!("Host VRAM: {} mb", host_mem.CurrentUsage / (1024 * 1024));
-
-                    ImGui_NewLine();
-                    imgui_text!("Camera position: {:.2}", camera.pos());
-                }
-                ImGui_End();
-
-                ImGui_Begin(c"Profiler".as_ptr(), std::ptr::null_mut(), 0);
-                {
-                    imgui_text!("Terrain::update: {:.2} ms", terrain_update_ms);
-                    imgui_text!("Terrain::render: {:.2} ms", terrain_render_ms);
+                    ImGui_Text(cs!("Host VRAM: {} mb", host_mem.CurrentUsage / (1024 * 1024)));
 
                     ImGui_NewLine();
+                    ImGui_Text(cs!("Camera position: {:.2}", camera.pos()));
+
+                    ImGui_NewLine();
+                    ImGui_Text(cs!("Terrain::update: {:.2} ms", terrain_update_ms));
+                    ImGui_Text(cs!("Terrain::render: {:.2} ms", terrain_render_ms));
                 }
                 ImGui_End();
 
