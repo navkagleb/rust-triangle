@@ -38,18 +38,6 @@ macro_rules! cs {
     };
 }
 
-#[repr(u32)]
-enum GpuResource {
-    ImGuiFont,
-    TerrainHeightAtlas,
-    TerrainGradientAtlas,
-    TerrainPatchIndexBuffer,
-    TerrainPatchBufferFirst,
-    #[allow(unused)]
-    TerrainPatchBufferLast = GpuResource::TerrainPatchBufferFirst as u32 + FRAME_COUNT,
-    Count,
-}
-
 struct InputState {
     keys: [bool; 256],
     mouse_x: i32,
@@ -296,24 +284,21 @@ fn main() -> Result<()> {
             resource.unwrap()
         };
 
-        let rtv_heap = DescriptorHeap::new(&device, D3D12_DESCRIPTOR_HEAP_TYPE_RTV, FRAME_COUNT)?;
-        let dsv_heap = DescriptorHeap::new(&device, D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1)?;
-
-        let resource_heap = DescriptorHeap::new(
-            &device,
-            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-            GpuResource::Count as u32,
-        )?;
+        let mut rtv_heap = DescriptorHeap::new(&device, D3D12_DESCRIPTOR_HEAP_TYPE_RTV, FRAME_COUNT)?;
+        let mut dsv_heap = DescriptorHeap::new(&device, D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 100)?;
+        let mut resource_heap = DescriptorHeap::new(&device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 100)?;
 
         let rtvs: [_; FRAME_COUNT as usize] = std::array::from_fn(|i| {
-            let handle = rtv_heap.get_cpu_handle(i as u32);
+            let index = rtv_heap.allocate_index();
+            let handle = rtv_heap.cpu_handle(index);
             device.CreateRenderTargetView(&back_buffers[i], None, handle);
 
             handle
         });
 
         let dsv = {
-            let handle = dsv_heap.get_cpu_handle(0);
+            let index = dsv_heap.allocate_index();
+            let handle = dsv_heap.cpu_handle(index);
             device.CreateDepthStencilView(&depth_buffer, None, handle);
 
             handle
@@ -417,6 +402,8 @@ fn main() -> Result<()> {
             io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
             io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;
 
+            let font_index = resource_heap.allocate_index();
+
             cimgui_implwin32_init(window_handle.0);
             cimgui_impldx12_init(&mut ImGui_ImplDX12_InitInfo {
                 device: device.as_raw() as *mut _,
@@ -428,12 +415,12 @@ fn main() -> Result<()> {
                 srv_descriptor_heap: resource_heap.d3d12().as_raw() as *mut _,
                 srv_descriptor_alloc_fn: None,
                 srv_descriptor_free_fn: None,
-                legacy_srv_cpu: resource_heap.get_cpu_handle(GpuResource::ImGuiFont as u32),
-                legacy_srv_gpu: resource_heap.get_gpu_handle(GpuResource::ImGuiFont as u32),
+                legacy_srv_cpu: resource_heap.cpu_handle(font_index),
+                legacy_srv_gpu: resource_heap.gpu_handle(font_index),
             });
         }
 
-        let mut terrain = Terrain::new(&device, &resource_heap, &root_signature)?;
+        let mut terrain = Terrain::new(&device, &mut resource_heap, &root_signature)?;
 
         let mut cpu_frame_index = 0;
         let mut gpu_frame_index = 0;

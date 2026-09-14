@@ -15,7 +15,10 @@ pub struct GpuTerrainConsts {
     pub world_to_clip: Mat4,
     pub sun_dir: Vec3,
     pub height_scale: f32,
-    pub active_patch_buffer_index: u32,
+
+    pub patch_buffer_index: u32,
+    pub height_atlas_index: u32,
+    pub gradient_atlas_index: u32,
 
     // Debug
     pub wireframe_pass: u32,

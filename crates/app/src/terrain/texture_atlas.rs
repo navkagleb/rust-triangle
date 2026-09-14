@@ -5,7 +5,7 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 
 use super::config::{ATLAS_PATCH_SIZE_IN_PIXELS, ATLAS_SIZE_IN_PIXELS_PER_SIDE};
 use crate::FRAME_COUNT;
-use crate::d3d12_utils::{D3D12BufferExt, D3D12TextureExt, InterfaceExt};
+use crate::d3d12_utils::{D3D12BufferExt, D3D12TextureExt, DescriptorHeap, InterfaceExt};
 
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -26,6 +26,8 @@ pub struct TextureAtlas<T> {
     upload: ID3D12Resource,
     mapped_ptr: *mut T,
     format: DXGI_FORMAT,
+    srv_index: u32,
+
     gpu_layout: D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
     gpu_size: u64,
 }
@@ -33,7 +35,7 @@ pub struct TextureAtlas<T> {
 impl<T> TextureAtlas<T> {
     pub fn new(
         device: &ID3D12Device,
-        cpu_srv: D3D12_CPU_DESCRIPTOR_HANDLE,
+        descriptor_heap: &mut DescriptorHeap,
         format: DXGI_FORMAT,
         debug_name: &str,
     ) -> Result<TextureAtlas<T>> {
@@ -43,6 +45,7 @@ impl<T> TextureAtlas<T> {
             ATLAS_SIZE_IN_PIXELS_PER_SIDE,
             ATLAS_SIZE_IN_PIXELS_PER_SIDE,
             1,
+            None,
         )?;
 
         let mut gpu_layout = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
@@ -65,6 +68,8 @@ impl<T> TextureAtlas<T> {
         texture.set_debug_name(debug_name)?;
         upload.set_debug_name(format!("{}Upload", debug_name).as_str())?;
 
+        let srv_index = descriptor_heap.allocate_index();
+
         unsafe {
             device.CreateShaderResourceView(
                 &texture,
@@ -81,7 +86,7 @@ impl<T> TextureAtlas<T> {
                         },
                     },
                 }),
-                cpu_srv,
+                descriptor_heap.cpu_handle(srv_index),
             );
         }
 
@@ -90,9 +95,14 @@ impl<T> TextureAtlas<T> {
             mapped_ptr: upload.map::<T>()?,
             upload,
             format,
+            srv_index,
             gpu_layout,
             gpu_size,
         })
+    }
+
+    pub fn srv_index(&self) -> u32 {
+        self.srv_index
     }
 
     pub fn copy_to(&self, cmd_list: &ID3D12GraphicsCommandList, active_frame_index: u32, slot: AtlasSlot, data: &[T]) {

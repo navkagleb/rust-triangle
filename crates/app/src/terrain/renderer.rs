@@ -13,7 +13,7 @@ use super::quad_tree::{PatchSelection, QuadTree};
 use super::texture_atlas::TextureAtlas;
 use crate::camera::Camera;
 use crate::d3d12_utils::*;
-use crate::{BACK_BUFFER_FORMAT, DEPTH_BUFFER_FORMAT, FRAME_COUNT, GpuResource, cs};
+use crate::{BACK_BUFFER_FORMAT, DEPTH_BUFFER_FORMAT, FRAME_COUNT, cs};
 
 pub struct Terrain {
     lod_factor: f32,
@@ -36,10 +36,12 @@ pub struct Terrain {
     patches_to_upload: Vec<PatchUpload>,
 
     patch_index_buffer: ID3D12Resource,
+
     #[allow(unused)]
     patch_buffer: ID3D12Resource,
     patch_buffer_item_count: u32,
     patch_buffer_ptr: *mut GpuTerrainPatch,
+    patch_buffer_srv_indices: [u32; FRAME_COUNT as usize],
 
     height_atlas: TextureAtlas<f32>,
     gradient_atlas: TextureAtlas<Vec2>,
@@ -58,7 +60,7 @@ pub struct Terrain {
 impl Terrain {
     pub fn new(
         device: &ID3D12Device4,
-        resource_heap: &DescriptorHeap,
+        resource_heap: &mut DescriptorHeap,
         root_signature: &ID3D12RootSignature,
     ) -> Result<Self> {
         let patch_indices = {
@@ -110,6 +112,8 @@ impl Terrain {
             (max_patch_count * FRAME_COUNT) as u64 * size_of::<GpuTerrainPatch>() as u64,
         )?;
 
+        let patch_buffer_srv_indices = std::array::from_fn(|_| resource_heap.allocate_index());
+
         unsafe {
             for i in 0..FRAME_COUNT {
                 device.CreateShaderResourceView(
@@ -127,27 +131,9 @@ impl Terrain {
                             },
                         },
                     }),
-                    resource_heap.get_cpu_handle(GpuResource::TerrainPatchBufferFirst as u32 + i),
+                    resource_heap.cpu_handle(patch_buffer_srv_indices[i as usize]),
                 );
             }
-
-            device.CreateShaderResourceView(
-                &patch_index_buffer,
-                Some(&D3D12_SHADER_RESOURCE_VIEW_DESC {
-                    Format: DXGI_FORMAT_R32_UINT,
-                    ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
-                    Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
-                    Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
-                        Buffer: D3D12_BUFFER_SRV {
-                            FirstElement: 0,
-                            NumElements: patch_indices.len() as u32,
-                            StructureByteStride: 0,
-                            Flags: D3D12_BUFFER_SRV_FLAG_NONE,
-                        },
-                    },
-                }),
-                resource_heap.get_cpu_handle(GpuResource::TerrainPatchIndexBuffer as u32),
-            );
         }
 
         let vs_blob = std::fs::read(std::path::Path::new("target/dxil/terrain.vs.dxil"))?;
@@ -231,22 +217,14 @@ impl Terrain {
             patches_to_upload: Vec::new(),
 
             patch_index_buffer,
+
             patch_buffer_item_count: max_patch_count,
             patch_buffer_ptr: patch_buffer.map::<GpuTerrainPatch>()?,
             patch_buffer,
+            patch_buffer_srv_indices,
 
-            height_atlas: TextureAtlas::new(
-                device,
-                resource_heap.get_cpu_handle(GpuResource::TerrainHeightAtlas as u32),
-                DXGI_FORMAT_R32_FLOAT,
-                "HeightAtlas",
-            )?,
-            gradient_atlas: TextureAtlas::new(
-                device,
-                resource_heap.get_cpu_handle(GpuResource::TerrainGradientAtlas as u32),
-                DXGI_FORMAT_R32G32_FLOAT,
-                "NormalAtlas",
-            )?,
+            height_atlas: TextureAtlas::new(device, resource_heap, DXGI_FORMAT_R32_FLOAT, "HeightAtlas")?,
+            gradient_atlas: TextureAtlas::new(device, resource_heap, DXGI_FORMAT_R32G32_FLOAT, "NormalAtlas")?,
 
             solid_const_buffer: ConstBuffer::new(device)?,
             wireframe_const_buffer: ConstBuffer::new(device)?,
@@ -320,7 +298,10 @@ impl Terrain {
             world_to_clip: camera.world_to_clip(),
             sun_dir: self.sun_dir(),
             height_scale: self.height_scale,
-            active_patch_buffer_index: GpuResource::TerrainPatchBufferFirst as u32 + active_frame_index,
+
+            patch_buffer_index: self.patch_buffer_srv_indices[active_frame_index as usize],
+            height_atlas_index: self.height_atlas.srv_index(),
+            gradient_atlas_index: self.gradient_atlas.srv_index(),
 
             wireframe_pass: false.into(),
             display_normals: self.display_normals.into(),
@@ -414,7 +395,7 @@ impl Terrain {
             ImGui_End();
 
             self.cache
-                .render_imgui(descriptor_heap.get_gpu_handle(GpuResource::TerrainHeightAtlas as u32));
+                .render_imgui(descriptor_heap.gpu_handle(self.height_atlas.srv_index()));
 
             self.render_imgui_qtree(camera_pos, camera_forward)
         }

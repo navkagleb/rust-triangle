@@ -269,14 +269,16 @@ impl<T> Drop for ConstBuffer<T> {
 
 pub struct DescriptorHeap {
     heap: ID3D12DescriptorHeap,
+    count: u32,
+    max_count: u32,
     descriptor_size: u32,
 }
 
 impl DescriptorHeap {
-    pub fn new(device: &ID3D12Device, heap_type: D3D12_DESCRIPTOR_HEAP_TYPE, descriptor_count: u32) -> Result<Self> {
+    pub fn new(device: &ID3D12Device, heap_type: D3D12_DESCRIPTOR_HEAP_TYPE, max_count: u32) -> Result<Self> {
         let heap = unsafe {
             device.CreateDescriptorHeap::<ID3D12DescriptorHeap>(&D3D12_DESCRIPTOR_HEAP_DESC {
-                NumDescriptors: descriptor_count,
+                NumDescriptors: max_count,
                 Type: heap_type,
                 Flags: if heap_type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV {
                     D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE
@@ -289,21 +291,37 @@ impl DescriptorHeap {
 
         let descriptor_size = unsafe { device.GetDescriptorHandleIncrementSize(heap_type) };
 
-        Ok(Self { heap, descriptor_size })
+        Ok(Self {
+            heap,
+            count: 0,
+            max_count,
+            descriptor_size,
+        })
     }
 
     pub fn d3d12(&self) -> &ID3D12DescriptorHeap {
         &self.heap
     }
 
-    pub fn get_cpu_handle(&self, index: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+    pub fn allocate_index(&mut self) -> u32 {
+        if self.count == self.max_count {
+            panic!("Descriptor heap is out of descriptors!");
+        }
+
+        let index = self.count;
+        self.count += 1;
+
+        index
+    }
+
+    pub fn cpu_handle(&self, index: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
         D3D12_CPU_DESCRIPTOR_HANDLE {
             ptr: unsafe { self.heap.GetCPUDescriptorHandleForHeapStart().ptr }
                 + (index * self.descriptor_size) as usize,
         }
     }
 
-    pub fn get_gpu_handle(&self, index: u32) -> D3D12_GPU_DESCRIPTOR_HANDLE {
+    pub fn gpu_handle(&self, index: u32) -> D3D12_GPU_DESCRIPTOR_HANDLE {
         D3D12_GPU_DESCRIPTOR_HANDLE {
             ptr: unsafe { self.heap.GetGPUDescriptorHandleForHeapStart().ptr } + (index * self.descriptor_size) as u64,
         }

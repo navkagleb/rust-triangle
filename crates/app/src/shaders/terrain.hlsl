@@ -15,7 +15,10 @@ struct TerrainConsts {
     float4x4 world_to_clip;
     float3 sun_dir;
     float height_scale;
-    uint active_patch_buffer_index;
+
+    uint patch_buffer_index;
+    uint height_atlas_index;
+    uint gradient_atlas_index;
 
     // Debug
     uint wireframe_pass;
@@ -59,10 +62,6 @@ float3 height_to_color(float h) {
 
     return color;
 }
-
-static const uint HEIGHT_ATLAS_INDEX = 1;
-static const uint GRADIENT_ATLAS_INDEX = 2;
-static const uint PATCH_INDEX_BUFFER_INDEX = 3;
 
 static const uint PATCH_LOD_COUNT = 11; // must match config.rs
 static const uint PATCH_SIZE_IN_METERS = 64;
@@ -115,9 +114,9 @@ float3 patch_color(TerrainPatch patch) {
 }
 
 VsOutput process_vertex(uint vertex_id, uint instance_id) {
-    const StructuredBuffer<TerrainPatch> patches = ResourceDescriptorHeap[consts.active_patch_buffer_index];
-    const Texture2D<float> height_atlas = ResourceDescriptorHeap[HEIGHT_ATLAS_INDEX];
-    const Texture2D<float2> gradient_atlas = ResourceDescriptorHeap[GRADIENT_ATLAS_INDEX];
+    const StructuredBuffer<TerrainPatch> patches = ResourceDescriptorHeap[consts.patch_buffer_index];
+    const Texture2D<float> height_atlas = ResourceDescriptorHeap[consts.height_atlas_index];
+    const Texture2D<float2> gradient_atlas = ResourceDescriptorHeap[consts.gradient_atlas_index];
 
     const TerrainPatch patch = patches[instance_id];
     const uint ix = vertex_id % (PATCH_QUAD_COUNT + 1);
@@ -149,31 +148,6 @@ VsOutput process_vertex(uint vertex_id, uint instance_id) {
 
 VsOutput vs_main(VsInput input) {
     return process_vertex(input.vertex_id, input.instance_id);
-}
-
-[NumThreads(128, 1, 1)]
-[OutputTopology("triangle")]
-void ms_main(
-    uint gtid : SV_GroupThreadID,
-    uint gid : SV_GroupID,
-    out vertices VsOutput vertices[PATCH_VERTEX_COUNT],
-    out indices uint3 triangles[PATCH_TRIANGLE_COUNT]
-) {
-    SetMeshOutputCounts(PATCH_VERTEX_COUNT, PATCH_TRIANGLE_COUNT);
-
-    if (gtid < PATCH_VERTEX_COUNT) {
-        vertices[gtid] = process_vertex(gtid, gid);
-    }
-
-    const Buffer<uint> index_buffer = ResourceDescriptorHeap[PATCH_INDEX_BUFFER_INDEX];
-
-    if (gtid < PATCH_TRIANGLE_COUNT) { 
-        triangles[gtid] = uint3(
-            index_buffer[gtid * 3 + 0],
-            index_buffer[gtid * 3 + 1],
-            index_buffer[gtid * 3 + 2]
-        );
-    }
 }
 
 float4 ps_main(VsOutput input) : SV_Target {
