@@ -46,6 +46,10 @@ pub struct Terrain {
     height_atlas: TextureAtlas<f32>,
     gradient_atlas: TextureAtlas<Vec2>,
 
+    shadow_map: ID3D12Resource,
+    shadow_map_srv_index: u32,
+    shadow_map_dsv_index: u32,
+
     solid_const_buffer: ConstBuffer<GpuTerrainConsts>,
     wireframe_const_buffer: ConstBuffer<GpuTerrainConsts>,
 
@@ -61,6 +65,7 @@ impl Terrain {
     pub fn new(
         device: &ID3D12Device4,
         resource_heap: &mut DescriptorHeap,
+        dsv_heap: &mut DescriptorHeap,
         root_signature: &ID3D12RootSignature,
     ) -> Result<Self> {
         let patch_indices = {
@@ -134,6 +139,51 @@ impl Terrain {
                     resource_heap.cpu_handle(patch_buffer_srv_indices[i as usize]),
                 );
             }
+        }
+
+        let shadow_map = ID3D12Resource::new_texture_2d(
+            device,
+            DXGI_FORMAT_R32_TYPELESS,
+            SHADOW_MAP_SIZE,
+            SHADOW_MAP_SIZE,
+            1,
+            Some(D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL),
+        )?;
+
+        let shadow_map_srv_index = resource_heap.allocate_index();
+        let shadow_map_dsv_index = dsv_heap.allocate_index();
+
+        unsafe {
+            device.CreateShaderResourceView(
+                &shadow_map,
+                Some(&D3D12_SHADER_RESOURCE_VIEW_DESC {
+                    Format: DXGI_FORMAT_R32_FLOAT,
+                    ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+                    Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                    Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                        Texture2D: D3D12_TEX2D_SRV {
+                            MostDetailedMip: 0,
+                            MipLevels: 1,
+                            PlaneSlice: 0,
+                            ResourceMinLODClamp: 0.0,
+                        },
+                    },
+                }),
+                resource_heap.cpu_handle(shadow_map_srv_index),
+            );
+
+            device.CreateDepthStencilView(
+                &shadow_map,
+                Some(&D3D12_DEPTH_STENCIL_VIEW_DESC {
+                    Format: DXGI_FORMAT_D32_FLOAT,
+                    ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2D,
+                    Flags: D3D12_DSV_FLAG_NONE,
+                    Anonymous: D3D12_DEPTH_STENCIL_VIEW_DESC_0 {
+                        Texture2D: D3D12_TEX2D_DSV { MipSlice: 0 },
+                    },
+                }),
+                dsv_heap.cpu_handle(shadow_map_dsv_index),
+            );
         }
 
         let vs_blob = std::fs::read(std::path::Path::new("target/dxil/terrain.vs.dxil"))?;
@@ -225,6 +275,10 @@ impl Terrain {
 
             height_atlas: TextureAtlas::new(device, resource_heap, DXGI_FORMAT_R32_FLOAT, "HeightAtlas")?,
             gradient_atlas: TextureAtlas::new(device, resource_heap, DXGI_FORMAT_R32G32_FLOAT, "NormalAtlas")?,
+
+            shadow_map,
+            shadow_map_srv_index,
+            shadow_map_dsv_index,
 
             solid_const_buffer: ConstBuffer::new(device)?,
             wireframe_const_buffer: ConstBuffer::new(device)?,

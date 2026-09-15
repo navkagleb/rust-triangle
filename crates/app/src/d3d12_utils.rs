@@ -179,6 +179,7 @@ pub trait D3D12TextureExt {
         width: u32,
         height: u32,
         mip_count: u32,
+        flags: Option<D3D12_RESOURCE_FLAGS>,
     ) -> Result<ID3D12Resource>;
 }
 
@@ -189,6 +190,7 @@ impl D3D12TextureExt for ID3D12Resource {
         width: u32,
         height: u32,
         mip_count: u32,
+        flags: Option<D3D12_RESOURCE_FLAGS>,
     ) -> Result<ID3D12Resource> {
         assert_ne!(format, DXGI_FORMAT_UNKNOWN);
 
@@ -207,7 +209,7 @@ impl D3D12TextureExt for ID3D12Resource {
                     Format: format,
                     SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
                     Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
-                    Flags: D3D12_RESOURCE_FLAG_NONE,
+                    Flags: flags.unwrap_or(D3D12_RESOURCE_FLAG_NONE),
                 },
                 D3D12_RESOURCE_STATE_COMMON,
                 None,

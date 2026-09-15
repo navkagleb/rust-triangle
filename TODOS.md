@@ -20,8 +20,8 @@
 
 - [ ] Replace the per-patch println! at generator.rs:153 with counters in the ImGui panel — generation ms histogram, queue depth, patches/sec, cache hit rate, eviction count
 - [ ] Basic shadow mapping
-    - [ ] Move sun direction to CPU
-    - [ ] Create shadow map resource
+    - [x] Move sun direction to CPU
+    - [x] Create shadow map resource
     - [ ] Compute light view-projection matrix
     - [ ] Shadow depth pass
     - [ ] Sample shadow map in pixel shader
